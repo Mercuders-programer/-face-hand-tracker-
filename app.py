@@ -32,7 +32,7 @@ class MainApp:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("PoseTracker")
-        self.root.geometry("540x310")
+        self.root.geometry("460x310")
         self.root.resizable(False, False)
         self.root.configure(bg=BG)
         self._build_ui()
@@ -51,54 +51,33 @@ class MainApp:
             fg=TEXT_G, bg=BG,
         ).pack(pady=(0, 26))
 
-        # 버튼 + 버전 정보 가로 배치
-        row = tk.Frame(self.root, bg=BG)
-        row.pack(pady=6)
-
-        # 왼쪽: 버튼 두 개
-        btn_col = tk.Frame(row, bg=BG)
-        btn_col.pack(side=tk.LEFT, padx=(0, 18))
-
+        # 버튼 두 개 (중앙 정렬)
         tk.Button(
-            btn_col, text="  카메라 추적  ",
+            self.root, text="카메라 추적",
             font=("Segoe UI", 13, "bold"),
             bg=ACCENT, fg="white",
             activebackground="#3a6fee", activeforeground="white",
             relief=tk.FLAT, cursor="hand2",
-            padx=24, pady=10,
+            width=12, pady=10,
             command=self._open_camera,
         ).pack(pady=5)
 
         tk.Button(
-            btn_col, text="  영상 분석  ",
+            self.root, text="영상 분석",
             font=("Segoe UI", 13, "bold"),
             bg=ACCENT, fg="white",
             activebackground="#3a6fee", activeforeground="white",
             relief=tk.FLAT, cursor="hand2",
-            padx=24, pady=10,
+            width=12, pady=10,
             command=self._open_video,
         ).pack(pady=5)
 
-        # 구분선
-        tk.Frame(row, bg="#2a2a4e", width=1).pack(
-            side=tk.LEFT, fill=tk.Y, padx=(0, 18), pady=4,
-        )
-
-        # 오른쪽: 버전 정보
-        ver_col = tk.Frame(row, bg=BG)
-        ver_col.pack(side=tk.LEFT)
-
+        # 버전 정보 — 우측 하단 고정
         tk.Label(
-            ver_col, text="v1.0.0",
-            font=("Segoe UI", 22, "bold"),
-            fg=ACCENT, bg=BG,
-        ).pack(anchor="w")
-
-        tk.Label(
-            ver_col, text="PoseTracker",
-            font=("Segoe UI", 10),
+            self.root, text="v1.0.0",
+            font=("Segoe UI", 8),
             fg=TEXT_G, bg=BG,
-        ).pack(anchor="w")
+        ).place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
 
     # ── 영상 분석 패널 열기 ────────────────────────────────────────────────
     def _open_video(self):
