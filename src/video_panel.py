@@ -8,7 +8,8 @@ video_panel.py — 영상 분석 패널
 """
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
+import threading
 import cv2
 import mediapipe as mp
 import os
@@ -24,6 +25,13 @@ from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnectio
 _BASE      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FACE_MODEL = os.path.join(_BASE, "models", "face_landmarker.task")
 HAND_MODEL = os.path.join(_BASE, "models", "hand_landmarker.task")
+
+try:
+    from .tracker import FrameData, VideoInfo, _extract_face, _extract_hand
+    from .exporter import export_json, export_ae_keyframes
+except ImportError:
+    from tracker import FrameData, VideoInfo, _extract_face, _extract_hand
+    from exporter import export_json, export_ae_keyframes
 
 try:
     from PIL import Image, ImageTk
@@ -49,6 +57,8 @@ class VideoPanel:
         self.win.configure(bg=BG_DARK)
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        self._video_path = path  # 내보내기 시 재사용
+
         # ── VideoCapture 초기화 ────────────────────────────────────────────
         self._cap = cv2.VideoCapture(path)
         if not self._cap.isOpened():
@@ -64,8 +74,9 @@ class VideoPanel:
         self._playing       = False
         self._dragging      = False
         self._drag_was_playing = False
-        self._show_overlay  = tk.BooleanVar(value=False)
-        self._time_var      = tk.StringVar(value="00:00 / 00:00")
+        self._show_overlay       = tk.BooleanVar(value=False)
+        self._time_var           = tk.StringVar(value="00:00 / 00:00")
+        self._export_status_var  = tk.StringVar(value="")
         self._face_det      = None
         self._hand_det      = None
         self._after_id      = None
@@ -97,9 +108,9 @@ class VideoPanel:
         self._tl.bind("<ButtonRelease-1>", self._tl_release)
         self._tl.bind("<Configure>",       lambda _e: self._draw_timeline())
 
-        # 컨트롤 바
+        # 컨트롤 바 — 1행 (재생 / 시간 / 체크박스)
         ctrl = tk.Frame(self.win, bg=BG_DARK)
-        ctrl.pack(fill=tk.X, padx=8, pady=(4, 8))
+        ctrl.pack(fill=tk.X, padx=8, pady=(4, 2))
 
         self._play_btn = tk.Button(
             ctrl, text="▶ 재생",
@@ -127,6 +138,49 @@ class VideoPanel:
             selectcolor=BG_PANEL,
             activeforeground=TEXT_W, activebackground=BG_DARK,
         ).pack(side=tk.RIGHT)
+
+        # 컨트롤 바 — 2행 (내보내기 버튼 + 상태)
+        export_bar = tk.Frame(self.win, bg=BG_DARK)
+        export_bar.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        self._json_btn = tk.Button(
+            export_bar, text="JSON 내보내기",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            padx=10, pady=3,
+            command=self._export_json,
+        )
+        self._json_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._ae_btn = tk.Button(
+            export_bar, text="AE 내보내기",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            padx=10, pady=3,
+            command=self._export_ae,
+        )
+        self._ae_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+        self._video_btn = tk.Button(
+            export_bar, text="영상 저장",
+            font=("Segoe UI", 10, "bold"),
+            bg="#2a1f5f", fg=TEXT_W,
+            activebackground="#3d2e80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            padx=10, pady=3,
+            command=self._export_video,
+        )
+        self._video_btn.pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Label(
+            export_bar, textvariable=self._export_status_var,
+            font=("Segoe UI", 10),
+            fg="#4aff9e", bg=BG_DARK,
+        ).pack(side=tk.LEFT)
 
     # ── MediaPipe 초기화 ───────────────────────────────────────────────────
     def _init_mediapipe(self):
@@ -313,6 +367,234 @@ class VideoPanel:
             secs = int(f / max(self._fps, 1))
             return f"{secs // 60:02d}:{secs % 60:02d}"
         self._time_var.set(f"{fmt(self._current_frame)} / {fmt(self._total_frames - 1)}")
+
+    # ── 내보내기 ───────────────────────────────────────────────────────────
+    def _export_json(self):
+        self._do_export("json")
+
+    def _export_ae(self):
+        self._do_export("ae")
+
+    def _do_export(self, mode: str):
+        if self._face_det is None or self._hand_det is None:
+            messagebox.showerror("오류", "MediaPipe 초기화에 실패했습니다.", parent=self.win)
+            return
+
+        if mode == "json":
+            save_path = filedialog.asksaveasfilename(
+                parent=self.win,
+                title="JSON 저장 위치 선택",
+                defaultextension=".json",
+                filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+            )
+            if not save_path:
+                return
+        else:  # ae
+            save_path = filedialog.askdirectory(
+                parent=self.win,
+                title="AE 키프레임 저장 폴더 선택",
+            )
+            if not save_path:
+                return
+
+        # 재생 일시정지
+        was_playing = self._playing
+        if self._playing:
+            self._playing = False
+            if self._after_id:
+                self.win.after_cancel(self._after_id)
+                self._after_id = None
+            self._play_btn.config(text="▶ 재생")
+
+        self._set_export_btns(tk.DISABLED)
+        self._export_status_var.set("분석 시작...")
+
+        def _run():
+            frames_data, info = self._process_all_frames()
+            if not frames_data:
+                def _fail():
+                    self._export_status_var.set("분석 실패 — 프레임 없음")
+                    self._set_export_btns(tk.NORMAL)
+                self.win.after(0, _fail)
+                return
+
+            try:
+                if mode == "json":
+                    export_json(frames_data, info, save_path)
+                    msg = f"JSON 저장 완료!\n{save_path}"
+                else:
+                    export_ae_keyframes(frames_data, info, save_path)
+                    msg = f"AE 키프레임 저장 완료!\n{save_path}/"
+            except Exception as e:
+                msg = None
+                err = str(e)
+                def _err():
+                    self._export_status_var.set("내보내기 오류")
+                    self._set_export_btns(tk.NORMAL)
+                    messagebox.showerror("내보내기 오류", err, parent=self.win)
+                self.win.after(0, _err)
+                return
+
+            final_msg = msg
+            def _done():
+                self._export_status_var.set("저장 완료!")
+                self._set_export_btns(tk.NORMAL)
+                messagebox.showinfo("완료", final_msg, parent=self.win)
+                self._export_status_var.set("")
+                if was_playing:
+                    self._playing = True
+                    self._play_btn.config(text="⏸ 일시정지")
+                    self._schedule_next()
+            self.win.after(0, _done)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _set_export_btns(self, state):
+        self._json_btn.config(state=state)
+        self._ae_btn.config(state=state)
+        self._video_btn.config(state=state)
+
+    def _export_video(self):
+        save_path = filedialog.asksaveasfilename(
+            parent=self.win,
+            title="영상 저장 위치 선택",
+            defaultextension=".mp4",
+            filetypes=[("MP4 파일", "*.mp4"), ("모든 파일", "*.*")],
+        )
+        if not save_path:
+            return
+
+        with_overlay = self._show_overlay.get()
+
+        # 오버레이 모드인데 MediaPipe 없으면 경고
+        if with_overlay and (self._face_det is None or self._hand_det is None):
+            messagebox.showwarning(
+                "경고",
+                "MediaPipe 초기화 실패 — 랜드마크 없이 원본 영상으로 저장합니다.",
+                parent=self.win,
+            )
+            with_overlay = False
+
+        was_playing = self._playing
+        if self._playing:
+            self._playing = False
+            if self._after_id:
+                self.win.after_cancel(self._after_id)
+                self._after_id = None
+            self._play_btn.config(text="▶ 재생")
+
+        self._set_export_btns(tk.DISABLED)
+        label = "오버레이 렌더링 중..." if with_overlay else "영상 저장 중..."
+        self._export_status_var.set(label)
+
+        def _run():
+            try:
+                self._save_video_frames(save_path, with_overlay)
+                msg = f"영상 저장 완료!\n{save_path}"
+                def _done():
+                    self._export_status_var.set("저장 완료!")
+                    self._set_export_btns(tk.NORMAL)
+                    messagebox.showinfo("완료", msg, parent=self.win)
+                    self._export_status_var.set("")
+                    if was_playing:
+                        self._playing = True
+                        self._play_btn.config(text="⏸ 일시정지")
+                        self._schedule_next()
+                self.win.after(0, _done)
+            except Exception as e:
+                err = str(e)
+                def _err():
+                    self._export_status_var.set("저장 오류")
+                    self._set_export_btns(tk.NORMAL)
+                    messagebox.showerror("저장 오류", err, parent=self.win)
+                self.win.after(0, _err)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _save_video_frames(self, save_path: str, with_overlay: bool):
+        cap = cv2.VideoCapture(self._video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"영상을 열 수 없습니다: {self._video_path}")
+
+        total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(save_path, fourcc, fps, (w, h))
+        if not writer.isOpened():
+            cap.release()
+            raise RuntimeError(f"VideoWriter를 열 수 없습니다: {save_path}")
+
+        try:
+            idx = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                if with_overlay:
+                    frame = self._apply_overlay(frame)
+
+                writer.write(frame)
+                idx += 1
+
+                if idx % 15 == 0:
+                    pct = int(idx / total * 100)
+                    label = f"렌더링 중... {pct}%" if with_overlay else f"저장 중... {pct}%"
+                    self.win.after(0, lambda l=label: self._export_status_var.set(l))
+        finally:
+            writer.release()
+            cap.release()
+
+    def _process_all_frames(self):
+        """영상 전체 프레임을 MediaPipe로 처리 → (List[FrameData], VideoInfo) 반환"""
+        cap = cv2.VideoCapture(self._video_path)
+        if not cap.isOpened():
+            return [], None
+
+        total = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
+        fps   = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        w     = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        frames_data = []
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            try:
+                face_res = self._face_det.detect(mp_img)
+                hand_res = self._hand_det.detect(mp_img)
+            except Exception as e:
+                print(f"[frame {idx} detect error] {e}")
+                idx += 1
+                continue
+
+            fd = FrameData(index=idx, timestamp=idx / fps)
+            fd.face = _extract_face(face_res, w, h)
+            if hand_res.hand_landmarks:
+                for hlms, hedness in zip(hand_res.hand_landmarks, hand_res.handedness):
+                    hd = _extract_hand(hlms, hedness, w, h)
+                    if hd.side == "left":
+                        fd.left_hand = hd
+                    else:
+                        fd.right_hand = hd
+            frames_data.append(fd)
+            idx += 1
+
+            if idx % 15 == 0:
+                pct = int(idx / total * 100)
+                self.win.after(0, lambda p=pct: self._export_status_var.set(f"분석중... {p}%"))
+
+        cap.release()
+        info = VideoInfo(width=w, height=h, fps=fps, total_frames=len(frames_data))
+        return frames_data, info
 
     # ── 종료 ──────────────────────────────────────────────────────────────
     def _on_close(self):
