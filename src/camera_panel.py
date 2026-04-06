@@ -1,0 +1,547 @@
+"""
+camera_panel.py — 카메라 추적 UI 패널
+
+기능:
+  - 웹캠 실시간 피드 + 얼굴/손 오버레이
+  - 30 / 60 fps 선택
+  - 녹화 → 저장 경로 선택 → 영상 저장 + AE 키프레임 자동 내보내기
+"""
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import queue
+import cv2
+import mediapipe as mp
+import os
+import tempfile
+import shutil
+
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import RunningMode
+from mediapipe.tasks.python.vision import drawing_utils as mp_draw
+from mediapipe.tasks.python.vision import drawing_styles as mp_styles
+from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarksConnections
+from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnections
+
+_BASE       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FACE_MODEL  = os.path.join(_BASE, "models", "face_landmarker.task")
+HAND_MODEL  = os.path.join(_BASE, "models", "hand_landmarker.task")
+
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    raise ImportError("Pillow가 필요합니다: pip install Pillow")
+
+try:
+    from .tracker import Tracker, FrameData, VideoInfo, _extract_face, _extract_hand
+    from .exporter import export_json, export_ae_keyframes
+except ImportError:
+    from tracker import Tracker, FrameData, VideoInfo, _extract_face, _extract_hand
+    from exporter import export_json, export_ae_keyframes
+
+
+# ── 테마 색상 ──────────────────────────────────────────────────────────────
+BG_DARK   = "#1a1a2e"
+BG_PANEL  = "#16213e"
+BG_CTRL   = "#0f3460"
+ACCENT    = "#4a7fff"
+ACCENT_R  = "#e94560"
+TEXT_W    = "#e0e0ff"
+TEXT_G    = "#8888aa"
+
+CANVAS_W  = 840
+CANVAS_H  = 560
+CTRL_W    = 230
+
+
+class CameraPanel:
+    def __init__(self, parent: tk.Tk):
+        self.win = tk.Toplevel(parent)
+        self.win.title("PoseTracker — 카메라 추적")
+        self.win.geometry(f"{CANVAS_W + CTRL_W + 36}x{CANVAS_H + 24}")
+        self.win.minsize(900, 500)
+        self.win.configure(bg=BG_DARK)
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # ── 상태 ──────────────────────────────────────────────────────────
+        self._running    = False
+        self._recording  = False
+        self._fps        = 30          # 캡처 스레드에서 사용할 정수값
+        self._fps_var    = tk.IntVar(value=30)
+        self._show_overlay = tk.BooleanVar(value=True)
+        self._status_var = tk.StringVar(value="대기중")
+        self._frame_q: queue.Queue = queue.Queue(maxsize=2)
+        self._frames_data: list[FrameData] = []
+        self._cap         = None
+        self._cap_thread  = None
+        self._is_file_mode = False
+        self._writer     = None        # cv2.VideoWriter
+        self._tmp_path   = None
+        self._after_id   = None
+        self._photo      = None        # GC 방지용 PhotoImage 참조
+        self._cam_w      = 0
+        self._cam_h      = 0
+        self._tracker    = Tracker()
+
+        self._build_ui()
+        # 패널 열리면 자동으로 카메라 시작
+        self.win.after(200, self._start_camera)
+
+    # ── UI 구성 ────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        # 좌측: 카메라 캔버스
+        left = tk.Frame(self.win, bg=BG_DARK)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 6), pady=12)
+
+        self._canvas = tk.Canvas(
+            left, bg="#000011",
+            highlightthickness=1, highlightbackground="#333355",
+        )
+        self._canvas.pack(fill=tk.BOTH, expand=True)
+        self._draw_placeholder()
+
+        # 우측: 컨트롤 패널
+        right = tk.Frame(self.win, bg=BG_PANEL, width=CTRL_W)
+        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 12), pady=12)
+        right.pack_propagate(False)
+
+        # ── 프레임 레이트 ──
+        self._section_label(right, "프레임 레이트")
+        fps_row = tk.Frame(right, bg=BG_PANEL)
+        fps_row.pack(pady=(0, 6))
+        for val in (30, 60):
+            tk.Radiobutton(
+                fps_row,
+                text=f"{val} fps",
+                variable=self._fps_var, value=val,
+                fg=TEXT_W, bg=BG_PANEL,
+                selectcolor=BG_CTRL,
+                activeforeground=TEXT_W, activebackground=BG_PANEL,
+                font=("Segoe UI", 11),
+                command=self._on_fps_change,
+            ).pack(side=tk.LEFT, padx=10)
+
+        self._separator(right)
+
+        # ── 랜드마크 표시 ──
+        self._section_label(right, "오버레이")
+        tk.Checkbutton(
+            right,
+            text="랜드마크 표시",
+            variable=self._show_overlay,
+            font=("Segoe UI", 11),
+            fg=TEXT_W, bg=BG_PANEL,
+            selectcolor=BG_CTRL,
+            activeforeground=TEXT_W, activebackground=BG_PANEL,
+        ).pack(pady=(0, 4))
+
+        self._separator(right)
+
+        # ── 카메라 버튼 ──
+        self._cam_btn = self._make_btn(
+            right, "카메라 시작", ACCENT,
+            command=self._toggle_camera,
+        )
+
+        self._separator(right)
+
+        # ── 녹화 버튼 ──
+        self._rec_btn = self._make_btn(
+            right, "녹화 시작", "#333355",
+            fg=TEXT_G, state=tk.DISABLED,
+            command=self._toggle_record,
+        )
+
+        self._separator(right)
+
+        # ── 상태 표시 ──
+        self._section_label(right, "상태")
+        tk.Label(
+            right,
+            textvariable=self._status_var,
+            font=("Segoe UI", 10),
+            fg="#4aff9e", bg=BG_PANEL,
+            wraplength=CTRL_W - 20,
+            justify=tk.CENTER,
+        ).pack(pady=4)
+
+        # REC 깜빡임 표시
+        self._rec_ind = tk.Label(
+            right, text="",
+            font=("Segoe UI", 12, "bold"),
+            fg=ACCENT_R, bg=BG_PANEL,
+        )
+        self._rec_ind.pack(pady=2)
+
+    def _section_label(self, parent, text: str):
+        tk.Label(
+            parent, text=text,
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT_G, bg=BG_PANEL,
+        ).pack(pady=(14, 4))
+
+    def _separator(self, parent):
+        ttk.Separator(parent, orient="horizontal").pack(
+            fill=tk.X, pady=8, padx=12,
+        )
+
+    def _make_btn(self, parent, text, bg,
+                  fg="white", state=tk.NORMAL, command=None):
+        b = tk.Button(
+            parent, text=text,
+            font=("Segoe UI", 11, "bold"),
+            bg=bg, fg=fg,
+            activebackground=bg, activeforeground=fg,
+            relief=tk.FLAT, cursor="hand2",
+            width=18, height=2,
+            state=state, command=command,
+        )
+        b.pack(pady=4)
+        return b
+
+    def _draw_placeholder(self):
+        self._canvas.update_idletasks()
+        w = self._canvas.winfo_width()  or CANVAS_W
+        h = self._canvas.winfo_height() or CANVAS_H
+        self._canvas.delete("all")
+        self._canvas.create_text(
+            w // 2, h // 2,
+            text="카메라를 시작하세요",
+            fill="#444466", font=("Segoe UI", 18),
+        )
+
+    # ── FPS 변경 ──────────────────────────────────────────────────────────
+    def _on_fps_change(self):
+        self._fps = self._fps_var.get()
+        if self._running and self._cap:
+            self._cap.set(cv2.CAP_PROP_FPS, self._fps)
+
+    # ── 카메라 토글 ────────────────────────────────────────────────────────
+    def _toggle_camera(self):
+        if not self._running:
+            self._start_camera()
+        else:
+            self._stop_camera()
+
+    def _start_camera(self):
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            cap.release()
+            # 카메라 없음 → 영상 파일로 대체 여부 묻기
+            from tkinter import filedialog
+            ans = messagebox.askyesno(
+                "카메라 없음",
+                "웹캠을 찾을 수 없습니다.\n\n"
+                "영상 파일로 대신 실행하시겠습니까?\n"
+                "(WSL2 환경에서는 영상 파일을 사용하세요)",
+                parent=self.win,
+            )
+            if not ans:
+                return
+            path = filedialog.askopenfilename(
+                parent=self.win,
+                title="영상 파일 선택",
+                filetypes=[("영상 파일", "*.mp4 *.avi *.mov *.mkv"), ("모든 파일", "*.*")],
+            )
+            if not path:
+                return
+            cap = cv2.VideoCapture(path)
+            if not cap.isOpened():
+                messagebox.showerror("오류", f"파일을 열 수 없습니다:\n{path}", parent=self.win)
+                return
+            self._is_file_mode = True
+        else:
+            self._is_file_mode = False
+
+        self._fps = self._fps_var.get()
+        cap.set(cv2.CAP_PROP_FPS, self._fps)
+        self._cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._cap     = cap
+        self._running = True
+
+        self._cam_btn.config(text="카메라 중지", bg=ACCENT_R)
+        self._rec_btn.config(
+            state=tk.NORMAL, bg=ACCENT_R, fg="white", text="녹화 시작",
+        )
+        self._status_var.set("카메라 실행중")
+
+        self._cap_thread = threading.Thread(
+            target=self._capture_loop, daemon=True,
+        )
+        self._cap_thread.start()
+        self._schedule_display()
+
+    def _stop_camera(self):
+        if self._recording:
+            self._stop_record(cancelled=True)
+
+        self._running = False
+
+        if self._after_id:
+            self.win.after_cancel(self._after_id)
+            self._after_id = None
+
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+
+        self._cam_btn.config(text="카메라 시작", bg=ACCENT)
+        self._rec_btn.config(
+            state=tk.DISABLED, bg="#333355", fg=TEXT_G, text="녹화 시작",
+        )
+        self._status_var.set("대기중")
+        self._rec_ind.config(text="")
+        self._draw_placeholder()
+
+    # ── 녹화 토글 ──────────────────────────────────────────────────────────
+    def _toggle_record(self):
+        if not self._recording:
+            self._start_record()
+        else:
+            self._stop_record()
+
+    def _start_record(self):
+        self._tmp_path = os.path.join(
+            tempfile.gettempdir(), "_posetracker_rec.mp4",
+        )
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._writer = cv2.VideoWriter(
+            self._tmp_path, fourcc, self._fps,
+            (self._cam_w, self._cam_h),
+        )
+        self._frames_data = []
+        self._recording = True
+        self._rec_btn.config(text="녹화 중지", bg="#cc2222")
+        self._status_var.set(f"녹화중  ({self._fps} fps)")
+        self._blink()
+
+    def _stop_record(self, cancelled: bool = False):
+        self._recording = False
+        if self._writer:
+            self._writer.release()
+            self._writer = None
+        self._rec_btn.config(text="녹화 시작", bg=ACCENT_R)
+        self._rec_ind.config(text="")
+
+        if cancelled:
+            self._cleanup_tmp()
+            return
+
+        self._status_var.set("저장 경로 선택...")
+
+        save_path = filedialog.asksaveasfilename(
+            parent=self.win,
+            title="영상 저장 위치 선택",
+            defaultextension=".mp4",
+            filetypes=[("MP4 파일", "*.mp4"), ("모든 파일", "*.*")],
+        )
+
+        if not save_path:
+            self._cleanup_tmp()
+            self._status_var.set("카메라 실행중")
+            return
+
+        # 임시 파일 → 지정 경로로 이동
+        shutil.move(self._tmp_path, save_path)
+        self._tmp_path = None
+
+        # AE 내보내기 (별도 스레드)
+        out_dir   = os.path.dirname(save_path) or "."
+        json_path = os.path.join(out_dir, "tracking_data.json")
+        ae_dir    = os.path.join(out_dir, "ae_keyframes")
+        fps       = self._fps
+        frames    = list(self._frames_data)
+        cam_w, cam_h = self._cam_w, self._cam_h
+
+        self._status_var.set("AE 데이터 내보내는 중...")
+
+        def _export():
+            if frames:
+                info = VideoInfo(
+                    width=cam_w, height=cam_h,
+                    fps=fps, total_frames=len(frames),
+                )
+                export_json(frames, info, json_path)
+                export_ae_keyframes(frames, info, ae_dir)
+
+            def _done():
+                self._status_var.set(f"저장 완료! ({len(frames)} 프레임)")
+                messagebox.showinfo(
+                    "저장 완료",
+                    f"영상:  {save_path}\n"
+                    f"JSON:  {json_path}\n"
+                    f"AE 키프레임:  {ae_dir}/",
+                    parent=self.win,
+                )
+                self._status_var.set("카메라 실행중")
+
+            self.win.after(0, _done)
+
+        threading.Thread(target=_export, daemon=True).start()
+
+    def _cleanup_tmp(self):
+        if self._tmp_path and os.path.exists(self._tmp_path):
+            os.remove(self._tmp_path)
+        self._tmp_path = None
+
+    def _blink(self):
+        if not self._recording:
+            return
+        cur = self._rec_ind.cget("text")
+        self._rec_ind.config(text="" if cur else "● REC")
+        self.win.after(500, self._blink)
+
+    # ── 캡처 루프 (백그라운드 스레드) ────────────────────────────────────
+    def _capture_loop(self):
+        face_opts = mp_vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
+            running_mode=RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        hand_opts = mp_vision.HandLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL),
+            running_mode=RunningMode.IMAGE,
+            num_hands=2,
+            min_hand_detection_confidence=0.5,
+            min_hand_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+        try:
+            face_det = mp_vision.FaceLandmarker.create_from_options(face_opts)
+            hand_det = mp_vision.HandLandmarker.create_from_options(hand_opts)
+        except Exception as e:
+            print(f"[MediaPipe init error] {e}")
+            self._capture_loop_raw()
+            return
+
+        try:
+            while self._running and self._cap and self._cap.isOpened():
+                ret, frame = self._cap.read()
+                if not ret:
+                    break
+
+                h_px, w_px = frame.shape[:2]
+                rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                try:
+                    face_res = face_det.detect(mp_img)
+                    hand_res = hand_det.detect(mp_img)
+                except Exception as e:
+                    print(f"[detect error] {e}")
+                    face_res = type('R', (), {'face_landmarks': [], 'hand_landmarks': [], 'handedness': []})()
+                    hand_res = face_res
+
+                # 오버레이 그리기
+                overlay = frame.copy()
+                if self._show_overlay.get():
+                    if face_res.face_landmarks:
+                        mp_draw.draw_landmarks(
+                            overlay,
+                            face_res.face_landmarks[0],
+                            FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+                            landmark_drawing_spec=None,
+                            connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
+                        )
+                    if hand_res.hand_landmarks:
+                        for hlms in hand_res.hand_landmarks:
+                            mp_draw.draw_landmarks(
+                                overlay, hlms,
+                                HandLandmarksConnections.HAND_CONNECTIONS,
+                                landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
+                                connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
+                            )
+
+                # 녹화 처리
+                if self._recording:
+                    if self._writer:
+                        self._writer.write(overlay)
+                    self._collect_frame(face_res, hand_res, w_px, h_px)
+
+                # 디스플레이 큐에 넣기 (BGR → RGB)
+                try:
+                    self._frame_q.put_nowait(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+                except queue.Full:
+                    pass
+        finally:
+            face_det.close()
+            hand_det.close()
+
+    def _capture_loop_raw(self):
+        """MediaPipe 없이 원본 영상만 표시"""
+        while self._running and self._cap and self._cap.isOpened():
+            ret, frame = self._cap.read()
+            if not ret:
+                break
+            if self._recording and self._writer:
+                self._writer.write(frame)
+            try:
+                self._frame_q.put_nowait(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            except queue.Full:
+                pass
+
+    def _collect_frame(self, face_res, hand_res, w: int, h: int):
+        idx = len(self._frames_data)
+        fd  = FrameData(index=idx, timestamp=idx / max(self._fps, 1))
+        fd.face = _extract_face(face_res, w, h)
+        if hand_res.hand_landmarks:
+            for hlms, hedness in zip(hand_res.hand_landmarks, hand_res.handedness):
+                hd = _extract_hand(hlms, hedness, w, h)
+                if hd.side == "left":
+                    fd.left_hand = hd
+                else:
+                    fd.right_hand = hd
+        self._frames_data.append(fd)
+
+    # ── 디스플레이 갱신 (메인 스레드) ────────────────────────────────────
+    def _schedule_display(self):
+        if not self._running:
+            return
+        delay = max(1, 1000 // self._fps)
+        self._after_id = self.win.after(delay, self._update_canvas)
+
+    def _update_canvas(self):
+        if not self._running:
+            return
+
+        try:
+            frame_rgb = self._frame_q.get_nowait()
+            cw = self._canvas.winfo_width()
+            ch = self._canvas.winfo_height()
+            if cw <= 1: cw = CANVAS_W
+            if ch <= 1: ch = CANVAS_H
+            if True:
+                img = Image.fromarray(frame_rgb)
+                img = img.resize((cw, ch), Image.LANCZOS)
+                self._photo = ImageTk.PhotoImage(img)
+                self._canvas.delete("all")
+                self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+
+                # 녹화 중 REC 인디케이터
+                if self._recording:
+                    self._canvas.create_oval(
+                        12, 12, 30, 30, fill="red", outline="",
+                    )
+                    self._canvas.create_text(
+                        38, 21, text="REC",
+                        fill="red", font=("Segoe UI", 11, "bold"),
+                        anchor=tk.W,
+                    )
+        except queue.Empty:
+            pass
+        except Exception as e:
+            print(f"[Display error] {e}")
+
+        self._schedule_display()
+
+    # ── 종료 ──────────────────────────────────────────────────────────────
+    def _on_close(self):
+        self._stop_camera()
+        self.win.destroy()

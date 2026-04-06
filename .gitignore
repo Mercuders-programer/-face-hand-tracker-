@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# 모델 파일 (용량 큰 바이너리 — 별도 다운로드)
+models/*.task
+models/*.deb
+
+# WSL2 전용 라이브러리
+lib/
+
+# 출력 결과물
+output/
+*.mp4
+*.avi
+*.mov
+
+# 로그
+*.log
+
+# 세션 대화 기록 (개인)
+sessions/
+
+# Claude Code 설정
+.claude/
+
+# IDE
+.vscode/
+.idea/
