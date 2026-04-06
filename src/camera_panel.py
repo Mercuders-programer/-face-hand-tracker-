@@ -71,7 +71,9 @@ class CameraPanel:
         self._recording  = False
         self._fps        = 30          # 캡처 스레드에서 사용할 정수값
         self._fps_var    = tk.IntVar(value=30)
-        self._show_overlay = tk.BooleanVar(value=True)
+        self._show_face  = tk.BooleanVar(value=True)
+        self._show_body  = tk.BooleanVar(value=True)
+        self._show_hands = tk.BooleanVar(value=True)
         self._status_var = tk.StringVar(value="대기중")
         self._frame_q: queue.Queue = queue.Queue(maxsize=2)
         self._frames_data: list[FrameData] = []
@@ -128,15 +130,19 @@ class CameraPanel:
 
         # ── 랜드마크 표시 ──
         self._section_label(right, "오버레이")
-        tk.Checkbutton(
-            right,
-            text="랜드마크 표시",
-            variable=self._show_overlay,
-            font=("Segoe UI", 11),
-            fg=TEXT_W, bg=BG_PANEL,
-            selectcolor=BG_CTRL,
-            activeforeground=TEXT_W, activebackground=BG_PANEL,
-        ).pack(pady=(0, 4))
+        for _var, _lbl in [
+            (self._show_face,  "얼굴  (눈·코·입)"),
+            (self._show_body,  "몸  (몸통·팔·다리)"),
+            (self._show_hands, "손  (손가락·손바닥)"),
+        ]:
+            tk.Checkbutton(
+                right, text=_lbl, variable=_var,
+                font=("Segoe UI", 10),
+                fg=TEXT_W, bg=BG_PANEL,
+                selectcolor=BG_CTRL,
+                activeforeground=TEXT_W, activebackground=BG_PANEL,
+                anchor=tk.W,
+            ).pack(fill=tk.X, padx=8, pady=(0, 2))
 
         self._separator(right)
 
@@ -356,6 +362,9 @@ class CameraPanel:
         fps       = self._fps
         frames    = list(self._frames_data)
         cam_w, cam_h = self._cam_w, self._cam_h
+        inc_face  = self._show_face.get()
+        inc_body  = self._show_body.get()
+        inc_hands = self._show_hands.get()
 
         self._status_var.set("AE 데이터 내보내는 중...")
 
@@ -365,8 +374,10 @@ class CameraPanel:
                     width=cam_w, height=cam_h,
                     fps=fps, total_frames=len(frames),
                 )
-                export_json(frames, info, json_path)
-                export_ae_keyframes(frames, info, ae_dir)
+                export_json(frames, info, json_path,
+                            include_face=inc_face, include_body=inc_body, include_hands=inc_hands)
+                export_ae_keyframes(frames, info, ae_dir,
+                                    include_face=inc_face, include_body=inc_body, include_hands=inc_hands)
 
             def _done():
                 self._status_var.set(f"저장 완료! ({len(frames)} 프레임)")
@@ -455,73 +466,66 @@ class CameraPanel:
 
                 # 오버레이 그리기
                 overlay = frame.copy()
-                if self._show_overlay.get():
-                    # ── 포즈 스켈레톤 (먼저 그려 얼굴/손 위에 덮이지 않게)
-                    if pose_res.pose_landmarks:
-                        _pl = pose_res.pose_landmarks[0]
-                        _pc = (50, 220, 50)   # BGR green
-                        _pc_l = (255, 160, 50)  # BGR cyan-ish (left)
-                        _pc_r = (50, 160, 255)  # BGR orange-ish (right)
-                        # 연결선
-                        _conns = [
-                            (11, 12, _pc),      # 어깨 가로선
-                            (11, 23, _pc_l),    # 왼쪽 몸통
-                            (12, 24, _pc_r),    # 오른쪽 몸통
-                            (23, 24, _pc),      # 골반 가로선
-                            (11, 13, _pc_l), (13, 15, _pc_l),  # 왼팔
-                            (12, 14, _pc_r), (14, 16, _pc_r),  # 오른팔
-                            (23, 25, _pc_l), (25, 27, _pc_l),  # 왼다리
-                            (24, 26, _pc_r), (26, 28, _pc_r),  # 오른다리
-                        ]
-                        for _s, _e, _col in _conns:
-                            if (_s < len(_pl) and _e < len(_pl)
-                                    and _pl[_s].visibility > 0.3
-                                    and _pl[_e].visibility > 0.3):
-                                _p1 = (int(_pl[_s].x*w_px), int(_pl[_s].y*h_px))
-                                _p2 = (int(_pl[_e].x*w_px), int(_pl[_e].y*h_px))
-                                cv2.line(overlay, _p1, _p2, _col, 2)
-                        # 주요 관절 점
-                        for _i, _col in [(11,_pc_l),(12,_pc_r),(13,_pc_l),(14,_pc_r),
-                                         (15,_pc_l),(16,_pc_r),(23,_pc_l),(24,_pc_r),
-                                         (25,_pc_l),(26,_pc_r),(27,_pc_l),(28,_pc_r)]:
-                            if _i < len(_pl) and _pl[_i].visibility > 0.3:
-                                cv2.circle(overlay,
-                                           (int(_pl[_i].x*w_px), int(_pl[_i].y*h_px)),
-                                           6, _col, -1)
-
-                    # ── 얼굴
-                    if face_res.face_landmarks:
+                # ── 포즈 스켈레톤 (먼저 그려 얼굴/손 위에 덮이지 않게)
+                if self._show_body.get() and pose_res.pose_landmarks:
+                    _pl = pose_res.pose_landmarks[0]
+                    _pc   = (50, 220, 50)
+                    _pc_l = (255, 160, 50)
+                    _pc_r = (50, 160, 255)
+                    _conns = [
+                        (11, 12, _pc),
+                        (11, 23, _pc_l), (12, 24, _pc_r),
+                        (23, 24, _pc),
+                        (11, 13, _pc_l), (13, 15, _pc_l),
+                        (12, 14, _pc_r), (14, 16, _pc_r),
+                        (23, 25, _pc_l), (25, 27, _pc_l),
+                        (24, 26, _pc_r), (26, 28, _pc_r),
+                    ]
+                    for _s, _e, _col in _conns:
+                        if (_s < len(_pl) and _e < len(_pl)
+                                and _pl[_s].visibility > 0.3
+                                and _pl[_e].visibility > 0.3):
+                            _p1 = (int(_pl[_s].x*w_px), int(_pl[_s].y*h_px))
+                            _p2 = (int(_pl[_e].x*w_px), int(_pl[_e].y*h_px))
+                            cv2.line(overlay, _p1, _p2, _col, 2)
+                    for _i, _col in [(11,_pc_l),(12,_pc_r),(13,_pc_l),(14,_pc_r),
+                                     (15,_pc_l),(16,_pc_r),(23,_pc_l),(24,_pc_r),
+                                     (25,_pc_l),(26,_pc_r),(27,_pc_l),(28,_pc_r)]:
+                        if _i < len(_pl) and _pl[_i].visibility > 0.3:
+                            cv2.circle(overlay,
+                                       (int(_pl[_i].x*w_px), int(_pl[_i].y*h_px)),
+                                       6, _col, -1)
+                # ── 얼굴
+                if self._show_face.get() and face_res.face_landmarks:
+                    mp_draw.draw_landmarks(
+                        overlay,
+                        face_res.face_landmarks[0],
+                        FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
+                    )
+                    _lf = face_res.face_landmarks[0]
+                    _nc = (0, 230, 180)
+                    for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
+                                   (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
+                        if _s < len(_lf) and _e < len(_lf):
+                            _p1 = (int(_lf[_s].x*w_px), int(_lf[_s].y*h_px))
+                            _p2 = (int(_lf[_e].x*w_px), int(_lf[_e].y*h_px))
+                            cv2.line(overlay, _p1, _p2, _nc, 1)
+                    for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
+                        if _i < len(_lf):
+                            cv2.circle(overlay,
+                                       (int(_lf[_i].x*w_px), int(_lf[_i].y*h_px)),
+                                       2, _nc, -1)
+                # ── 손
+                if self._show_hands.get() and hand_res.hand_landmarks:
+                    for hlms in hand_res.hand_landmarks:
                         mp_draw.draw_landmarks(
-                            overlay,
-                            face_res.face_landmarks[0],
-                            FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                            landmark_drawing_spec=None,
-                            connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
+                            overlay, hlms,
+                            HandLandmarksConnections.HAND_CONNECTIONS,
+                            landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
+                            connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
                         )
-                        # 코 랜드마크 (CONTOURS에 미포함 → cv2로 직접 그리기)
-                        _lf = face_res.face_landmarks[0]
-                        _nc = (0, 230, 180)  # teal
-                        for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
-                                       (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
-                            if _s < len(_lf) and _e < len(_lf):
-                                _p1 = (int(_lf[_s].x*w_px), int(_lf[_s].y*h_px))
-                                _p2 = (int(_lf[_e].x*w_px), int(_lf[_e].y*h_px))
-                                cv2.line(overlay, _p1, _p2, _nc, 1)
-                        for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
-                            if _i < len(_lf):
-                                cv2.circle(overlay,
-                                           (int(_lf[_i].x*w_px), int(_lf[_i].y*h_px)),
-                                           2, _nc, -1)
-
-                    # ── 손
-                    if hand_res.hand_landmarks:
-                        for hlms in hand_res.hand_landmarks:
-                            mp_draw.draw_landmarks(
-                                overlay, hlms,
-                                HandLandmarksConnections.HAND_CONNECTIONS,
-                                landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
-                                connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
-                            )
 
                 # 녹화 처리
                 if self._recording:

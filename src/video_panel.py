@@ -77,7 +77,9 @@ class VideoPanel:
         self._playing       = False
         self._dragging      = False
         self._drag_was_playing = False
-        self._show_overlay       = tk.BooleanVar(value=False)
+        self._show_face  = tk.BooleanVar(value=False)
+        self._show_body  = tk.BooleanVar(value=False)
+        self._show_hands = tk.BooleanVar(value=False)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._export_status_var  = tk.StringVar(value="")
         self._face_det      = None
@@ -88,7 +90,8 @@ class VideoPanel:
 
         self._build_ui()
         self._init_mediapipe()
-        self._show_overlay.trace_add("write", lambda *_: self._refresh_frame())
+        for _v in (self._show_face, self._show_body, self._show_hands):
+            _v.trace_add("write", lambda *_: self._refresh_frame())
         # 첫 프레임 표시 (레이아웃 완료 후)
         self.win.after(100, lambda: self._seek_to(0))
 
@@ -222,16 +225,19 @@ class VideoPanel:
             fg=TEXT_G, bg=BG_PANEL, anchor="w",
         ).pack(fill=tk.X, padx=14, pady=(0, 4))
 
-        tk.Checkbutton(
-            parent,
-            text="랜드마크 표시",
-            variable=self._show_overlay,
-            font=("Segoe UI", 10),
-            fg=TEXT_W, bg=BG_PANEL,
-            selectcolor="#0f3460",
-            activeforeground=TEXT_W, activebackground=BG_PANEL,
-            anchor="w",
-        ).pack(fill=tk.X, padx=10, pady=(0, 4))
+        for _var, _lbl in [
+            (self._show_face,  "얼굴  (눈·코·입)"),
+            (self._show_body,  "몸  (몸통·팔·다리)"),
+            (self._show_hands, "손  (손가락·손바닥)"),
+        ]:
+            tk.Checkbutton(
+                parent, text=_lbl, variable=_var,
+                font=("Segoe UI", 10),
+                fg=TEXT_W, bg=BG_PANEL,
+                selectcolor="#0f3460",
+                activeforeground=TEXT_W, activebackground=BG_PANEL,
+                anchor="w",
+            ).pack(fill=tk.X, padx=10, pady=(0, 2))
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
@@ -407,7 +413,7 @@ class VideoPanel:
 
     # ── 프레임 표시 ────────────────────────────────────────────────────────
     def _display_frame(self, bgr):
-        if self._show_overlay.get():
+        if self._show_face.get() or self._show_body.get() or self._show_hands.get():
             bgr = self._apply_overlay(bgr)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
@@ -442,20 +448,19 @@ class VideoPanel:
         _oh, _ow = overlay.shape[:2]
 
         # ── 포즈 스켈레톤 (얼굴/손 아래 레이어로 먼저 그리기)
-        if pose_res and pose_res.pose_landmarks:
+        if self._show_body.get() and pose_res and pose_res.pose_landmarks:
             _pl = pose_res.pose_landmarks[0]
-            _pc   = (50, 220, 50)    # green — 몸통 중앙선
-            _pc_l = (255, 160, 50)   # cyan-ish — 왼쪽
-            _pc_r = (50, 160, 255)   # orange-ish — 오른쪽
+            _pc   = (50, 220, 50)
+            _pc_l = (255, 160, 50)
+            _pc_r = (50, 160, 255)
             _conns = [
-                (11, 12, _pc),       # 어깨 가로선
-                (11, 23, _pc_l),     # 왼쪽 몸통
-                (12, 24, _pc_r),     # 오른쪽 몸통
-                (23, 24, _pc),       # 골반 가로선
-                (11, 13, _pc_l), (13, 15, _pc_l),   # 왼팔
-                (12, 14, _pc_r), (14, 16, _pc_r),   # 오른팔
-                (23, 25, _pc_l), (25, 27, _pc_l),   # 왼다리
-                (24, 26, _pc_r), (26, 28, _pc_r),   # 오른다리
+                (11, 12, _pc),
+                (11, 23, _pc_l), (12, 24, _pc_r),
+                (23, 24, _pc),
+                (11, 13, _pc_l), (13, 15, _pc_l),
+                (12, 14, _pc_r), (14, 16, _pc_r),
+                (23, 25, _pc_l), (25, 27, _pc_l),
+                (24, 26, _pc_r), (26, 28, _pc_r),
             ]
             for _s, _e, _col in _conns:
                 if (_s < len(_pl) and _e < len(_pl)
@@ -473,7 +478,7 @@ class VideoPanel:
                                6, _col, -1)
 
         # ── 얼굴
-        if face_res.face_landmarks:
+        if self._show_face.get() and face_res.face_landmarks:
             mp_draw.draw_landmarks(
                 overlay,
                 face_res.face_landmarks[0],
@@ -481,9 +486,8 @@ class VideoPanel:
                 landmark_drawing_spec=None,
                 connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
             )
-            # 코 랜드마크 (CONTOURS에 미포함 → cv2로 직접 그리기)
             _lf = face_res.face_landmarks[0]
-            _nc = (0, 230, 180)  # teal
+            _nc = (0, 230, 180)
             for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
                            (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
                 if _s < len(_lf) and _e < len(_lf):
@@ -497,7 +501,7 @@ class VideoPanel:
                                2, _nc, -1)
 
         # ── 손
-        if hand_res.hand_landmarks:
+        if self._show_hands.get() and hand_res.hand_landmarks:
             for hlms in hand_res.hand_landmarks:
                 mp_draw.draw_landmarks(
                     overlay, hlms,
@@ -554,6 +558,9 @@ class VideoPanel:
 
         self._set_export_btns(tk.DISABLED)
         self._export_status_var.set("분석 시작...")
+        inc_face  = self._show_face.get()
+        inc_body  = self._show_body.get()
+        inc_hands = self._show_hands.get()
 
         def _run():
             frames_data, info = self._process_all_frames()
@@ -566,10 +573,12 @@ class VideoPanel:
 
             try:
                 if mode == "json":
-                    export_json(frames_data, info, save_path)
+                    export_json(frames_data, info, save_path,
+                                include_face=inc_face, include_body=inc_body, include_hands=inc_hands)
                     msg = f"JSON 저장 완료!\n{save_path}"
                 else:
-                    export_ae_keyframes(frames_data, info, save_path)
+                    export_ae_keyframes(frames_data, info, save_path,
+                                        include_face=inc_face, include_body=inc_body, include_hands=inc_hands)
                     msg = f"AE 키프레임 저장 완료!\n{save_path}/"
             except Exception as e:
                 msg = None
@@ -610,10 +619,10 @@ class VideoPanel:
         if not save_path:
             return
 
-        with_overlay = self._show_overlay.get()
+        with_overlay = self._show_face.get() or self._show_body.get() or self._show_hands.get()
 
         # 오버레이 모드인데 MediaPipe 없으면 경고
-        if with_overlay and (self._face_det is None or self._hand_det is None):
+        if with_overlay and self._face_det is None:
             messagebox.showwarning(
                 "경고",
                 "MediaPipe 초기화 실패 — 랜드마크 없이 원본 영상으로 저장합니다.",

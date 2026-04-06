@@ -15,7 +15,9 @@ except ImportError:
 # JSON 내보내기
 # ──────────────────────────────────────────────────────────────────────────
 
-def export_json(frames: List[FrameData], info: VideoInfo, out_path: str) -> bool:
+def export_json(frames: List[FrameData], info: VideoInfo, out_path: str,
+                include_face: bool = True, include_body: bool = True,
+                include_hands: bool = True) -> bool:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     def pt(p: Point2D) -> dict:
@@ -27,6 +29,7 @@ def export_json(frames: List[FrameData], info: VideoInfo, out_path: str) -> bool
             "total_frames": info.total_frames,
             "width":        info.width,
             "height":       info.height,
+            "included":     {"face": include_face, "body": include_body, "hands": include_hands},
         },
         "landmark_info": {
             "face": {
@@ -70,57 +73,59 @@ def export_json(frames: List[FrameData], info: VideoInfo, out_path: str) -> bool
         jf = {"frame": fd.index, "timestamp": round(fd.timestamp, 4)}
 
         # 얼굴
-        jface = {"detected": fd.face.detected}
-        if fd.face.detected:
-            jface["named"] = {
-                "right_eye_outer":  pt(fd.face.right_eye_outer),
-                "right_eye_inner":  pt(fd.face.right_eye_inner),
-                "right_iris":       pt(fd.face.right_iris),
-                "left_eye_inner":   pt(fd.face.left_eye_inner),
-                "left_eye_outer":   pt(fd.face.left_eye_outer),
-                "left_iris":        pt(fd.face.left_iris),
-                "nose_bridge_top":  pt(fd.face.nose_bridge_top),
-                "nose_tip":         pt(fd.face.nose_tip),
-                "mouth_right":      pt(fd.face.mouth_right),
-                "mouth_upper":      pt(fd.face.mouth_upper),
-                "mouth_left":       pt(fd.face.mouth_left),
-                "mouth_lower":      pt(fd.face.mouth_lower),
-            }
-            jface["all_landmarks"] = [pt(p) for p in fd.face.all]
-        jf["face"] = jface
+        if include_face:
+            jface = {"detected": fd.face.detected}
+            if fd.face.detected:
+                jface["named"] = {
+                    "right_eye_outer":  pt(fd.face.right_eye_outer),
+                    "right_eye_inner":  pt(fd.face.right_eye_inner),
+                    "right_iris":       pt(fd.face.right_iris),
+                    "left_eye_inner":   pt(fd.face.left_eye_inner),
+                    "left_eye_outer":   pt(fd.face.left_eye_outer),
+                    "left_iris":        pt(fd.face.left_iris),
+                    "nose_bridge_top":  pt(fd.face.nose_bridge_top),
+                    "nose_tip":         pt(fd.face.nose_tip),
+                    "mouth_right":      pt(fd.face.mouth_right),
+                    "mouth_upper":      pt(fd.face.mouth_upper),
+                    "mouth_left":       pt(fd.face.mouth_left),
+                    "mouth_lower":      pt(fd.face.mouth_lower),
+                }
+                jface["all_landmarks"] = [pt(p) for p in fd.face.all]
+            jf["face"] = jface
 
         # 손
-        def hand_to_dict(h):
-            d = {"detected": h.detected, "side": h.side}
-            if h.detected:
-                d["landmarks"] = [
-                    {**pt(lm), "index": i, "name": HAND_LANDMARK_NAMES[i]}
-                    for i, lm in enumerate(h.landmarks)
-                ]
-            return d
-
-        jf["left_hand"]  = hand_to_dict(fd.left_hand)
-        jf["right_hand"] = hand_to_dict(fd.right_hand)
+        if include_hands:
+            def hand_to_dict(h):
+                d = {"detected": h.detected, "side": h.side}
+                if h.detected:
+                    d["landmarks"] = [
+                        {**pt(lm), "index": i, "name": HAND_LANDMARK_NAMES[i]}
+                        for i, lm in enumerate(h.landmarks)
+                    ]
+                return d
+            jf["left_hand"]  = hand_to_dict(fd.left_hand)
+            jf["right_hand"] = hand_to_dict(fd.right_hand)
 
         # 포즈
-        jpose = {"detected": fd.pose.detected}
-        if fd.pose.detected:
-            jpose["key_joints"] = {
-                "left_shoulder":  pt(fd.pose.left_shoulder),
-                "right_shoulder": pt(fd.pose.right_shoulder),
-                "left_elbow":     pt(fd.pose.left_elbow),
-                "right_elbow":    pt(fd.pose.right_elbow),
-                "left_wrist":     pt(fd.pose.left_wrist),
-                "right_wrist":    pt(fd.pose.right_wrist),
-                "left_hip":       pt(fd.pose.left_hip),
-                "right_hip":      pt(fd.pose.right_hip),
-                "left_knee":      pt(fd.pose.left_knee),
-                "right_knee":     pt(fd.pose.right_knee),
-                "left_ankle":     pt(fd.pose.left_ankle),
-                "right_ankle":    pt(fd.pose.right_ankle),
-            }
-            jpose["all_landmarks"] = [pt(p) for p in fd.pose.all]
-        jf["pose"] = jpose
+        if include_body:
+            jpose = {"detected": fd.pose.detected}
+            if fd.pose.detected:
+                jpose["key_joints"] = {
+                    "left_shoulder":  pt(fd.pose.left_shoulder),
+                    "right_shoulder": pt(fd.pose.right_shoulder),
+                    "left_elbow":     pt(fd.pose.left_elbow),
+                    "right_elbow":    pt(fd.pose.right_elbow),
+                    "left_wrist":     pt(fd.pose.left_wrist),
+                    "right_wrist":    pt(fd.pose.right_wrist),
+                    "left_hip":       pt(fd.pose.left_hip),
+                    "right_hip":      pt(fd.pose.right_hip),
+                    "left_knee":      pt(fd.pose.left_knee),
+                    "right_knee":     pt(fd.pose.right_knee),
+                    "left_ankle":     pt(fd.pose.left_ankle),
+                    "right_ankle":    pt(fd.pose.right_ankle),
+                }
+                jpose["all_landmarks"] = [pt(p) for p in fd.pose.all]
+            jf["pose"] = jpose
 
         data["frames"].append(jf)
 
@@ -171,7 +176,9 @@ def _write_ae_file(path: str,
     return True
 
 
-def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str) -> bool:
+def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str,
+                        include_face: bool = True, include_body: bool = True,
+                        include_hands: bool = True) -> bool:
     face_dir  = os.path.join(out_dir, "face")
     lh_dir    = os.path.join(out_dir, "hands", "left")
     rh_dir    = os.path.join(out_dir, "hands", "right")
@@ -182,78 +189,78 @@ def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str) 
     ok = True
 
     # ── 얼굴 12개 포인트 ─────────────────────────────────────────────────
-    face_points = [
-        ("right_eye_outer",  lambda f: f.face.right_eye_outer),
-        ("right_eye_inner",  lambda f: f.face.right_eye_inner),
-        ("right_iris",       lambda f: f.face.right_iris),
-        ("left_eye_inner",   lambda f: f.face.left_eye_inner),
-        ("left_eye_outer",   lambda f: f.face.left_eye_outer),
-        ("left_iris",        lambda f: f.face.left_iris),
-        ("nose_bridge_top",  lambda f: f.face.nose_bridge_top),
-        ("nose_tip",         lambda f: f.face.nose_tip),
-        ("mouth_right",      lambda f: f.face.mouth_right),
-        ("mouth_upper",      lambda f: f.face.mouth_upper),
-        ("mouth_left",       lambda f: f.face.mouth_left),
-        ("mouth_lower",      lambda f: f.face.mouth_lower),
-    ]
-
-    for name, getter in face_points:
-        path = os.path.join(face_dir, f"{name}.txt")
-        ok &= _write_ae_file(path, info, frames, getter)
+    if include_face:
+        face_points = [
+            ("right_eye_outer",  lambda f: f.face.right_eye_outer),
+            ("right_eye_inner",  lambda f: f.face.right_eye_inner),
+            ("right_iris",       lambda f: f.face.right_iris),
+            ("left_eye_inner",   lambda f: f.face.left_eye_inner),
+            ("left_eye_outer",   lambda f: f.face.left_eye_outer),
+            ("left_iris",        lambda f: f.face.left_iris),
+            ("nose_bridge_top",  lambda f: f.face.nose_bridge_top),
+            ("nose_tip",         lambda f: f.face.nose_tip),
+            ("mouth_right",      lambda f: f.face.mouth_right),
+            ("mouth_upper",      lambda f: f.face.mouth_upper),
+            ("mouth_left",       lambda f: f.face.mouth_left),
+            ("mouth_lower",      lambda f: f.face.mouth_lower),
+        ]
+        for name, getter in face_points:
+            path = os.path.join(face_dir, f"{name}.txt")
+            ok &= _write_ae_file(path, info, frames, getter)
 
     # ── 손 주요 6포인트 × 2손 ────────────────────────────────────────────
-    hand_tips = [
-        ("wrist",      lambda h: h.wrist),
-        ("thumb_tip",  lambda h: h.thumb_tip),
-        ("index_tip",  lambda h: h.index_tip),
-        ("middle_tip", lambda h: h.middle_tip),
-        ("ring_tip",   lambda h: h.ring_tip),
-        ("pinky_tip",  lambda h: h.pinky_tip),
-    ]
+    if include_hands:
+        hand_tips = [
+            ("wrist",      lambda h: h.wrist),
+            ("thumb_tip",  lambda h: h.thumb_tip),
+            ("index_tip",  lambda h: h.index_tip),
+            ("middle_tip", lambda h: h.middle_tip),
+            ("ring_tip",   lambda h: h.ring_tip),
+            ("pinky_tip",  lambda h: h.pinky_tip),
+        ]
+        for name, hgetter in hand_tips:
+            ok &= _write_ae_file(
+                os.path.join(lh_dir, f"{name}.txt"), info, frames,
+                lambda f, g=hgetter: g(f.left_hand) if f.left_hand.detected else Point2D())
+            ok &= _write_ae_file(
+                os.path.join(rh_dir, f"{name}.txt"), info, frames,
+                lambda f, g=hgetter: g(f.right_hand) if f.right_hand.detected else Point2D())
 
-    for name, hgetter in hand_tips:
-        ok &= _write_ae_file(
-            os.path.join(lh_dir, f"{name}.txt"), info, frames,
-            lambda f, g=hgetter: g(f.left_hand) if f.left_hand.detected else Point2D())
-        ok &= _write_ae_file(
-            os.path.join(rh_dir, f"{name}.txt"), info, frames,
-            lambda f, g=hgetter: g(f.right_hand) if f.right_hand.detected else Point2D())
-
-    # ── 손 전체 21개 랜드마크 ────────────────────────────────────────────
-    for i, lm_name in enumerate(HAND_LANDMARK_NAMES):
-        ok &= _write_ae_file(
-            os.path.join(lh_all, f"{lm_name}.txt"), info, frames,
-            lambda f, idx=i: (f.left_hand.landmarks[idx]
-                               if f.left_hand.detected and len(f.left_hand.landmarks) > idx
-                               else Point2D()))
-        ok &= _write_ae_file(
-            os.path.join(rh_all, f"{lm_name}.txt"), info, frames,
-            lambda f, idx=i: (f.right_hand.landmarks[idx]
-                               if f.right_hand.detected and len(f.right_hand.landmarks) > idx
-                               else Point2D()))
+        # ── 손 전체 21개 랜드마크
+        for i, lm_name in enumerate(HAND_LANDMARK_NAMES):
+            ok &= _write_ae_file(
+                os.path.join(lh_all, f"{lm_name}.txt"), info, frames,
+                lambda f, idx=i: (f.left_hand.landmarks[idx]
+                                   if f.left_hand.detected and len(f.left_hand.landmarks) > idx
+                                   else Point2D()))
+            ok &= _write_ae_file(
+                os.path.join(rh_all, f"{lm_name}.txt"), info, frames,
+                lambda f, idx=i: (f.right_hand.landmarks[idx]
+                                   if f.right_hand.detected and len(f.right_hand.landmarks) > idx
+                                   else Point2D()))
 
     # ── 포즈 주요 관절 12개 ──────────────────────────────────────────────
-    pose_joints = [
-        ("left_shoulder",  lambda f: f.pose.left_shoulder),
-        ("right_shoulder", lambda f: f.pose.right_shoulder),
-        ("left_elbow",     lambda f: f.pose.left_elbow),
-        ("right_elbow",    lambda f: f.pose.right_elbow),
-        ("left_wrist",     lambda f: f.pose.left_wrist),
-        ("right_wrist",    lambda f: f.pose.right_wrist),
-        ("left_hip",       lambda f: f.pose.left_hip),
-        ("right_hip",      lambda f: f.pose.right_hip),
-        ("left_knee",      lambda f: f.pose.left_knee),
-        ("right_knee",     lambda f: f.pose.right_knee),
-        ("left_ankle",     lambda f: f.pose.left_ankle),
-        ("right_ankle",    lambda f: f.pose.right_ankle),
-    ]
-
-    for name, getter in pose_joints:
-        path = os.path.join(pose_dir, f"{name}.txt")
-        ok &= _write_ae_file(
-            path, info, frames,
-            lambda f, g=getter: g(f) if f.pose.detected else Point2D(),
-        )
+    if include_body:
+        pose_joints = [
+            ("left_shoulder",  lambda f: f.pose.left_shoulder),
+            ("right_shoulder", lambda f: f.pose.right_shoulder),
+            ("left_elbow",     lambda f: f.pose.left_elbow),
+            ("right_elbow",    lambda f: f.pose.right_elbow),
+            ("left_wrist",     lambda f: f.pose.left_wrist),
+            ("right_wrist",    lambda f: f.pose.right_wrist),
+            ("left_hip",       lambda f: f.pose.left_hip),
+            ("right_hip",      lambda f: f.pose.right_hip),
+            ("left_knee",      lambda f: f.pose.left_knee),
+            ("right_knee",     lambda f: f.pose.right_knee),
+            ("left_ankle",     lambda f: f.pose.left_ankle),
+            ("right_ankle",    lambda f: f.pose.right_ankle),
+        ]
+        for name, getter in pose_joints:
+            path = os.path.join(pose_dir, f"{name}.txt")
+            ok &= _write_ae_file(
+                path, info, frames,
+                lambda f, g=getter: g(f) if f.pose.detected else Point2D(),
+            )
 
     print(f"[Exporter] AE Keyframe Data 저장 완료: {out_dir}/")
     return ok
