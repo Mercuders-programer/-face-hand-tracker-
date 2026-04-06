@@ -62,15 +62,33 @@ class MainApp:
             command=self._open_camera,
         ).pack(pady=5)
 
-        # 버튼 2 — 영상 분석 (미구현)
+        # 버튼 2 — 영상 분석
         tk.Button(
             self.root, text="  영상 분석  ",
             font=("Segoe UI", 13, "bold"),
-            bg=BTN_DIM, fg=TEXT_G,
-            activebackground="#3a3a5e", activeforeground="#aaaacc",
+            bg=ACCENT, fg="white",
+            activebackground="#3a6fee", activeforeground="white",
             relief=tk.FLAT, cursor="hand2",
             padx=24, pady=10,
+            command=self._open_video,
         ).pack(pady=5)
+
+    # ── 영상 분석 패널 열기 ────────────────────────────────────────────────
+    def _open_video(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="분석할 영상 선택",
+            filetypes=[("영상 파일", "*.mp4 *.avi *.mov *.mkv"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            from video_panel import VideoPanel
+        except ImportError as e:
+            messagebox.showerror("오류", str(e), parent=self.root)
+            return
+        VideoPanel(self.root, path)
 
     # ── 카메라 패널 열기 ───────────────────────────────────────────────────
     def _open_camera(self):
