@@ -62,8 +62,13 @@ if not exist "models\hand_landmarker.task" (
     echo [ERROR] models\hand_landmarker.task not found
     pause & exit /b 1
 )
-echo   face_landmarker.task  OK
-echo   hand_landmarker.task  OK
+if not exist "models\pose_landmarker_full.task" (
+    echo [ERROR] models\pose_landmarker_full.task not found
+    pause & exit /b 1
+)
+echo   face_landmarker.task       OK
+echo   hand_landmarker.task       OK
+echo   pose_landmarker_full.task  OK
 echo.
 
 :: STEP 4. Source files
