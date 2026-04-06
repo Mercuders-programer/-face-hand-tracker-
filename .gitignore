@@ -20,9 +20,6 @@ output/
 # 로그
 *.log
 
-# 세션 대화 기록 (개인)
-sessions/
-
 # Claude Code 설정
 .claude/
 
