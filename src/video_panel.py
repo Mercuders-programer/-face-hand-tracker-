@@ -52,8 +52,8 @@ class VideoPanel:
     def __init__(self, parent: tk.Tk, path: str):
         self.win = tk.Toplevel(parent)
         self.win.title(f"PoseTracker — 영상 분석: {os.path.basename(path)}")
-        self.win.geometry("960x600")
-        self.win.minsize(640, 420)
+        self.win.geometry("1160x640")
+        self.win.minsize(820, 460)
         self.win.configure(bg=BG_DARK)
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -70,6 +70,8 @@ class VideoPanel:
 
         self._total_frames  = max(int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT)), 1)
         self._fps           = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._vid_w         = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._vid_h         = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self._current_frame = 0
         self._playing       = False
         self._dragging      = False
@@ -90,16 +92,30 @@ class VideoPanel:
 
     # ── UI 구성 ────────────────────────────────────────────────────────────
     def _build_ui(self):
+        # ── 최상위: 좌우 분할 ─────────────────────────────────────────────
+        body = tk.Frame(self.win, bg=BG_DARK)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # 우측 정보 패널 (먼저 pack → 리사이즈 시 공간 우선 확보)
+        info_panel = tk.Frame(body, bg=BG_PANEL, width=210)
+        info_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        info_panel.pack_propagate(False)
+        self._build_info_panel(info_panel)
+
+        # 좌측: 영상 + 타임라인 + 컨트롤
+        left = tk.Frame(body, bg=BG_DARK)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
         # 영상 캔버스
         self._canvas = tk.Canvas(
-            self.win, bg="#000011",
+            left, bg="#000011",
             highlightthickness=1, highlightbackground="#333355",
         )
         self._canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
 
         # 타임라인 캔버스
         self._tl = tk.Canvas(
-            self.win, height=TL_H, bg=TL_BG,
+            left, height=TL_H, bg=TL_BG,
             highlightthickness=0, cursor="sb_h_double_arrow",
         )
         self._tl.pack(fill=tk.X, padx=8, pady=(4, 0))
@@ -108,9 +124,9 @@ class VideoPanel:
         self._tl.bind("<ButtonRelease-1>", self._tl_release)
         self._tl.bind("<Configure>",       lambda _e: self._draw_timeline())
 
-        # 컨트롤 바 — 1행 (재생 / 시간 / 체크박스)
-        ctrl = tk.Frame(self.win, bg=BG_DARK)
-        ctrl.pack(fill=tk.X, padx=8, pady=(4, 2))
+        # 컨트롤 바 — 재생 / 시간
+        ctrl = tk.Frame(left, bg=BG_DARK)
+        ctrl.pack(fill=tk.X, padx=8, pady=(4, 8))
 
         self._play_btn = tk.Button(
             ctrl, text="▶ 재생",
@@ -129,58 +145,124 @@ class VideoPanel:
             fg=TEXT_W, bg=BG_DARK,
         ).pack(side=tk.LEFT)
 
+    # ── 파일 정보 패널 ─────────────────────────────────────────────────────
+    def _build_info_panel(self, parent):
+        # 상단 accent 바
+        tk.Frame(parent, bg=ACCENT, height=3).pack(fill=tk.X)
+
+        # 헤더
+        tk.Label(
+            parent, text="파일 정보",
+            font=("Segoe UI", 12, "bold"),
+            fg=TEXT_W, bg=BG_PANEL, anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(14, 4))
+
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        def row(label: str, value: str, wrap: bool = False):
+            tk.Label(
+                parent, text=label,
+                font=("Segoe UI", 8),
+                fg=TEXT_G, bg=BG_PANEL, anchor="w",
+            ).pack(fill=tk.X, padx=14, pady=(8, 0))
+            tk.Label(
+                parent, text=value,
+                font=("Segoe UI", 10, "bold"),
+                fg=TEXT_W, bg=BG_PANEL, anchor="w",
+                wraplength=178, justify=tk.LEFT,
+            ).pack(fill=tk.X, padx=14, pady=(1, 0))
+            tk.Frame(parent, bg="#1e1e3a", height=1).pack(fill=tk.X, padx=10, pady=(6, 0))
+
+        # ── 파일명 ──
+        fname = os.path.basename(self._video_path)
+        row("파일명", fname, wrap=True)
+
+        # ── 경로 ──
+        row("경로", self._video_path, wrap=True)
+
+        # ── 용량 ──
+        try:
+            size = os.path.getsize(self._video_path)
+            if size < 1024 ** 2:
+                size_str = f"{size / 1024:.1f} KB"
+            elif size < 1024 ** 3:
+                size_str = f"{size / 1024 ** 2:.1f} MB"
+            else:
+                size_str = f"{size / 1024 ** 3:.2f} GB"
+        except Exception:
+            size_str = "—"
+        row("용량", size_str)
+
+        # ── 해상도 ──
+        res = f"{self._vid_w} × {self._vid_h}" if self._vid_w and self._vid_h else "—"
+        row("해상도", res)
+
+        # ── 총 프레임 수 ──
+        row("총 프레임", f"{self._total_frames:,} 프레임")
+
+        # ── FPS ──
+        row("FPS", f"{self._fps:.2f}")
+
+        # ── 재생 시간 ──
+        total_secs = int(self._total_frames / max(self._fps, 1))
+        h, rem = divmod(total_secs, 3600)
+        m, s   = divmod(rem, 60)
+        dur = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+        row("재생 시간", dur)
+
+        # ── 섹션 구분 ──
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(14, 8))
+
+        # ── 오버레이 ──
+        tk.Label(
+            parent, text="오버레이",
+            font=("Segoe UI", 8),
+            fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(0, 4))
+
         tk.Checkbutton(
-            ctrl,
-            text="랜드마크",
+            parent,
+            text="랜드마크 표시",
             variable=self._show_overlay,
-            font=("Segoe UI", 11),
-            fg=TEXT_W, bg=BG_DARK,
-            selectcolor=BG_PANEL,
-            activeforeground=TEXT_W, activebackground=BG_DARK,
-        ).pack(side=tk.RIGHT)
+            font=("Segoe UI", 10),
+            fg=TEXT_W, bg=BG_PANEL,
+            selectcolor="#0f3460",
+            activeforeground=TEXT_W, activebackground=BG_PANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(0, 4))
 
-        # 컨트롤 바 — 2행 (내보내기 버튼 + 상태)
-        export_bar = tk.Frame(self.win, bg=BG_DARK)
-        export_bar.pack(fill=tk.X, padx=8, pady=(0, 8))
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
-        self._json_btn = tk.Button(
-            export_bar, text="JSON 내보내기",
-            font=("Segoe UI", 10, "bold"),
-            bg="#1e3a5f", fg=TEXT_W,
-            activebackground="#2a4f80", activeforeground="white",
-            relief=tk.FLAT, cursor="hand2",
-            padx=10, pady=3,
-            command=self._export_json,
-        )
-        self._json_btn.pack(side=tk.LEFT, padx=(0, 6))
+        # ── 내보내기 ──
+        tk.Label(
+            parent, text="내보내기",
+            font=("Segoe UI", 8),
+            fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(0, 6))
 
-        self._ae_btn = tk.Button(
-            export_bar, text="AE 내보내기",
-            font=("Segoe UI", 10, "bold"),
-            bg="#1e3a5f", fg=TEXT_W,
-            activebackground="#2a4f80", activeforeground="white",
-            relief=tk.FLAT, cursor="hand2",
-            padx=10, pady=3,
-            command=self._export_ae,
-        )
-        self._ae_btn.pack(side=tk.LEFT, padx=(0, 12))
+        def export_btn(text, bg, hover, cmd):
+            b = tk.Button(
+                parent, text=text,
+                font=("Segoe UI", 10, "bold"),
+                bg=bg, fg=TEXT_W,
+                activebackground=hover, activeforeground="white",
+                relief=tk.FLAT, cursor="hand2",
+                pady=6, anchor="w", padx=12,
+                command=cmd,
+            )
+            b.pack(fill=tk.X, padx=10, pady=(0, 4))
+            return b
 
-        self._video_btn = tk.Button(
-            export_bar, text="영상 저장",
-            font=("Segoe UI", 10, "bold"),
-            bg="#2a1f5f", fg=TEXT_W,
-            activebackground="#3d2e80", activeforeground="white",
-            relief=tk.FLAT, cursor="hand2",
-            padx=10, pady=3,
-            command=self._export_video,
-        )
-        self._video_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self._json_btn  = export_btn("⬇  JSON 내보내기",  "#1e3a5f", "#2a4f80", self._export_json)
+        self._ae_btn    = export_btn("⬇  AE 내보내기",    "#1e3a5f", "#2a4f80", self._export_ae)
+        self._video_btn = export_btn("🎬  영상 저장",      "#2a1f5f", "#3d2e80", self._export_video)
 
         tk.Label(
-            export_bar, textvariable=self._export_status_var,
-            font=("Segoe UI", 10),
-            fg="#4aff9e", bg=BG_DARK,
-        ).pack(side=tk.LEFT)
+            parent, textvariable=self._export_status_var,
+            font=("Segoe UI", 9),
+            fg="#4aff9e", bg=BG_PANEL,
+            wraplength=178, justify=tk.CENTER,
+        ).pack(fill=tk.X, padx=10, pady=(4, 0))
 
     # ── MediaPipe 초기화 ───────────────────────────────────────────────────
     def _init_mediapipe(self):
