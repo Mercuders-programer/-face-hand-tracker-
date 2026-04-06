@@ -433,6 +433,21 @@ class VideoPanel:
                 landmark_drawing_spec=None,
                 connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
             )
+            # 코 랜드마크 (CONTOURS에 미포함 → cv2로 직접 그리기)
+            _lf = face_res.face_landmarks[0]
+            _h, _w = overlay.shape[:2]
+            _nc = (0, 230, 180)  # teal
+            for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
+                           (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
+                if _s < len(_lf) and _e < len(_lf):
+                    _p1 = (int(_lf[_s].x*_w), int(_lf[_s].y*_h))
+                    _p2 = (int(_lf[_e].x*_w), int(_lf[_e].y*_h))
+                    cv2.line(overlay, _p1, _p2, _nc, 1)
+            for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
+                if _i < len(_lf):
+                    cv2.circle(overlay,
+                               (int(_lf[_i].x*_w), int(_lf[_i].y*_h)),
+                               2, _nc, -1)
         if hand_res.hand_landmarks:
             for hlms in hand_res.hand_landmarks:
                 mp_draw.draw_landmarks(
