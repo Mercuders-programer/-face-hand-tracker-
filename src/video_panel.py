@@ -25,12 +25,13 @@ from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnectio
 _BASE      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FACE_MODEL = os.path.join(_BASE, "models", "face_landmarker.task")
 HAND_MODEL = os.path.join(_BASE, "models", "hand_landmarker.task")
+POSE_MODEL = os.path.join(_BASE, "models", "pose_landmarker_full.task")
 
 try:
-    from .tracker import FrameData, VideoInfo, _extract_face, _extract_hand
+    from .tracker import FrameData, VideoInfo, _extract_face, _extract_hand, _extract_pose
     from .exporter import export_json, export_ae_keyframes
 except ImportError:
-    from tracker import FrameData, VideoInfo, _extract_face, _extract_hand
+    from tracker import FrameData, VideoInfo, _extract_face, _extract_hand, _extract_pose
     from exporter import export_json, export_ae_keyframes
 
 try:
@@ -81,6 +82,7 @@ class VideoPanel:
         self._export_status_var  = tk.StringVar(value="")
         self._face_det      = None
         self._hand_det      = None
+        self._pose_det      = None
         self._after_id      = None
         self._photo         = None  # GC 방지
 
@@ -283,12 +285,22 @@ class VideoPanel:
                 min_hand_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
+            pose_opts = mp_vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
+                running_mode=RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
             self._face_det = mp_vision.FaceLandmarker.create_from_options(face_opts)
             self._hand_det = mp_vision.HandLandmarker.create_from_options(hand_opts)
+            self._pose_det = mp_vision.PoseLandmarker.create_from_options(pose_opts)
         except Exception as e:
             print(f"[MediaPipe init error] {e}")
             self._face_det = None
             self._hand_det = None
+            self._pose_det = None
 
     # ── 타임라인 렌더링 ────────────────────────────────────────────────────
     def _draw_timeline(self):
@@ -422,9 +434,45 @@ class VideoPanel:
         try:
             face_res = self._face_det.detect(mp_img)
             hand_res = self._hand_det.detect(mp_img)
+            pose_res = self._pose_det.detect(mp_img) if self._pose_det else None
         except Exception as e:
             print(f"[detect error] {e}")
             return overlay
+
+        _oh, _ow = overlay.shape[:2]
+
+        # ── 포즈 스켈레톤 (얼굴/손 아래 레이어로 먼저 그리기)
+        if pose_res and pose_res.pose_landmarks:
+            _pl = pose_res.pose_landmarks[0]
+            _pc   = (50, 220, 50)    # green — 몸통 중앙선
+            _pc_l = (255, 160, 50)   # cyan-ish — 왼쪽
+            _pc_r = (50, 160, 255)   # orange-ish — 오른쪽
+            _conns = [
+                (11, 12, _pc),       # 어깨 가로선
+                (11, 23, _pc_l),     # 왼쪽 몸통
+                (12, 24, _pc_r),     # 오른쪽 몸통
+                (23, 24, _pc),       # 골반 가로선
+                (11, 13, _pc_l), (13, 15, _pc_l),   # 왼팔
+                (12, 14, _pc_r), (14, 16, _pc_r),   # 오른팔
+                (23, 25, _pc_l), (25, 27, _pc_l),   # 왼다리
+                (24, 26, _pc_r), (26, 28, _pc_r),   # 오른다리
+            ]
+            for _s, _e, _col in _conns:
+                if (_s < len(_pl) and _e < len(_pl)
+                        and _pl[_s].visibility > 0.3
+                        and _pl[_e].visibility > 0.3):
+                    _p1 = (int(_pl[_s].x*_ow), int(_pl[_s].y*_oh))
+                    _p2 = (int(_pl[_e].x*_ow), int(_pl[_e].y*_oh))
+                    cv2.line(overlay, _p1, _p2, _col, 2)
+            for _i, _col in [(11,_pc_l),(12,_pc_r),(13,_pc_l),(14,_pc_r),
+                             (15,_pc_l),(16,_pc_r),(23,_pc_l),(24,_pc_r),
+                             (25,_pc_l),(26,_pc_r),(27,_pc_l),(28,_pc_r)]:
+                if _i < len(_pl) and _pl[_i].visibility > 0.3:
+                    cv2.circle(overlay,
+                               (int(_pl[_i].x*_ow), int(_pl[_i].y*_oh)),
+                               6, _col, -1)
+
+        # ── 얼굴
         if face_res.face_landmarks:
             mp_draw.draw_landmarks(
                 overlay,
@@ -435,19 +483,20 @@ class VideoPanel:
             )
             # 코 랜드마크 (CONTOURS에 미포함 → cv2로 직접 그리기)
             _lf = face_res.face_landmarks[0]
-            _h, _w = overlay.shape[:2]
             _nc = (0, 230, 180)  # teal
             for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
                            (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
                 if _s < len(_lf) and _e < len(_lf):
-                    _p1 = (int(_lf[_s].x*_w), int(_lf[_s].y*_h))
-                    _p2 = (int(_lf[_e].x*_w), int(_lf[_e].y*_h))
+                    _p1 = (int(_lf[_s].x*_ow), int(_lf[_s].y*_oh))
+                    _p2 = (int(_lf[_e].x*_ow), int(_lf[_e].y*_oh))
                     cv2.line(overlay, _p1, _p2, _nc, 1)
             for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
                 if _i < len(_lf):
                     cv2.circle(overlay,
-                               (int(_lf[_i].x*_w), int(_lf[_i].y*_h)),
+                               (int(_lf[_i].x*_ow), int(_lf[_i].y*_oh)),
                                2, _nc, -1)
+
+        # ── 손
         if hand_res.hand_landmarks:
             for hlms in hand_res.hand_landmarks:
                 mp_draw.draw_landmarks(
@@ -668,6 +717,7 @@ class VideoPanel:
             try:
                 face_res = self._face_det.detect(mp_img)
                 hand_res = self._hand_det.detect(mp_img)
+                pose_res = self._pose_det.detect(mp_img) if self._pose_det else None
             except Exception as e:
                 print(f"[frame {idx} detect error] {e}")
                 idx += 1
@@ -675,6 +725,8 @@ class VideoPanel:
 
             fd = FrameData(index=idx, timestamp=idx / fps)
             fd.face = _extract_face(face_res, w, h)
+            if pose_res:
+                fd.pose = _extract_pose(pose_res, w, h)
             if hand_res.hand_landmarks:
                 for hlms, hedness in zip(hand_res.hand_landmarks, hand_res.handedness):
                     hd = _extract_hand(hlms, hedness, w, h)
@@ -708,4 +760,7 @@ class VideoPanel:
         if self._hand_det:
             self._hand_det.close()
             self._hand_det = None
+        if self._pose_det:
+            self._pose_det.close()
+            self._pose_det = None
         self.win.destroy()

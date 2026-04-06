@@ -28,6 +28,7 @@ from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnectio
 _BASE       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FACE_MODEL  = os.path.join(_BASE, "models", "face_landmarker.task")
 HAND_MODEL  = os.path.join(_BASE, "models", "hand_landmarker.task")
+POSE_MODEL  = os.path.join(_BASE, "models", "pose_landmarker_full.task")
 
 try:
     from PIL import Image, ImageTk
@@ -35,10 +36,10 @@ except ImportError:
     raise ImportError("Pillow가 필요합니다: pip install Pillow")
 
 try:
-    from .tracker import Tracker, FrameData, VideoInfo, _extract_face, _extract_hand
+    from .tracker import Tracker, FrameData, VideoInfo, _extract_face, _extract_hand, _extract_pose
     from .exporter import export_json, export_ae_keyframes
 except ImportError:
-    from tracker import Tracker, FrameData, VideoInfo, _extract_face, _extract_hand
+    from tracker import Tracker, FrameData, VideoInfo, _extract_face, _extract_hand, _extract_pose
     from exporter import export_json, export_ae_keyframes
 
 
@@ -412,10 +413,19 @@ class CameraPanel:
             min_hand_presence_confidence=0.5,
             min_tracking_confidence=0.5,
         )
+        pose_opts = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
+            running_mode=RunningMode.IMAGE,
+            num_poses=1,
+            min_pose_detection_confidence=0.5,
+            min_pose_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
 
         try:
             face_det = mp_vision.FaceLandmarker.create_from_options(face_opts)
             hand_det = mp_vision.HandLandmarker.create_from_options(hand_opts)
+            pose_det = mp_vision.PoseLandmarker.create_from_options(pose_opts)
         except Exception as e:
             print(f"[MediaPipe init error] {e}")
             self._capture_loop_raw()
@@ -434,14 +444,52 @@ class CameraPanel:
                 try:
                     face_res = face_det.detect(mp_img)
                     hand_res = hand_det.detect(mp_img)
+                    pose_res = pose_det.detect(mp_img)
                 except Exception as e:
                     print(f"[detect error] {e}")
-                    face_res = type('R', (), {'face_landmarks': [], 'hand_landmarks': [], 'handedness': []})()
-                    hand_res = face_res
+                    _empty = type('R', (), {
+                        'face_landmarks': [], 'hand_landmarks': [],
+                        'handedness': [], 'pose_landmarks': []
+                    })()
+                    face_res = hand_res = pose_res = _empty
 
                 # 오버레이 그리기
                 overlay = frame.copy()
                 if self._show_overlay.get():
+                    # ── 포즈 스켈레톤 (먼저 그려 얼굴/손 위에 덮이지 않게)
+                    if pose_res.pose_landmarks:
+                        _pl = pose_res.pose_landmarks[0]
+                        _pc = (50, 220, 50)   # BGR green
+                        _pc_l = (255, 160, 50)  # BGR cyan-ish (left)
+                        _pc_r = (50, 160, 255)  # BGR orange-ish (right)
+                        # 연결선
+                        _conns = [
+                            (11, 12, _pc),      # 어깨 가로선
+                            (11, 23, _pc_l),    # 왼쪽 몸통
+                            (12, 24, _pc_r),    # 오른쪽 몸통
+                            (23, 24, _pc),      # 골반 가로선
+                            (11, 13, _pc_l), (13, 15, _pc_l),  # 왼팔
+                            (12, 14, _pc_r), (14, 16, _pc_r),  # 오른팔
+                            (23, 25, _pc_l), (25, 27, _pc_l),  # 왼다리
+                            (24, 26, _pc_r), (26, 28, _pc_r),  # 오른다리
+                        ]
+                        for _s, _e, _col in _conns:
+                            if (_s < len(_pl) and _e < len(_pl)
+                                    and _pl[_s].visibility > 0.3
+                                    and _pl[_e].visibility > 0.3):
+                                _p1 = (int(_pl[_s].x*w_px), int(_pl[_s].y*h_px))
+                                _p2 = (int(_pl[_e].x*w_px), int(_pl[_e].y*h_px))
+                                cv2.line(overlay, _p1, _p2, _col, 2)
+                        # 주요 관절 점
+                        for _i, _col in [(11,_pc_l),(12,_pc_r),(13,_pc_l),(14,_pc_r),
+                                         (15,_pc_l),(16,_pc_r),(23,_pc_l),(24,_pc_r),
+                                         (25,_pc_l),(26,_pc_r),(27,_pc_l),(28,_pc_r)]:
+                            if _i < len(_pl) and _pl[_i].visibility > 0.3:
+                                cv2.circle(overlay,
+                                           (int(_pl[_i].x*w_px), int(_pl[_i].y*h_px)),
+                                           6, _col, -1)
+
+                    # ── 얼굴
                     if face_res.face_landmarks:
                         mp_draw.draw_landmarks(
                             overlay,
@@ -464,6 +512,8 @@ class CameraPanel:
                                 cv2.circle(overlay,
                                            (int(_lf[_i].x*w_px), int(_lf[_i].y*h_px)),
                                            2, _nc, -1)
+
+                    # ── 손
                     if hand_res.hand_landmarks:
                         for hlms in hand_res.hand_landmarks:
                             mp_draw.draw_landmarks(
@@ -477,7 +527,7 @@ class CameraPanel:
                 if self._recording:
                     if self._writer:
                         self._writer.write(overlay)
-                    self._collect_frame(face_res, hand_res, w_px, h_px)
+                    self._collect_frame(face_res, hand_res, pose_res, w_px, h_px)
 
                 # 디스플레이 큐에 넣기 (BGR → RGB)
                 try:
@@ -487,6 +537,7 @@ class CameraPanel:
         finally:
             face_det.close()
             hand_det.close()
+            pose_det.close()
 
     def _capture_loop_raw(self):
         """MediaPipe 없이 원본 영상만 표시"""
@@ -501,10 +552,11 @@ class CameraPanel:
             except queue.Full:
                 pass
 
-    def _collect_frame(self, face_res, hand_res, w: int, h: int):
+    def _collect_frame(self, face_res, hand_res, pose_res, w: int, h: int):
         idx = len(self._frames_data)
         fd  = FrameData(index=idx, timestamp=idx / max(self._fps, 1))
         fd.face = _extract_face(face_res, w, h)
+        fd.pose = _extract_pose(pose_res, w, h)
         if hand_res.hand_landmarks:
             for hlms, hedness in zip(hand_res.hand_landmarks, hand_res.handedness):
                 hd = _extract_hand(hlms, hedness, w, h)

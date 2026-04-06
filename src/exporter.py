@@ -6,9 +6,9 @@ import json
 import os
 from typing import List, Callable
 try:
-    from .tracker import FrameData, VideoInfo, Point2D, HAND_LANDMARK_NAMES
+    from .tracker import FrameData, VideoInfo, Point2D, HAND_LANDMARK_NAMES, POSE_LANDMARK_NAMES
 except ImportError:
-    from tracker import FrameData, VideoInfo, Point2D, HAND_LANDMARK_NAMES
+    from tracker import FrameData, VideoInfo, Point2D, HAND_LANDMARK_NAMES, POSE_LANDMARK_NAMES
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -49,7 +49,19 @@ def export_json(frames: List[FrameData], info: VideoInfo, out_path: str) -> bool
             "hand": {
                 "total_points": 21,
                 "names": HAND_LANDMARK_NAMES,
-            }
+            },
+            "pose": {
+                "total_points": 33,
+                "names": POSE_LANDMARK_NAMES,
+                "key_joints": {
+                    "left_shoulder": 11, "right_shoulder": 12,
+                    "left_elbow":    13, "right_elbow":    14,
+                    "left_wrist":    15, "right_wrist":    16,
+                    "left_hip":      23, "right_hip":      24,
+                    "left_knee":     25, "right_knee":      26,
+                    "left_ankle":    27, "right_ankle":     28,
+                }
+            },
         },
         "frames": []
     }
@@ -89,6 +101,27 @@ def export_json(frames: List[FrameData], info: VideoInfo, out_path: str) -> bool
 
         jf["left_hand"]  = hand_to_dict(fd.left_hand)
         jf["right_hand"] = hand_to_dict(fd.right_hand)
+
+        # 포즈
+        jpose = {"detected": fd.pose.detected}
+        if fd.pose.detected:
+            jpose["key_joints"] = {
+                "left_shoulder":  pt(fd.pose.left_shoulder),
+                "right_shoulder": pt(fd.pose.right_shoulder),
+                "left_elbow":     pt(fd.pose.left_elbow),
+                "right_elbow":    pt(fd.pose.right_elbow),
+                "left_wrist":     pt(fd.pose.left_wrist),
+                "right_wrist":    pt(fd.pose.right_wrist),
+                "left_hip":       pt(fd.pose.left_hip),
+                "right_hip":      pt(fd.pose.right_hip),
+                "left_knee":      pt(fd.pose.left_knee),
+                "right_knee":     pt(fd.pose.right_knee),
+                "left_ankle":     pt(fd.pose.left_ankle),
+                "right_ankle":    pt(fd.pose.right_ankle),
+            }
+            jpose["all_landmarks"] = [pt(p) for p in fd.pose.all]
+        jf["pose"] = jpose
+
         data["frames"].append(jf)
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -144,6 +177,7 @@ def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str) 
     rh_dir    = os.path.join(out_dir, "hands", "right")
     lh_all    = os.path.join(lh_dir,  "all")
     rh_all    = os.path.join(rh_dir,  "all")
+    pose_dir  = os.path.join(out_dir, "pose")
 
     ok = True
 
@@ -197,6 +231,29 @@ def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str) 
             lambda f, idx=i: (f.right_hand.landmarks[idx]
                                if f.right_hand.detected and len(f.right_hand.landmarks) > idx
                                else Point2D()))
+
+    # ── 포즈 주요 관절 12개 ──────────────────────────────────────────────
+    pose_joints = [
+        ("left_shoulder",  lambda f: f.pose.left_shoulder),
+        ("right_shoulder", lambda f: f.pose.right_shoulder),
+        ("left_elbow",     lambda f: f.pose.left_elbow),
+        ("right_elbow",    lambda f: f.pose.right_elbow),
+        ("left_wrist",     lambda f: f.pose.left_wrist),
+        ("right_wrist",    lambda f: f.pose.right_wrist),
+        ("left_hip",       lambda f: f.pose.left_hip),
+        ("right_hip",      lambda f: f.pose.right_hip),
+        ("left_knee",      lambda f: f.pose.left_knee),
+        ("right_knee",     lambda f: f.pose.right_knee),
+        ("left_ankle",     lambda f: f.pose.left_ankle),
+        ("right_ankle",    lambda f: f.pose.right_ankle),
+    ]
+
+    for name, getter in pose_joints:
+        path = os.path.join(pose_dir, f"{name}.txt")
+        ok &= _write_ae_file(
+            path, info, frames,
+            lambda f, g=getter: g(f) if f.pose.detected else Point2D(),
+        )
 
     print(f"[Exporter] AE Keyframe Data 저장 완료: {out_dir}/")
     return ok

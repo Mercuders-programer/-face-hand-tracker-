@@ -1,8 +1,9 @@
 """
-tracker.py — MediaPipe Tasks API 기반 얼굴 + 손 추적기 (mediapipe 0.10.x+)
+tracker.py — MediaPipe Tasks API 기반 얼굴 + 손 + 포즈 추적기 (mediapipe 0.10.x+)
 
 얼굴: FaceLandmarker 478개 랜드마크 (홍채 포함)
 손:   HandLandmarker 21개 랜드마크 × 최대 2손
+포즈: PoseLandmarker 33개 랜드마크 (몸/팔/다리)
 """
 
 import os
@@ -20,6 +21,7 @@ from mediapipe.tasks.python.vision import RunningMode
 _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FACE_MODEL  = os.path.join(_BASE, "models", "face_landmarker.task")
 HAND_MODEL  = os.path.join(_BASE, "models", "hand_landmarker.task")
+POSE_MODEL  = os.path.join(_BASE, "models", "pose_landmarker_full.task")
 
 # ──────────────────────────────────────────────────────────────────────────
 # 데이터 구조체
@@ -59,6 +61,42 @@ HAND_LANDMARK_NAMES = [
     "ring_mcp",  "ring_pip",  "ring_dip",  "ring_tip",
     "pinky_mcp", "pinky_pip", "pinky_dip", "pinky_tip",
 ]
+
+# PoseLandmarker 33개 랜드마크 이름 (인덱스 순서)
+POSE_LANDMARK_NAMES = [
+    "nose",
+    "left_eye_inner", "left_eye", "left_eye_outer",
+    "right_eye_inner", "right_eye", "right_eye_outer",
+    "left_ear", "right_ear",
+    "mouth_left", "mouth_right",
+    "left_shoulder", "right_shoulder",
+    "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist",
+    "left_pinky", "right_pinky",
+    "left_index", "right_index",
+    "left_thumb", "right_thumb",
+    "left_hip", "right_hip",
+    "left_knee", "right_knee",
+    "left_ankle", "right_ankle",
+    "left_heel", "right_heel",
+    "left_foot_index", "right_foot_index",
+]
+
+
+class PoseIdx:
+    """포즈 추적에 사용할 주요 랜드마크 인덱스"""
+    LEFT_SHOULDER  = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW     = 13
+    RIGHT_ELBOW    = 14
+    LEFT_WRIST     = 15
+    RIGHT_WRIST    = 16
+    LEFT_HIP       = 23
+    RIGHT_HIP      = 24
+    LEFT_KNEE      = 25
+    RIGHT_KNEE     = 26
+    LEFT_ANKLE     = 27
+    RIGHT_ANKLE    = 28
 
 
 @dataclass
@@ -102,12 +140,31 @@ class HandLandmarks:
 
 
 @dataclass
+class PoseLandmarks:
+    detected:       bool = False
+    left_shoulder:  Point2D = field(default_factory=Point2D)
+    right_shoulder: Point2D = field(default_factory=Point2D)
+    left_elbow:     Point2D = field(default_factory=Point2D)
+    right_elbow:    Point2D = field(default_factory=Point2D)
+    left_wrist:     Point2D = field(default_factory=Point2D)
+    right_wrist:    Point2D = field(default_factory=Point2D)
+    left_hip:       Point2D = field(default_factory=Point2D)
+    right_hip:      Point2D = field(default_factory=Point2D)
+    left_knee:      Point2D = field(default_factory=Point2D)
+    right_knee:     Point2D = field(default_factory=Point2D)
+    left_ankle:     Point2D = field(default_factory=Point2D)
+    right_ankle:    Point2D = field(default_factory=Point2D)
+    all: List[Point2D] = field(default_factory=list)
+
+
+@dataclass
 class FrameData:
     index:      int   = 0
     timestamp:  float = 0.0
     face:       FaceLandmarks = field(default_factory=FaceLandmarks)
     left_hand:  HandLandmarks = field(default_factory=HandLandmarks)
     right_hand: HandLandmarks = field(default_factory=HandLandmarks)
+    pose:       PoseLandmarks = field(default_factory=PoseLandmarks)
 
 
 @dataclass
@@ -150,6 +207,36 @@ def _extract_face(face_result, w: int, h: int) -> FaceLandmarks:
         f.left_iris  = pt(FaceIdx.LEFT_IRIS)
     f.detected = True
     return f
+
+
+def _extract_pose(pose_result, w: int, h: int) -> PoseLandmarks:
+    p = PoseLandmarks()
+    if not pose_result.pose_landmarks:
+        return p
+    lms = pose_result.pose_landmarks[0]
+
+    def pt(idx: int) -> Point2D:
+        lm = lms[idx]
+        vis = lm.visibility if hasattr(lm, "visibility") else 1.0
+        return Point2D(x=lm.x * w, y=lm.y * h, confidence=vis)
+
+    p.all            = [Point2D(x=lm.x*w, y=lm.y*h,
+                                confidence=lm.visibility if hasattr(lm, "visibility") else 1.0)
+                        for lm in lms]
+    p.left_shoulder  = pt(PoseIdx.LEFT_SHOULDER)
+    p.right_shoulder = pt(PoseIdx.RIGHT_SHOULDER)
+    p.left_elbow     = pt(PoseIdx.LEFT_ELBOW)
+    p.right_elbow    = pt(PoseIdx.RIGHT_ELBOW)
+    p.left_wrist     = pt(PoseIdx.LEFT_WRIST)
+    p.right_wrist    = pt(PoseIdx.RIGHT_WRIST)
+    p.left_hip       = pt(PoseIdx.LEFT_HIP)
+    p.right_hip      = pt(PoseIdx.RIGHT_HIP)
+    p.left_knee      = pt(PoseIdx.LEFT_KNEE)
+    p.right_knee     = pt(PoseIdx.RIGHT_KNEE)
+    p.left_ankle     = pt(PoseIdx.LEFT_ANKLE)
+    p.right_ankle    = pt(PoseIdx.RIGHT_ANKLE)
+    p.detected = True
+    return p
 
 
 def _extract_hand(hand_lms, handedness_list, w: int, h: int) -> HandLandmarks:
