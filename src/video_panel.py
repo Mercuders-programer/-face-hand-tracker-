@@ -52,8 +52,8 @@ class VideoPanel:
     def __init__(self, parent: tk.Tk, path: str):
         self.win = tk.Toplevel(parent)
         self.win.title(f"PoseTracker — 영상 분석: {os.path.basename(path)}")
-        self.win.geometry("1160x640")
-        self.win.minsize(820, 460)
+        self.win.geometry("1160x800")
+        self.win.minsize(820, 720)
         self.win.configure(bg=BG_DARK)
         self.win.protocol("WM_DELETE_WINDOW", self._on_close)
 
