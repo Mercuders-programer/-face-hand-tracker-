@@ -44,6 +44,7 @@
 | 33 | make_exe_file.bat도 따로 반영할 건 없지? | STEP 3에 pose_landmarker_full.task 존재 확인 추가 |
 | 34 | cmd에서 어떻게 실행하더라? | `cd C:\...\my_openPose_proj` → `python app.py` 안내 |
 | 35 | command_history.md에 추가가 안 되는 이유 | 직전 질문 미기록 확인, 즉시 추가 |
+| 36 | 랜드마크 포인트 이름을 view에 렌더링, "랜드마크 이름" 체크박스로 ON/OFF | `camera_panel.py`/`video_panel.py` — `_show_names` BooleanVar + 체크박스 추가, `_draw_landmark_names()` 헬퍼 함수 구현 |
 
 ---
 

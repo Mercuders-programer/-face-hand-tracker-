@@ -49,6 +49,63 @@ TL_BG    = "#0f0f1f"
 TL_H     = 30
 
 
+def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
+                          w, h, show_face, show_body, show_hands):
+    """랜드마크 포인트 이름을 overlay 이미지에 렌더링한다."""
+
+    def _text(img, label, x, y, color):
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+        cv2.rectangle(img, (x - 1, y - th - 2), (x + tw + 2, y + 2), (0, 0, 0), -1)
+        cv2.putText(img, label, (x, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
+
+    # ── 얼굴 주요 12포인트 이름
+    if show_face and face_res.face_landmarks:
+        _lf = face_res.face_landmarks[0]
+        _fc = (0, 230, 180)
+        for _idx, _lbl in [
+            (33,  "R.Eye.O"), (133, "R.Eye.I"), (473, "R.Iris"),
+            (362, "L.Eye.I"), (263, "L.Eye.O"), (468, "L.Iris"),
+            (168, "Nose.B"),  (4,   "Nose.T"),
+            (61,  "Mouth.R"), (13,  "Mouth.U"), (291, "Mouth.L"), (14, "Mouth.D"),
+        ]:
+            if _idx < len(_lf):
+                _text(overlay, _lbl,
+                      int(_lf[_idx].x * w) + 4,
+                      int(_lf[_idx].y * h) - 4, _fc)
+
+    # ── 포즈 주요 관절 이름
+    if show_body and pose_res and pose_res.pose_landmarks:
+        _pl = pose_res.pose_landmarks[0]
+        for _idx, _lbl in [
+            (11, "L.Shldr"), (12, "R.Shldr"),
+            (13, "L.Elbow"), (14, "R.Elbow"),
+            (15, "L.Wrist"), (16, "R.Wrist"),
+            (23, "L.Hip"),   (24, "R.Hip"),
+            (25, "L.Knee"),  (26, "R.Knee"),
+            (27, "L.Ankle"), (28, "R.Ankle"),
+        ]:
+            if _idx < len(_pl) and _pl[_idx].visibility > 0.3:
+                _col = (255, 160, 50) if _lbl.startswith("L.") else (50, 160, 255)
+                _text(overlay, _lbl,
+                      int(_pl[_idx].x * w) + 7,
+                      int(_pl[_idx].y * h) - 7, _col)
+
+    # ── 손 주요 6포인트 이름
+    if show_hands and hand_res.hand_landmarks:
+        _hc = (255, 220, 100)
+        for _hlms in hand_res.hand_landmarks:
+            for _idx, _lbl in [
+                (0, "Wrist"), (4, "Thumb"),
+                (8, "Index"), (12, "Middle"),
+                (16, "Ring"), (20, "Pinky"),
+            ]:
+                if _idx < len(_hlms):
+                    _text(overlay, _lbl,
+                          int(_hlms[_idx].x * w) + 4,
+                          int(_hlms[_idx].y * h) - 4, _hc)
+
+
 class VideoPanel:
     def __init__(self, parent: tk.Tk, path: str):
         self.win = tk.Toplevel(parent)
@@ -80,6 +137,7 @@ class VideoPanel:
         self._show_face  = tk.BooleanVar(value=False)
         self._show_body  = tk.BooleanVar(value=False)
         self._show_hands = tk.BooleanVar(value=False)
+        self._show_names = tk.BooleanVar(value=False)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._export_status_var  = tk.StringVar(value="")
         self._face_det      = None
@@ -90,7 +148,7 @@ class VideoPanel:
 
         self._build_ui()
         self._init_mediapipe()
-        for _v in (self._show_face, self._show_body, self._show_hands):
+        for _v in (self._show_face, self._show_body, self._show_hands, self._show_names):
             _v.trace_add("write", lambda *_: self._refresh_frame())
         # 첫 프레임 표시 (레이아웃 완료 후)
         self.win.after(100, lambda: self._seek_to(0))
@@ -238,6 +296,15 @@ class VideoPanel:
                 activeforeground=TEXT_W, activebackground=BG_PANEL,
                 anchor="w",
             ).pack(fill=tk.X, padx=10, pady=(0, 2))
+        tk.Checkbutton(
+            parent, text="랜드마크 이름",
+            variable=self._show_names,
+            font=("Segoe UI", 10),
+            fg="#ffdd88", bg=BG_PANEL,
+            selectcolor="#0f3460",
+            activeforeground="#ffdd88", activebackground=BG_PANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(4, 2))
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
@@ -509,6 +576,13 @@ class VideoPanel:
                     landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
                     connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
                 )
+        # ── 랜드마크 이름
+        if self._show_names.get():
+            _draw_landmark_names(overlay, face_res, hand_res, pose_res,
+                                 _ow, _oh,
+                                 self._show_face.get(),
+                                 self._show_body.get(),
+                                 self._show_hands.get())
         return overlay
 
     # ── 시간 업데이트 ──────────────────────────────────────────────────────
