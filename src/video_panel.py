@@ -28,10 +28,14 @@ HAND_MODEL = os.path.join(_BASE, "models", "hand_landmarker.task")
 POSE_MODEL = os.path.join(_BASE, "models", "pose_landmarker_full.task")
 
 try:
-    from .tracker import FrameData, VideoInfo, _extract_face, _extract_hand, _extract_pose
+    from .tracker import (FrameData, VideoInfo, PersonData,
+                          _extract_face, _extract_hand, _extract_pose,
+                          _build_persons, MAX_PERSONS, PERSON_COLORS)
     from .exporter import export_json, export_ae_keyframes
 except ImportError:
-    from tracker import FrameData, VideoInfo, _extract_face, _extract_hand, _extract_pose
+    from tracker import (FrameData, VideoInfo, PersonData,
+                         _extract_face, _extract_hand, _extract_pose,
+                         _build_persons, MAX_PERSONS, PERSON_COLORS)
     from exporter import export_json, export_ae_keyframes
 
 try:
@@ -59,37 +63,37 @@ def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
         cv2.putText(img, label, (x, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
 
-    # ── 얼굴 주요 12포인트 이름
+    # ── 얼굴 주요 12포인트 이름 (감지된 모든 사람)
     if show_face and face_res.face_landmarks:
-        _lf = face_res.face_landmarks[0]
         _fc = (0, 230, 180)
-        for _idx, _lbl in [
-            (33,  "R.Eye.O"), (133, "R.Eye.I"), (473, "R.Iris"),
-            (362, "L.Eye.I"), (263, "L.Eye.O"), (468, "L.Iris"),
-            (168, "Nose.B"),  (4,   "Nose.T"),
-            (61,  "Mouth.R"), (13,  "Mouth.U"), (291, "Mouth.L"), (14, "Mouth.D"),
-        ]:
-            if _idx < len(_lf):
-                _text(overlay, _lbl,
-                      int(_lf[_idx].x * w) + 4,
-                      int(_lf[_idx].y * h) - 4, _fc)
+        for _lf in face_res.face_landmarks:
+            for _idx, _lbl in [
+                (33,  "R.Eye.O"), (133, "R.Eye.I"), (473, "R.Iris"),
+                (362, "L.Eye.I"), (263, "L.Eye.O"), (468, "L.Iris"),
+                (168, "Nose.B"),  (4,   "Nose.T"),
+                (61,  "Mouth.R"), (13,  "Mouth.U"), (291, "Mouth.L"), (14, "Mouth.D"),
+            ]:
+                if _idx < len(_lf):
+                    _text(overlay, _lbl,
+                          int(_lf[_idx].x * w) + 4,
+                          int(_lf[_idx].y * h) - 4, _fc)
 
-    # ── 포즈 주요 관절 이름
+    # ── 포즈 주요 관절 이름 (감지된 모든 사람)
     if show_body and pose_res and pose_res.pose_landmarks:
-        _pl = pose_res.pose_landmarks[0]
-        for _idx, _lbl in [
-            (11, "L.Shldr"), (12, "R.Shldr"),
-            (13, "L.Elbow"), (14, "R.Elbow"),
-            (15, "L.Wrist"), (16, "R.Wrist"),
-            (23, "L.Hip"),   (24, "R.Hip"),
-            (25, "L.Knee"),  (26, "R.Knee"),
-            (27, "L.Ankle"), (28, "R.Ankle"),
-        ]:
-            if _idx < len(_pl) and _pl[_idx].visibility > 0.3:
-                _col = (255, 160, 50) if _lbl.startswith("L.") else (50, 160, 255)
-                _text(overlay, _lbl,
-                      int(_pl[_idx].x * w) + 7,
-                      int(_pl[_idx].y * h) - 7, _col)
+        for _pl in pose_res.pose_landmarks:
+            for _idx, _lbl in [
+                (11, "L.Shldr"), (12, "R.Shldr"),
+                (13, "L.Elbow"), (14, "R.Elbow"),
+                (15, "L.Wrist"), (16, "R.Wrist"),
+                (23, "L.Hip"),   (24, "R.Hip"),
+                (25, "L.Knee"),  (26, "R.Knee"),
+                (27, "L.Ankle"), (28, "R.Ankle"),
+            ]:
+                if _idx < len(_pl) and _pl[_idx].visibility > 0.3:
+                    _col = (255, 160, 50) if _lbl.startswith("L.") else (50, 160, 255)
+                    _text(overlay, _lbl,
+                          int(_pl[_idx].x * w) + 7,
+                          int(_pl[_idx].y * h) - 7, _col)
 
     # ── 손 주요 6포인트 이름
     if show_hands and hand_res.hand_landmarks:
@@ -345,7 +349,7 @@ class VideoPanel:
             face_opts = mp_vision.FaceLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
                 running_mode=RunningMode.IMAGE,
-                num_faces=1,
+                num_faces=MAX_PERSONS,
                 min_face_detection_confidence=0.5,
                 min_face_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
@@ -353,7 +357,7 @@ class VideoPanel:
             hand_opts = mp_vision.HandLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL),
                 running_mode=RunningMode.IMAGE,
-                num_hands=2,
+                num_hands=MAX_PERSONS * 2,
                 min_hand_detection_confidence=0.5,
                 min_hand_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
@@ -361,7 +365,7 @@ class VideoPanel:
             pose_opts = mp_vision.PoseLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
                 running_mode=RunningMode.IMAGE,
-                num_poses=1,
+                num_poses=MAX_PERSONS,
                 min_pose_detection_confidence=0.5,
                 min_pose_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
@@ -514,58 +518,55 @@ class VideoPanel:
 
         _oh, _ow = overlay.shape[:2]
 
-        # ── 포즈 스켈레톤 (얼굴/손 아래 레이어로 먼저 그리기)
+        # ── 포즈 스켈레톤 (모든 감지된 사람, 얼굴/손 아래 레이어로 먼저 그리기)
         if self._show_body.get() and pose_res and pose_res.pose_landmarks:
-            _pl = pose_res.pose_landmarks[0]
-            _pc   = (50, 220, 50)
-            _pc_l = (255, 160, 50)
-            _pc_r = (50, 160, 255)
-            _conns = [
-                (11, 12, _pc),
-                (11, 23, _pc_l), (12, 24, _pc_r),
-                (23, 24, _pc),
-                (11, 13, _pc_l), (13, 15, _pc_l),
-                (12, 14, _pc_r), (14, 16, _pc_r),
-                (23, 25, _pc_l), (25, 27, _pc_l),
-                (24, 26, _pc_r), (26, 28, _pc_r),
-            ]
-            for _s, _e, _col in _conns:
-                if (_s < len(_pl) and _e < len(_pl)
-                        and _pl[_s].visibility > 0.3
-                        and _pl[_e].visibility > 0.3):
-                    _p1 = (int(_pl[_s].x*_ow), int(_pl[_s].y*_oh))
-                    _p2 = (int(_pl[_e].x*_ow), int(_pl[_e].y*_oh))
-                    cv2.line(overlay, _p1, _p2, _col, 2)
-            for _i, _col in [(11,_pc_l),(12,_pc_r),(13,_pc_l),(14,_pc_r),
-                             (15,_pc_l),(16,_pc_r),(23,_pc_l),(24,_pc_r),
-                             (25,_pc_l),(26,_pc_r),(27,_pc_l),(28,_pc_r)]:
-                if _i < len(_pl) and _pl[_i].visibility > 0.3:
-                    cv2.circle(overlay,
-                               (int(_pl[_i].x*_ow), int(_pl[_i].y*_oh)),
-                               6, _col, -1)
+            _SKEL = [(11,12),(11,23),(12,24),(23,24),
+                     (11,13),(13,15),(12,14),(14,16),
+                     (23,25),(25,27),(24,26),(26,28)]
+            for _pidx, _pl in enumerate(pose_res.pose_landmarks):
+                _pc = PERSON_COLORS[_pidx % len(PERSON_COLORS)]
+                for _s, _e in _SKEL:
+                    if (_s < len(_pl) and _e < len(_pl)
+                            and _pl[_s].visibility > 0.3
+                            and _pl[_e].visibility > 0.3):
+                        cv2.line(overlay,
+                                 (int(_pl[_s].x*_ow), int(_pl[_s].y*_oh)),
+                                 (int(_pl[_e].x*_ow), int(_pl[_e].y*_oh)),
+                                 _pc, 2)
+                for _i in [11,12,13,14,15,16,23,24,25,26,27,28]:
+                    if _i < len(_pl) and _pl[_i].visibility > 0.3:
+                        cv2.circle(overlay,
+                                   (int(_pl[_i].x*_ow), int(_pl[_i].y*_oh)),
+                                   6, _pc, -1)
+                # 사람 번호 레이블
+                if 0 < len(_pl) and _pl[0].visibility > 0.3:
+                    _lx = max(5, int(_pl[0].x*_ow) - 12)
+                    _ly = max(20, int(_pl[0].y*_oh) - 20)
+                    cv2.putText(overlay, f"P{_pidx+1}", (_lx, _ly),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, _pc, 2, cv2.LINE_AA)
 
-        # ── 얼굴
+        # ── 얼굴 (모든 감지된 사람)
         if self._show_face.get() and face_res.face_landmarks:
-            mp_draw.draw_landmarks(
-                overlay,
-                face_res.face_landmarks[0],
-                FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                landmark_drawing_spec=None,
-                connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
-            )
-            _lf = face_res.face_landmarks[0]
             _nc = (0, 230, 180)
-            for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
-                           (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
-                if _s < len(_lf) and _e < len(_lf):
-                    _p1 = (int(_lf[_s].x*_ow), int(_lf[_s].y*_oh))
-                    _p2 = (int(_lf[_e].x*_ow), int(_lf[_e].y*_oh))
-                    cv2.line(overlay, _p1, _p2, _nc, 1)
-            for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
-                if _i < len(_lf):
-                    cv2.circle(overlay,
-                               (int(_lf[_i].x*_ow), int(_lf[_i].y*_oh)),
-                               2, _nc, -1)
+            for _lf in face_res.face_landmarks:
+                mp_draw.draw_landmarks(
+                    overlay, _lf,
+                    FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+                    landmark_drawing_spec=None,
+                    connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
+                )
+                for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
+                               (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
+                    if _s < len(_lf) and _e < len(_lf):
+                        cv2.line(overlay,
+                                 (int(_lf[_s].x*_ow), int(_lf[_s].y*_oh)),
+                                 (int(_lf[_e].x*_ow), int(_lf[_e].y*_oh)),
+                                 _nc, 1)
+                for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
+                    if _i < len(_lf):
+                        cv2.circle(overlay,
+                                   (int(_lf[_i].x*_ow), int(_lf[_i].y*_oh)),
+                                   2, _nc, -1)
 
         # ── 손
         if self._show_hands.get() and hand_res.hand_landmarks:
@@ -807,16 +808,7 @@ class VideoPanel:
                 continue
 
             fd = FrameData(index=idx, timestamp=idx / fps)
-            fd.face = _extract_face(face_res, w, h)
-            if pose_res:
-                fd.pose = _extract_pose(pose_res, w, h)
-            if hand_res.hand_landmarks:
-                for hlms, hedness in zip(hand_res.hand_landmarks, hand_res.handedness):
-                    hd = _extract_hand(hlms, hedness, w, h)
-                    if hd.side == "left":
-                        fd.left_hand = hd
-                    else:
-                        fd.right_hand = hd
+            fd.persons = _build_persons(face_res, hand_res, pose_res, w, h)
             frames_data.append(fd)
             idx += 1
 

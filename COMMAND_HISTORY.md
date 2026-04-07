@@ -45,6 +45,7 @@
 | 34 | cmd에서 어떻게 실행하더라? | `cd C:\...\my_openPose_proj` → `python app.py` 안내 |
 | 35 | command_history.md에 추가가 안 되는 이유 | 직전 질문 미기록 확인, 즉시 추가 |
 | 36 | 랜드마크 포인트 이름을 view에 렌더링, "랜드마크 이름" 체크박스로 ON/OFF | `camera_panel.py`/`video_panel.py` — `_show_names` BooleanVar + 체크박스 추가, `_draw_landmark_names()` 헬퍼 함수 구현 |
+| 37 | 왜 인간 두명 이상이 나오면 안되지? / 네 (구현 요청) | `tracker.py` — `MAX_PERSONS=4`, `PersonData`, `_build_persons()`, `_find_person_for_hand()` 추가. `camera_panel.py`/`video_panel.py` — `num_faces/poses=MAX_PERSONS`, `num_hands=MAX_PERSONS*2`, 다인원 오버레이 루프+P1/P2 레이블. `exporter.py` — `fd.persons` 구조로 JSON/AE `person_0/`, `person_1/` 디렉터리 |
 
 ---
 

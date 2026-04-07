@@ -99,6 +99,15 @@ class PoseIdx:
     RIGHT_ANKLE    = 28
 
 
+MAX_PERSONS = 4
+PERSON_COLORS = [
+    ( 50, 220,  50),   # P1: green
+    (255, 100,  50),   # P2: orange
+    ( 50, 100, 255),   # P3: blue
+    (255, 220,  50),   # P4: yellow
+]
+
+
 @dataclass
 class FaceLandmarks:
     detected: bool = False
@@ -158,13 +167,19 @@ class PoseLandmarks:
 
 
 @dataclass
-class FrameData:
-    index:      int   = 0
-    timestamp:  float = 0.0
+class PersonData:
+    person_id:  int           = 0
     face:       FaceLandmarks = field(default_factory=FaceLandmarks)
+    pose:       PoseLandmarks = field(default_factory=PoseLandmarks)
     left_hand:  HandLandmarks = field(default_factory=HandLandmarks)
     right_hand: HandLandmarks = field(default_factory=HandLandmarks)
-    pose:       PoseLandmarks = field(default_factory=PoseLandmarks)
+
+
+@dataclass
+class FrameData:
+    index:     int              = 0
+    timestamp: float            = 0.0
+    persons:   List[PersonData] = field(default_factory=list)
 
 
 @dataclass
@@ -183,11 +198,11 @@ def _lm_to_point(lm, w: int, h: int, conf: float = 1.0) -> Point2D:
     return Point2D(x=lm.x * w, y=lm.y * h, confidence=conf)
 
 
-def _extract_face(face_result, w: int, h: int) -> FaceLandmarks:
+def _extract_face(face_result, w: int, h: int, face_idx: int = 0) -> FaceLandmarks:
     f = FaceLandmarks()
-    if not face_result.face_landmarks:
+    if not face_result.face_landmarks or face_idx >= len(face_result.face_landmarks):
         return f
-    lms = face_result.face_landmarks[0]  # 첫 번째 얼굴
+    lms = face_result.face_landmarks[face_idx]
 
     def pt(idx): return _lm_to_point(lms[idx], w, h)
 
@@ -209,11 +224,11 @@ def _extract_face(face_result, w: int, h: int) -> FaceLandmarks:
     return f
 
 
-def _extract_pose(pose_result, w: int, h: int) -> PoseLandmarks:
+def _extract_pose(pose_result, w: int, h: int, pose_idx: int = 0) -> PoseLandmarks:
     p = PoseLandmarks()
-    if not pose_result.pose_landmarks:
+    if not pose_result.pose_landmarks or pose_idx >= len(pose_result.pose_landmarks):
         return p
-    lms = pose_result.pose_landmarks[0]
+    lms = pose_result.pose_landmarks[pose_idx]
 
     def pt(idx: int) -> Point2D:
         lm = lms[idx]
@@ -248,6 +263,62 @@ def _extract_hand(hand_lms, handedness_list, w: int, h: int) -> HandLandmarks:
     return h_data
 
 
+def _find_person_for_hand(wrist: Point2D, persons: list) -> int:
+    """손목 위치에 가장 가까운 사람 인덱스 반환"""
+    best_idx = 0
+    best_dist = float('inf')
+    for i, p in enumerate(persons):
+        refs = []
+        if p.pose.detected:
+            refs += [p.pose.left_wrist, p.pose.right_wrist]
+        if p.face.detected:
+            refs.append(p.face.nose_tip)
+        for ref in refs:
+            if ref.confidence > 0.1:
+                dist = (wrist.x - ref.x) ** 2 + (wrist.y - ref.y) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = i
+    return best_idx
+
+
+def _build_persons(face_res, hand_res, pose_res, w: int, h: int) -> list:
+    """얼굴/포즈/손 감지 결과를 PersonData 리스트로 조합 (좌→우 순 정렬)"""
+    n_faces = len(face_res.face_landmarks) if face_res and face_res.face_landmarks else 0
+    n_poses = len(pose_res.pose_landmarks) if pose_res and pose_res.pose_landmarks else 0
+    n = max(n_faces, n_poses)
+    if n == 0:
+        return []
+
+    # 좌→우 정렬: 얼굴은 코 끝(인덱스 4) x, 포즈는 엉덩이 중심 x
+    face_order = sorted(range(n_faces),
+                        key=lambda i: face_res.face_landmarks[i][4].x)
+    pose_order = sorted(range(n_poses),
+                        key=lambda i: (pose_res.pose_landmarks[i][23].x
+                                       + pose_res.pose_landmarks[i][24].x) / 2)
+
+    persons = []
+    for pid in range(n):
+        p = PersonData(person_id=pid)
+        if pid < len(face_order):
+            p.face = _extract_face(face_res, w, h, face_order[pid])
+        if pid < len(pose_order):
+            p.pose = _extract_pose(pose_res, w, h, pose_order[pid])
+        persons.append(p)
+
+    if hand_res and hand_res.hand_landmarks:
+        for hlms, hedness in zip(hand_res.hand_landmarks, hand_res.handedness):
+            hd = _extract_hand(hlms, hedness, w, h)
+            pid = _find_person_for_hand(hd.wrist, persons)
+            p = persons[pid]
+            if hd.side == "left" and not p.left_hand.detected:
+                p.left_hand = hd
+            elif hd.side == "right" and not p.right_hand.detected:
+                p.right_hand = hd
+
+    return persons
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Tracker (영상 파일 처리용)
 # ──────────────────────────────────────────────────────────────────────────
@@ -262,8 +333,8 @@ class Tracker:
         self._hand_conf = min_hand_confidence
 
     # camera_panel 에서 호출하는 메서드 (구 API 호환 래퍼)
-    def _extract_face(self, face_result, w: int, h: int) -> FaceLandmarks:
-        return _extract_face(face_result, w, h)
+    def _extract_face(self, face_result, w: int, h: int, face_idx: int = 0) -> FaceLandmarks:
+        return _extract_face(face_result, w, h, face_idx)
 
     def _extract_hand(self, hand_lms, handedness, w: int, h: int) -> HandLandmarks:
         return _extract_hand(hand_lms, handedness, w, h)
@@ -290,7 +361,7 @@ class Tracker:
         face_opts = mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
             running_mode=RunningMode.IMAGE,
-            num_faces=1,
+            num_faces=MAX_PERSONS,
             min_face_detection_confidence=self._face_conf,
             min_face_presence_confidence=self._face_conf,
             min_tracking_confidence=0.5,
@@ -298,9 +369,17 @@ class Tracker:
         hand_opts = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL),
             running_mode=RunningMode.IMAGE,
-            num_hands=2,
+            num_hands=MAX_PERSONS * 2,
             min_hand_detection_confidence=self._hand_conf,
             min_hand_presence_confidence=self._hand_conf,
+            min_tracking_confidence=0.5,
+        )
+        pose_opts = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL),
+            running_mode=RunningMode.IMAGE,
+            num_poses=MAX_PERSONS,
+            min_pose_detection_confidence=self._face_conf,
+            min_pose_presence_confidence=self._face_conf,
             min_tracking_confidence=0.5,
         )
 
@@ -312,7 +391,8 @@ class Tracker:
         frames: List[FrameData] = []
 
         with mp_vision.FaceLandmarker.create_from_options(face_opts) as face_det, \
-             mp_vision.HandLandmarker.create_from_options(hand_opts) as hand_det:
+             mp_vision.HandLandmarker.create_from_options(hand_opts) as hand_det, \
+             mp_vision.PoseLandmarker.create_from_options(pose_opts) as pose_det:
 
             idx = 0
             while True:
@@ -326,30 +406,23 @@ class Tracker:
 
                 face_res = face_det.detect(mp_img)
                 hand_res = hand_det.detect(mp_img)
+                pose_res = pose_det.detect(mp_img)
 
                 fd = FrameData(index=idx, timestamp=idx / info.fps)
-                fd.face = _extract_face(face_res, w_px, h_px)
-
-                if hand_res.hand_landmarks:
-                    for hlms, hedness in zip(hand_res.hand_landmarks, hand_res.handedness):
-                        hd = _extract_hand(hlms, hedness, w_px, h_px)
-                        if hd.side == "left":
-                            fd.left_hand = hd
-                        else:
-                            fd.right_hand = hd
+                fd.persons = _build_persons(face_res, hand_res, pose_res, w_px, h_px)
 
                 frames.append(fd)
 
                 if show_preview:
                     preview = frame.copy()
                     if face_res.face_landmarks:
-                        du.draw_landmarks(
-                            preview,
-                            face_res.face_landmarks[0],
-                            FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                            landmark_drawing_spec=None,
-                            connection_drawing_spec=ds.get_default_face_mesh_contours_style(),
-                        )
+                        for _fl in face_res.face_landmarks:
+                            du.draw_landmarks(
+                                preview, _fl,
+                                FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+                                landmark_drawing_spec=None,
+                                connection_drawing_spec=ds.get_default_face_mesh_contours_style(),
+                            )
                     if hand_res.hand_landmarks:
                         for hlms in hand_res.hand_landmarks:
                             du.draw_landmarks(
