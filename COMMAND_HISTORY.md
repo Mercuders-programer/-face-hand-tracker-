@@ -41,6 +41,9 @@
 | 30 | 명령어 및 질문 모두 저장하는 파일 만들고 앞으로도 기록해줘 | `COMMAND_HISTORY.md` 생성 |
 | 31 | 카메라/영상 분석 뷰에서 몸, 팔, 다리 위치 추적 추가 (어깨, 팔꿈치, 손목, 골반, 무릎, 발목) | `models/pose_landmarker_full.task` 다운로드, `tracker.py` PoseLandmarks 추가, `camera_panel.py`/`video_panel.py` 포즈 오버레이 추가, `exporter.py` 포즈 JSON/AE 내보내기 추가 |
 | 32 | 랜드마크를 얼굴/몸/손 체크박스 3개로 나누고 저장(AE,JSON,영상)에도 적용 | `camera_panel.py`/`video_panel.py` — 3개 BooleanVar+체크박스 분리, `exporter.py` — include_face/body/hands 파라미터 추가 |
+| 33 | make_exe_file.bat도 따로 반영할 건 없지? | STEP 3에 pose_landmarker_full.task 존재 확인 추가 |
+| 34 | cmd에서 어떻게 실행하더라? | `cd C:\...\my_openPose_proj` → `python app.py` 안내 |
+| 35 | command_history.md에 추가가 안 되는 이유 | 직전 질문 미기록 확인, 즉시 추가 |
 
 ---
 
