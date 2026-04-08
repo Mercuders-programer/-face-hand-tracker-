@@ -132,10 +132,11 @@ class CameraPanel:
         self._recording  = False
         self._fps        = 30          # 캡처 스레드에서 사용할 정수값
         self._fps_var    = tk.IntVar(value=30)
-        self._show_face  = tk.BooleanVar(value=True)
-        self._show_body  = tk.BooleanVar(value=True)
-        self._show_hands = tk.BooleanVar(value=True)
-        self._show_names = tk.BooleanVar(value=False)
+        self._show_face   = tk.BooleanVar(value=True)
+        self._show_body   = tk.BooleanVar(value=True)
+        self._show_hands  = tk.BooleanVar(value=True)
+        self._show_names  = tk.BooleanVar(value=False)
+        self._smooth_var  = tk.IntVar(value=3)
         self._status_var = tk.StringVar(value="대기중")
         self._frame_q: queue.Queue = queue.Queue(maxsize=2)
         self._frames_data: list[FrameData] = []
@@ -214,6 +215,23 @@ class CameraPanel:
             activeforeground="#ffdd88", activebackground=BG_PANEL,
             anchor=tk.W,
         ).pack(fill=tk.X, padx=8, pady=(4, 2))
+
+        self._separator(right)
+
+        # ── AE 스무딩 ──
+        self._section_label(right, "AE 스무딩")
+        smooth_row = tk.Frame(right, bg=BG_PANEL)
+        smooth_row.pack(pady=(0, 4))
+        tk.Label(smooth_row, text="0", font=("Segoe UI", 9),
+                 fg=TEXT_G, bg=BG_PANEL).pack(side=tk.LEFT)
+        tk.Scale(
+            smooth_row, from_=0, to=15, orient=tk.HORIZONTAL,
+            variable=self._smooth_var, length=130,
+            bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+            highlightthickness=0, showvalue=True,
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(smooth_row, text="15", font=("Segoe UI", 9),
+                 fg=TEXT_G, bg=BG_PANEL).pack(side=tk.LEFT)
 
         self._separator(right)
 
@@ -433,9 +451,10 @@ class CameraPanel:
         fps       = self._fps
         frames    = list(self._frames_data)
         cam_w, cam_h = self._cam_w, self._cam_h
-        inc_face  = self._show_face.get()
-        inc_body  = self._show_body.get()
-        inc_hands = self._show_hands.get()
+        inc_face   = self._show_face.get()
+        inc_body   = self._show_body.get()
+        inc_hands  = self._show_hands.get()
+        smooth     = self._smooth_var.get()
 
         self._status_var.set("AE 데이터 내보내는 중...")
 
@@ -448,7 +467,8 @@ class CameraPanel:
                 export_json(frames, info, json_path,
                             include_face=inc_face, include_body=inc_body, include_hands=inc_hands)
                 export_ae_keyframes(frames, info, ae_dir,
-                                    include_face=inc_face, include_body=inc_body, include_hands=inc_hands)
+                                    include_face=inc_face, include_body=inc_body, include_hands=inc_hands,
+                                    smooth_radius=smooth)
 
             def _done():
                 self._status_var.set(f"저장 완료! ({len(frames)} 프레임)")

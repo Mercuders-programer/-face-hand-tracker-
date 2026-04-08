@@ -9,6 +9,7 @@
 
 | # | 명령 / 질문 | 결과 |
 |---|-------------|------|
+| 0 |그럼 프로그램을 실행했을때 UI화면을 넣어줄건데, 첫번쨰를 클릭하면 캠으로 보이는 뷰가 보이면서 캠에서 보이는 얼굴이랑 손가락등을 실시간으로 추적해서 캠 뷰 자체에서 포인트나 라인으로 확인할 수 있게 해주고 옵션으로 30 프레임 60프레임이 있고 녹화 버튼을 누르면 캠으로 찍는 화면을 뷰로 보여주면서 뷰에 얼굴이나 손가락 등을 실시간으로 추적해서 뷰 자체에 포인트나 라인으로 보여주고 녹화 하다가 중지 버튼을 누르면 녹화했던 영상을 저장하는 경로를 물어보고 경로가 설정되면 그 경로에 영상을 저장하고 동시에 녹화에서 눈 코 입 손가락 등의 위치를 옵션의 30 프레임이나 60프레임에 맞게 초당 위치등의 정보를 에프터이펙트에서 읽어서 사용할 수 있는 정보로 파일을 만들어서 저장해줘 두번째 UI는 일단 버튼만 만들고 첫번쨰 UI를 다 만들면 다시 얘기할게 
 | 1 | 첫 번째 버튼(녹화 중지)의 AE/JSON 저장 기능을 영상 분석 UI에도 버튼으로 추가해줘 | `src/video_panel.py` — JSON/AE 내보내기 버튼 추가 |
 | 2 | 영상 저장 버튼 추가, 랜드마크 체크 시 오버레이 렌더링된 MP4로 저장 | `src/video_panel.py` — 영상 저장 버튼 추가 |
 | 3 | 방금 추가된 내용 GitHub에 push 해줘 | push 완료 (73db5a5) |
@@ -46,6 +47,13 @@
 | 35 | command_history.md에 추가가 안 되는 이유 | 직전 질문 미기록 확인, 즉시 추가 |
 | 36 | 랜드마크 포인트 이름을 view에 렌더링, "랜드마크 이름" 체크박스로 ON/OFF | `camera_panel.py`/`video_panel.py` — `_show_names` BooleanVar + 체크박스 추가, `_draw_landmark_names()` 헬퍼 함수 구현 |
 | 37 | 왜 인간 두명 이상이 나오면 안되지? / 네 (구현 요청) | `tracker.py` — `MAX_PERSONS=4`, `PersonData`, `_build_persons()`, `_find_person_for_hand()` 추가. `camera_panel.py`/`video_panel.py` — `num_faces/poses=MAX_PERSONS`, `num_hands=MAX_PERSONS*2`, 다인원 오버레이 루프+P1/P2 레이블. `exporter.py` — `fd.persons` 구조로 JSON/AE `person_0/`, `person_1/` 디렉터리 |
+| 38 | 내보낸 파일을 AE에서 어떻게 활용할 수 있나 — `Idea_AE.txt`로 만들어줘 | `Idea_AE.txt` 생성 — 얼굴/몸/손/다인원 활용 아이디어 5개 섹션 작성 |
+| 39 | 검지손가락 끝에 컴포넌트를 위치시키려면? | `index_tip.txt` → NULL 오브젝트 Position에 붙여넣기 → Parent 연결 방법 안내 |
+| 40 | AE script에서 keyword 입력창 → NULL 자동 생성 스크립트 + AE 내보내기 시 자동 포함 | `scripts/pose_to_null.jsx` 생성, `exporter.py` — AE 내보내기 시 `pose_to_null.jsx` 출력 폴더에 자동 복사 |
+| 41 | keyframe이 너무 흔들린다 — 보정해줘 | `exporter.py` — `_moving_avg()` 이동 평균 스무딩, `export_ae_keyframes`에 `smooth_radius` 파라미터 추가. `camera_panel.py`/`video_panel.py` — 스무딩 슬라이더(0~15, 기본값 3) 추가 |
+| 42 | 왜 자꾸 command_history에 내용 업데이트를 안해? | ERROR_HISTORY 3차 기록 |
+| 43 | 왜 자꾸 그러냐고 | 반복 실수 인정, 근본 원인(코딩 집중 시 기록 건너뜀) 설명 |
+| 44 | 방금 내가 얘기했던거 다 기록해줘 command_history에 | 누락 항목(#42~44) 추가, 표 밖에 끼어들어간 내용 정리 |
 
 ---
 

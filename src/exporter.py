@@ -4,6 +4,7 @@ exporter.py — 추적 데이터를 JSON + After Effects Keyframe Data 로 저�
 
 import json
 import os
+import shutil
 from typing import List, Callable
 try:
     from .tracker import FrameData, VideoInfo, Point2D, PersonData, HAND_LANDMARK_NAMES, POSE_LANDMARK_NAMES
@@ -143,12 +144,35 @@ def export_json(frames: List[FrameData], info: VideoInfo, out_path: str,
 # AE Keyframe Data 내보내기
 # ──────────────────────────────────────────────────────────────────────────
 
+def _moving_avg(values: list, radius: int) -> list:
+    """반경 radius의 이동 평균으로 리스트 스무딩"""
+    n = len(values)
+    result = []
+    for i in range(n):
+        lo = max(0, i - radius)
+        hi = min(n, i + radius + 1)
+        result.append(sum(values[lo:hi]) / (hi - lo))
+    return result
+
+
 def _write_ae_file(path: str,
                    info: VideoInfo,
                    frames: List[FrameData],
                    getter: Callable[[FrameData], Point2D],
-                   threshold: float = 0.05) -> bool:
+                   threshold: float = 0.05,
+                   smooth_radius: int = 0) -> bool:
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # 모든 프레임의 포인트 추출
+    raw = [(fd.index, getter(fd)) for fd in frames]
+
+    # 스무딩 적용 (이동 평균)
+    if smooth_radius > 0 and len(raw) > 1:
+        xs    = _moving_avg([p.x          for _, p in raw], smooth_radius)
+        ys    = _moving_avg([p.y          for _, p in raw], smooth_radius)
+        confs =             [p.confidence for _, p in raw]
+        raw = [(raw[i][0], Point2D(x=xs[i], y=ys[i], confidence=confs[i]))
+               for i in range(len(raw))]
 
     lines = []
     lines.append("Adobe After Effects 8.0 Keyframe Data\n")
@@ -162,11 +186,10 @@ def _write_ae_file(path: str,
     lines.append("\tFrame\tX pixels\tY pixels\tZ pixels\t\n")
 
     count = 0
-    for fd in frames:
-        p = getter(fd)
+    for frame_idx, p in raw:
         if p.confidence < threshold:
             continue
-        lines.append(f"\t{fd.index}\t{p.x:.4f}\t{p.y:.4f}\t0.0000\t\n")
+        lines.append(f"\t{frame_idx}\t{p.x:.4f}\t{p.y:.4f}\t0.0000\t\n")
         count += 1
 
     lines.append("\nEnd of Keyframe Data\n")
@@ -181,7 +204,8 @@ def _write_ae_file(path: str,
 
 def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str,
                         include_face: bool = True, include_body: bool = True,
-                        include_hands: bool = True) -> bool:
+                        include_hands: bool = True,
+                        smooth_radius: int = 0) -> bool:
     max_persons = max((len(fd.persons) for fd in frames), default=0)
     if max_persons == 0:
         print(f"[Exporter] 경고: 감지된 사람 없음 — AE 출력 건너뜀")
@@ -244,7 +268,8 @@ def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str,
                     os.path.join(face_dir, f"{name}.txt"), info, frames,
                     lambda f, g=getter, pid=pid: (
                         g(f.persons[pid]) if pid < len(f.persons) and f.persons[pid].face.detected
-                        else Point2D()))
+                        else Point2D()),
+                    smooth_radius=smooth_radius)
 
         # ── 손 주요 6포인트 × 2손 + 전체 21포인트
         if include_hands:
@@ -253,12 +278,14 @@ def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str,
                     os.path.join(lh_dir, f"{name}.txt"), info, frames,
                     lambda f, g=hgetter, pid=pid: (
                         g(f.persons[pid].left_hand) if pid < len(f.persons) and f.persons[pid].left_hand.detected
-                        else Point2D()))
+                        else Point2D()),
+                    smooth_radius=smooth_radius)
                 ok &= _write_ae_file(
                     os.path.join(rh_dir, f"{name}.txt"), info, frames,
                     lambda f, g=hgetter, pid=pid: (
                         g(f.persons[pid].right_hand) if pid < len(f.persons) and f.persons[pid].right_hand.detected
-                        else Point2D()))
+                        else Point2D()),
+                    smooth_radius=smooth_radius)
             for i, lm_name in enumerate(HAND_LANDMARK_NAMES):
                 ok &= _write_ae_file(
                     os.path.join(lh_all, f"{lm_name}.txt"), info, frames,
@@ -266,14 +293,16 @@ def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str,
                         f.persons[pid].left_hand.landmarks[idx]
                         if pid < len(f.persons) and f.persons[pid].left_hand.detected
                         and len(f.persons[pid].left_hand.landmarks) > idx
-                        else Point2D()))
+                        else Point2D()),
+                    smooth_radius=smooth_radius)
                 ok &= _write_ae_file(
                     os.path.join(rh_all, f"{lm_name}.txt"), info, frames,
                     lambda f, idx=i, pid=pid: (
                         f.persons[pid].right_hand.landmarks[idx]
                         if pid < len(f.persons) and f.persons[pid].right_hand.detected
                         and len(f.persons[pid].right_hand.landmarks) > idx
-                        else Point2D()))
+                        else Point2D()),
+                    smooth_radius=smooth_radius)
 
         # ── 포즈 주요 관절 12개
         if include_body:
@@ -282,7 +311,16 @@ def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str,
                     os.path.join(pose_dir, f"{name}.txt"), info, frames,
                     lambda f, g=getter, pid=pid: (
                         g(f.persons[pid]) if pid < len(f.persons) and f.persons[pid].pose.detected
-                        else Point2D()))
+                        else Point2D()),
+                    smooth_radius=smooth_radius)
+
+    # ── pose_to_null.jsx 를 출력 폴더에 복사 ────────────────────────
+    _jsx_src = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts", "pose_to_null.jsx",
+    )
+    if os.path.exists(_jsx_src):
+        shutil.copy2(_jsx_src, os.path.join(out_dir, "pose_to_null.jsx"))
 
     print(f"[Exporter] AE Keyframe Data 저장 완료: {out_dir}/")
     return ok

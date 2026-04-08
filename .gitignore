@@ -13,6 +13,8 @@ lib/
 
 # 출력 결과물
 output/
+TEST_DATA/
+x64/
 *.mp4
 *.avi
 *.mov

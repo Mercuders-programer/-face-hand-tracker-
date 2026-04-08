@@ -142,6 +142,7 @@ class VideoPanel:
         self._show_body  = tk.BooleanVar(value=False)
         self._show_hands = tk.BooleanVar(value=False)
         self._show_names = tk.BooleanVar(value=False)
+        self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._export_status_var  = tk.StringVar(value="")
         self._face_det      = None
@@ -309,6 +310,25 @@ class VideoPanel:
             activeforeground="#ffdd88", activebackground=BG_PANEL,
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(4, 2))
+
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        # ── AE 스무딩 ──
+        tk.Label(parent, text="AE 스무딩",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14, pady=(0, 2))
+        smooth_row = tk.Frame(parent, bg=BG_PANEL)
+        smooth_row.pack(fill=tk.X, padx=10, pady=(0, 4))
+        tk.Label(smooth_row, text="0", font=("Segoe UI", 9),
+                 fg=TEXT_G, bg=BG_PANEL).pack(side=tk.LEFT)
+        tk.Scale(
+            smooth_row, from_=0, to=15, orient=tk.HORIZONTAL,
+            variable=self._smooth_var, length=120,
+            bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
+            highlightthickness=0, showvalue=True,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Label(smooth_row, text="15", font=("Segoe UI", 9),
+                 fg=TEXT_G, bg=BG_PANEL).pack(side=tk.LEFT)
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
@@ -636,6 +656,7 @@ class VideoPanel:
         inc_face  = self._show_face.get()
         inc_body  = self._show_body.get()
         inc_hands = self._show_hands.get()
+        smooth    = self._smooth_var.get()
 
         def _run():
             frames_data, info = self._process_all_frames()
@@ -653,7 +674,8 @@ class VideoPanel:
                     msg = f"JSON 저장 완료!\n{save_path}"
                 else:
                     export_ae_keyframes(frames_data, info, save_path,
-                                        include_face=inc_face, include_body=inc_body, include_hands=inc_hands)
+                                        include_face=inc_face, include_body=inc_body, include_hands=inc_hands,
+                                        smooth_radius=smooth)
                     msg = f"AE 키프레임 저장 완료!\n{save_path}/"
             except Exception as e:
                 msg = None

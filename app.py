@@ -74,7 +74,7 @@ class MainApp:
 
         # 버전 정보 — 우측 하단 고정
         tk.Label(
-            self.root, text="v1.0.0",
+            self.root, text="v1.0.1",
             font=("Segoe UI", 8),
             fg=TEXT_G, bg=BG,
         ).place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-8)
