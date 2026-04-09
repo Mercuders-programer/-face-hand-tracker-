@@ -58,6 +58,7 @@
 | 46 | 첫번째/두번째 버튼 view에서 느린 느낌 안들도록 최적화 | `camera_panel.py`/`video_panel.py` — 2프레임마다 감지, 추론 640px 축소, 미사용 감지기 생략, BILINEAR 리사이즈 |
 | 47 | 얼굴 이미지 로드 버튼 — 이미지의 눈코입 감지 후 실시간 view에서 얼굴에 워프하여 따라가게 | `camera_panel.py`/`video_panel.py` — `_FACE_IMG_KPT`/`_apply_face_img_overlay` 추가, "이미지 로드/제거" 버튼+라벨 UI, `_load_face_image`/`_toggle_face_image` 메서드, Homography 워프+알파 블렌딩 |
 | 48 | ref/ 폴더의 고양이 일러스트로 테스트 — 그림/일러스트 지원 요청 | `_apply_face_img_overlay` 이중 모드 구현: 실사 [정밀] Homography / 일러스트 [자동] Affine 폴백. 눈 위치Y(%)·크기(%) 슬라이더 추가. ref/ 4개 고양이 이미지 모두 [자동] 모드 정상 동작 확인 |
+| 49 | 두 view UI 오른쪽 패널에 스크롤바 추가 (아래가 안 보임) | `camera_panel.py`/`video_panel.py` — 우측 패널을 Canvas+Scrollbar 구조로 교체, 마우스 휠 스크롤 지원 |
 
 ---
 

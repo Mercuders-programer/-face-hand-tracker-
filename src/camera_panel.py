@@ -231,10 +231,34 @@ class CameraPanel:
         self._canvas.pack(fill=tk.BOTH, expand=True)
         self._draw_placeholder()
 
-        # 우측: 컨트롤 패널
-        right = tk.Frame(self.win, bg=BG_PANEL, width=CTRL_W)
-        right.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 12), pady=12)
-        right.pack_propagate(False)
+        # 우측: 스크롤 가능한 컨트롤 패널
+        _r_outer = tk.Frame(self.win, bg=BG_PANEL, width=CTRL_W)
+        _r_outer.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 12), pady=12)
+        _r_outer.pack_propagate(False)
+
+        _r_sb = tk.Scrollbar(_r_outer, orient="vertical")
+        _r_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        _r_cv = tk.Canvas(
+            _r_outer, bg=BG_PANEL,
+            yscrollcommand=_r_sb.set,
+            highlightthickness=0,
+        )
+        _r_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _r_sb.config(command=_r_cv.yview)
+
+        right = tk.Frame(_r_cv, bg=BG_PANEL)
+        _r_win = _r_cv.create_window((0, 0), window=right, anchor="nw")
+
+        right.bind("<Configure>",
+                   lambda e: _r_cv.configure(scrollregion=_r_cv.bbox("all")))
+        _r_cv.bind("<Configure>",
+                   lambda e: _r_cv.itemconfig(_r_win, width=e.width))
+
+        def _r_wheel(e):
+            _r_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        _r_cv.bind("<Enter>", lambda e: _r_cv.bind_all("<MouseWheel>", _r_wheel))
+        _r_cv.bind("<Leave>", lambda e: _r_cv.unbind_all("<MouseWheel>"))
 
         # ── 프레임 레이트 ──
         self._section_label(right, "프레임 레이트")

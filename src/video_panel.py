@@ -226,10 +226,35 @@ class VideoPanel:
         body = tk.Frame(self.win, bg=BG_DARK)
         body.pack(fill=tk.BOTH, expand=True)
 
-        # 우측 정보 패널 (먼저 pack → 리사이즈 시 공간 우선 확보)
-        info_panel = tk.Frame(body, bg=BG_PANEL, width=210)
-        info_panel.pack(side=tk.RIGHT, fill=tk.Y)
-        info_panel.pack_propagate(False)
+        # 우측 정보 패널 — 스크롤 가능
+        _i_outer = tk.Frame(body, bg=BG_PANEL, width=210)
+        _i_outer.pack(side=tk.RIGHT, fill=tk.Y)
+        _i_outer.pack_propagate(False)
+
+        _i_sb = tk.Scrollbar(_i_outer, orient="vertical")
+        _i_sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        _i_cv = tk.Canvas(
+            _i_outer, bg=BG_PANEL,
+            yscrollcommand=_i_sb.set,
+            highlightthickness=0,
+        )
+        _i_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        _i_sb.config(command=_i_cv.yview)
+
+        info_panel = tk.Frame(_i_cv, bg=BG_PANEL)
+        _i_win = _i_cv.create_window((0, 0), window=info_panel, anchor="nw")
+
+        info_panel.bind("<Configure>",
+                        lambda e: _i_cv.configure(scrollregion=_i_cv.bbox("all")))
+        _i_cv.bind("<Configure>",
+                   lambda e: _i_cv.itemconfig(_i_win, width=e.width))
+
+        def _i_wheel(e):
+            _i_cv.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        _i_cv.bind("<Enter>", lambda e: _i_cv.bind_all("<MouseWheel>", _i_wheel))
+        _i_cv.bind("<Leave>", lambda e: _i_cv.unbind_all("<MouseWheel>"))
+
         self._build_info_panel(info_panel)
 
         # 좌측: 영상 + 타임라인 + 컨트롤
