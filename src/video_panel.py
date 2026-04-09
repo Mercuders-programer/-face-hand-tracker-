@@ -109,6 +109,28 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
         ).astype(np.uint8)
 
 
+def _apply_face_mosaic(frame, face_res, w, h, block=20):
+    """감지된 얼굴 영역에 모자이크(픽셀화) 효과를 적용한다."""
+    if not face_res.face_landmarks:
+        return
+    for _lf in face_res.face_landmarks:
+        xs = [_lf[i].x * w for i in range(len(_lf))]
+        ys = [_lf[i].y * h for i in range(len(_lf))]
+        x1 = max(0,  int(min(xs)) - 15)
+        y1 = max(0,  int(min(ys)) - 15)
+        x2 = min(w,  int(max(xs)) + 15)
+        y2 = min(h,  int(max(ys)) + 15)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+        roi = frame[y1:y2, x1:x2]
+        rh, rw = roi.shape[:2]
+        small = cv2.resize(roi,
+                           (max(1, rw // block), max(1, rh // block)),
+                           interpolation=cv2.INTER_LINEAR)
+        frame[y1:y2, x1:x2] = cv2.resize(small, (rw, rh),
+                                           interpolation=cv2.INTER_NEAREST)
+
+
 def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
                           w, h, show_face, show_body, show_hands):
     """랜드마크 포인트 이름을 overlay 이미지에 렌더링한다."""
@@ -194,10 +216,11 @@ class VideoPanel:
         self._playing       = False
         self._dragging      = False
         self._drag_was_playing = False
-        self._show_face  = tk.BooleanVar(value=False)
-        self._show_body  = tk.BooleanVar(value=False)
-        self._show_hands = tk.BooleanVar(value=False)
-        self._show_names = tk.BooleanVar(value=False)
+        self._show_face   = tk.BooleanVar(value=False)
+        self._show_body   = tk.BooleanVar(value=False)
+        self._show_hands  = tk.BooleanVar(value=False)
+        self._show_names  = tk.BooleanVar(value=False)
+        self._show_mosaic = tk.BooleanVar(value=False)
         self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._export_status_var  = tk.StringVar(value="")
@@ -215,7 +238,7 @@ class VideoPanel:
 
         self._build_ui()
         self._init_mediapipe()
-        for _v in (self._show_face, self._show_body, self._show_hands, self._show_names):
+        for _v in (self._show_face, self._show_body, self._show_hands, self._show_names, self._show_mosaic):
             _v.trace_add("write", lambda *_: self._refresh_frame())
         # 첫 프레임 표시 (레이아웃 완료 후)
         self.win.after(100, lambda: self._seek_to(0))
@@ -397,6 +420,15 @@ class VideoPanel:
             activeforeground="#ffdd88", activebackground=BG_PANEL,
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(4, 2))
+        tk.Checkbutton(
+            parent, text="얼굴 모자이크",
+            variable=self._show_mosaic,
+            font=("Segoe UI", 10),
+            fg="#ff8888", bg=BG_PANEL,
+            selectcolor="#0f3460",
+            activeforeground="#ff8888", activebackground=BG_PANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(2, 2))
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
@@ -633,7 +665,7 @@ class VideoPanel:
     # ── 프레임 표시 ────────────────────────────────────────────────────────
     def _display_frame(self, bgr, playback=False):
         if (self._show_face.get() or self._show_body.get() or self._show_hands.get()
-                or self._face_img is not None):
+                or self._face_img is not None or self._show_mosaic.get()):
             bgr = self._apply_overlay(bgr, playback=playback)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
@@ -684,6 +716,10 @@ class VideoPanel:
             face_res, hand_res, pose_res = self._det_cache
 
         _oh, _ow = overlay.shape[:2]
+
+        # ── 얼굴 모자이크 (가장 먼저 적용)
+        if self._show_mosaic.get():
+            _apply_face_mosaic(overlay, face_res, _ow, _oh)
 
         # ── 포즈 스켈레톤 (모든 감지된 사람, 얼굴/손 아래 레이어로 먼저 그리기)
         if self._show_body.get() and pose_res and pose_res.pose_landmarks:
