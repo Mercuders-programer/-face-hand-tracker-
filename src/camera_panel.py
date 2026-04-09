@@ -16,6 +16,7 @@ import mediapipe as mp
 import os
 import tempfile
 import shutil
+import numpy as np
 
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -59,6 +60,64 @@ TEXT_G    = "#8888aa"
 CANVAS_W  = 840
 CANVAS_H  = 560
 CTRL_W    = 230
+
+# 얼굴 이미지 워핑에 사용할 랜드마크 인덱스 (6점)
+_FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, Mouth.R, Mouth.L
+
+
+def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
+                             eye_y_pct=55, size_pct=100):
+    """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
+    face_img_pts is not None → Homography 정밀 모드 (실제 얼굴 사진)
+    face_img_pts is None     → Affine 자동 모드  (일러스트/그림)
+    """
+    if not face_res.face_landmarks:
+        return
+    img_h, img_w = face_img.shape[:2]
+    for _lf in face_res.face_landmarks:
+        if len(_lf) < 264:
+            continue
+        r_eye = np.array([_lf[33].x * w, _lf[33].y * h], dtype=np.float64)
+        l_eye = np.array([_lf[263].x * w, _lf[263].y * h], dtype=np.float64)
+        eye_center = (r_eye + l_eye) / 2.0
+        angle = float(np.degrees(np.arctan2(l_eye[1] - r_eye[1], l_eye[0] - r_eye[0])))
+
+        if face_img_pts is not None:
+            # ── Homography 정밀 모드 ─────────────────────────────────────
+            if len(_lf) <= max(_FACE_IMG_KPT):
+                continue
+            dst_pts = np.float32([[_lf[i].x * w, _lf[i].y * h] for i in _FACE_IMG_KPT])
+            M, _ = cv2.findHomography(face_img_pts, dst_pts)
+            if M is None:
+                continue
+            warped = cv2.warpPerspective(face_img, M, (w, h),
+                                         flags=cv2.INTER_LINEAR,
+                                         borderMode=cv2.BORDER_CONSTANT,
+                                         borderValue=(0, 0, 0, 0))
+        else:
+            # ── Affine 자동 모드 (일러스트) ──────────────────────────────
+            # 얼굴 바운딩박스 높이 → 스케일 (이미지의 80%가 얼굴 영역이라 가정)
+            ys = [_lf[i].y * h for i in range(len(_lf))]
+            face_h_px = max(ys) - min(ys)
+            scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
+            # 소스 이미지에서 눈 중심 위치 (eye_y_pct% 높이, 가로 중앙)
+            src_cx = img_w / 2.0
+            src_cy = img_h * (eye_y_pct / 100.0)
+            # Affine: 소스 눈 중심 → 화면 눈 중심, 회전 + 스케일
+            M = cv2.getRotationMatrix2D((src_cx, src_cy), -angle, scale)
+            M[0, 2] += eye_center[0] - src_cx
+            M[1, 2] += eye_center[1] - src_cy
+            warped = cv2.warpAffine(face_img, M, (w, h),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT,
+                                    borderValue=(0, 0, 0, 0))
+
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        overlay[:] = np.clip(
+            warped[:, :, :3].astype(np.float32) * alpha
+            + overlay.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
 
 
 def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
@@ -149,7 +208,11 @@ class CameraPanel:
         self._photo      = None        # GC 방지용 PhotoImage 참조
         self._cam_w      = 0
         self._cam_h      = 0
-        self._tracker    = Tracker()
+        self._tracker       = Tracker()
+        self._face_img      = None   # BGRA numpy array (얼굴 이미지)
+        self._face_img_pts  = None   # 소스 키포인트 (None = Affine 자동 모드)
+        self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
+        self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
 
         self._build_ui()
         # 패널 열리면 자동으로 카메라 시작
@@ -215,6 +278,36 @@ class CameraPanel:
             activeforeground="#ffdd88", activebackground=BG_PANEL,
             anchor=tk.W,
         ).pack(fill=tk.X, padx=8, pady=(4, 2))
+
+        self._separator(right)
+
+        # ── 얼굴 이미지 오버레이 ──
+        self._section_label(right, "얼굴 이미지")
+        self._face_img_btn = self._make_btn(
+            right, "이미지 로드", BG_CTRL,
+            command=self._toggle_face_image,
+        )
+        self._face_img_lbl = tk.Label(
+            right, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL,
+            wraplength=CTRL_W - 20,
+        )
+        self._face_img_lbl.pack(pady=(0, 2))
+        # 그림/일러스트 조정 슬라이더 (Affine 자동 모드에서 사용)
+        tk.Label(right, text="눈 위치 Y (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(right, from_=10, to=90, orient=tk.HORIZONTAL,
+                 variable=self._eye_y_var, length=170,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 2))
+        tk.Label(right, text="크기 (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(right, from_=30, to=300, orient=tk.HORIZONTAL,
+                 variable=self._img_size_var, length=170,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 4))
 
         self._separator(right)
 
@@ -497,6 +590,70 @@ class CameraPanel:
         self._rec_ind.config(text="" if cur else "● REC")
         self.win.after(500, self._blink)
 
+    # ── 얼굴 이미지 로드/제거 ──────────────────────────────────────────────
+    def _toggle_face_image(self):
+        if self._face_img is not None:
+            self._face_img = None
+            self._face_img_pts = None
+            self._face_img_lbl.config(text="미선택")
+            self._face_img_btn.config(text="이미지 로드")
+        else:
+            self._load_face_image()
+
+    def _load_face_image(self):
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="얼굴 이미지 선택",
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{path}", parent=self.win)
+            return
+
+        h, w = img.shape[:2]
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 3:
+            tmp = np.zeros((h, w, 4), dtype=np.uint8)
+            tmp[:, :, :3] = img
+            tmp[:, :, 3] = 255
+            img = tmp
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        face_opts = mp_vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
+            running_mode=RunningMode.IMAGE,
+            num_faces=1,
+        )
+        try:
+            _det = mp_vision.FaceLandmarker.create_from_options(face_opts)
+            mp_img_src = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            face_res = _det.detect(mp_img_src)
+            _det.close()
+        except Exception as e:
+            messagebox.showerror("오류", f"얼굴 감지 실패:\n{e}", parent=self.win)
+            return
+
+        # 얼굴 감지 성공 → 정밀 모드 (Homography)
+        # 감지 실패 (그림/일러스트) → 자동 모드 (Affine)
+        if (face_res.face_landmarks
+                and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT)):
+            lf = face_res.face_landmarks[0]
+            src_pts = np.float32([[lf[i].x * w, lf[i].y * h] for i in _FACE_IMG_KPT])
+            mode_text = " [정밀]"
+        else:
+            src_pts = None  # Affine 자동 모드
+            mode_text = " [자동]"
+
+        self._face_img = img.copy()
+        self._face_img_pts = src_pts
+        self._face_img_lbl.config(text=os.path.basename(path) + mode_text)
+        self._face_img_btn.config(text="× 이미지 제거")
+
     # ── 캡처 루프 (백그라운드 스레드) ────────────────────────────────────
     def _capture_loop(self):
         face_opts = mp_vision.FaceLandmarkerOptions(
@@ -533,6 +690,13 @@ class CameraPanel:
             self._capture_loop_raw()
             return
 
+        _empty_r = type('R', (), {
+            'face_landmarks': [], 'hand_landmarks': [],
+            'handedness': [], 'pose_landmarks': []
+        })()
+        _det_tick = 0
+        _last_f = _last_h = _last_p = _empty_r
+
         try:
             while self._running and self._cap and self._cap.isOpened():
                 ret, frame = self._cap.read()
@@ -543,17 +707,33 @@ class CameraPanel:
                 rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-                try:
-                    face_res = face_det.detect(mp_img)
-                    hand_res = hand_det.detect(mp_img)
-                    pose_res = pose_det.detect(mp_img)
-                except Exception as e:
-                    print(f"[detect error] {e}")
-                    _empty = type('R', (), {
-                        'face_landmarks': [], 'hand_landmarks': [],
-                        'handedness': [], 'pose_landmarks': []
-                    })()
-                    face_res = hand_res = pose_res = _empty
+                # 최적화: 2프레임마다 감지 (녹화 중에는 매 프레임 감지)
+                _det_tick += 1
+                _overlay_on = (self._show_face.get() or self._show_body.get()
+                               or self._show_hands.get())
+                _fi_on = self._face_img is not None
+                _need_det = (_det_tick % 2 == 1) or self._recording
+
+                if _need_det and (_overlay_on or self._recording or _fi_on):
+                    # 추론 해상도 축소 (최대 640px 너비)
+                    _sc = min(1.0, 640 / max(w_px, 1))
+                    if _sc < 0.99:
+                        _iw, _ih = int(w_px * _sc), int(h_px * _sc)
+                        _inf = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                        data=cv2.resize(rgb, (_iw, _ih)))
+                    else:
+                        _inf = mp_img
+                    try:
+                        if self._show_face.get() or self._recording or _fi_on:
+                            _last_f = face_det.detect(_inf)
+                        if self._show_hands.get() or self._recording:
+                            _last_h = hand_det.detect(_inf)
+                        if self._show_body.get() or self._recording:
+                            _last_p = pose_det.detect(_inf)
+                    except Exception as e:
+                        print(f"[detect error] {e}")
+
+                face_res, hand_res, pose_res = _last_f, _last_h, _last_p
 
                 # 오버레이 그리기
                 overlay = frame.copy()
@@ -622,6 +802,14 @@ class CameraPanel:
                                          self._show_body.get(),
                                          self._show_hands.get())
 
+                # ── 얼굴 이미지 오버레이
+                _fi = self._face_img
+                _fp = self._face_img_pts
+                if _fi is not None:
+                    _apply_face_img_overlay(overlay, face_res, w_px, h_px, _fi, _fp,
+                                            eye_y_pct=self._eye_y_var.get(),
+                                            size_pct=self._img_size_var.get())
+
                 # 녹화 처리
                 if self._recording:
                     if self._writer:
@@ -676,7 +864,7 @@ class CameraPanel:
             if ch <= 1: ch = CANVAS_H
             if True:
                 img = Image.fromarray(frame_rgb)
-                img = img.resize((cw, ch), Image.LANCZOS)
+                img = img.resize((cw, ch), Image.BILINEAR)
                 self._photo = ImageTk.PhotoImage(img)
                 self._canvas.delete("all")
                 self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
