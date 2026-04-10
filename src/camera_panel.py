@@ -64,6 +64,16 @@ CTRL_W    = 230
 # 얼굴 이미지 워핑에 사용할 랜드마크 인덱스 (6점)
 _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, Mouth.R, Mouth.L
 
+# 만화 손 스타일 뼈대 연결 정의
+_HAND_BONES = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
 
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                              eye_y_pct=55, size_pct=100):
@@ -142,6 +152,38 @@ def _apply_face_mosaic(frame, face_res, w, h, block=20):
                                            interpolation=cv2.INTER_NEAREST)
 
 
+def _draw_cartoon_hands(overlay, hand_res, w, h):
+    """손 랜드마크를 2D 애니메이션 스타일로 그린다 (두꺼운 뼈대 + 관절)."""
+    if not hand_res.hand_landmarks:
+        return
+    for hlms in hand_res.hand_landmarks:
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hlms]
+        if len(pts) < 21:
+            continue
+        _dist = float(np.linalg.norm(np.array(pts[0]) - np.array(pts[9])))
+        _dist = max(_dist, 30.0)
+        bone_w  = max(8,  int(_dist * 0.20))
+        joint_r = max(6,  int(_dist * 0.13))
+        nail_r  = max(4,  int(_dist * 0.09))
+        # 1st pass: 외곽 윤곽선
+        for s, e in _HAND_BONES:
+            cv2.line(overlay, pts[s], pts[e], (20, 20, 20), bone_w + 6, cv2.LINE_AA)
+        for i in range(21):
+            cv2.circle(overlay, pts[i], joint_r + 4, (20, 20, 20), -1)
+        # 2nd pass: 살색 본체 (BGR 200,215,235 = 따뜻한 크림)
+        for s, e in _HAND_BONES:
+            cv2.line(overlay, pts[s], pts[e], (200, 215, 235), bone_w, cv2.LINE_AA)
+        for i in range(21):
+            cv2.circle(overlay, pts[i], joint_r, (215, 225, 240), -1)
+        # 3rd pass: 손가락 끝 손톱 하이라이트
+        for tip in [4, 8, 12, 16, 20]:
+            cv2.circle(overlay, pts[tip], nail_r, (240, 245, 255), -1)
+            cv2.circle(overlay, pts[tip], nail_r, (20, 20, 20), 2)
+        # 4th pass: 관절 중심 하이라이트
+        for i in range(21):
+            cv2.circle(overlay, pts[i], max(2, joint_r // 3), (245, 248, 255), -1)
+
+
 def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
                           w, h, show_face, show_body, show_hands):
     """랜드마크 포인트 이름을 overlay 이미지에 렌더링한다."""
@@ -217,7 +259,8 @@ class CameraPanel:
         self._show_body   = tk.BooleanVar(value=True)
         self._show_hands  = tk.BooleanVar(value=True)
         self._show_names  = tk.BooleanVar(value=False)
-        self._show_mosaic = tk.BooleanVar(value=False)
+        self._show_mosaic         = tk.BooleanVar(value=False)
+        self._show_cartoon_hands  = tk.BooleanVar(value=False)
         self._smooth_var  = tk.IntVar(value=3)
         self._status_var = tk.StringVar(value="대기중")
         self._frame_q: queue.Queue = queue.Queue(maxsize=2)
@@ -316,6 +359,15 @@ class CameraPanel:
                 activeforeground=TEXT_W, activebackground=BG_PANEL,
                 anchor=tk.W,
             ).pack(fill=tk.X, padx=8, pady=(0, 2))
+        tk.Checkbutton(
+            right, text="  └ 만화 손 스타일",
+            variable=self._show_cartoon_hands,
+            font=("Segoe UI", 10),
+            fg="#88ccff", bg=BG_PANEL,
+            selectcolor=BG_CTRL,
+            activeforeground="#88ccff", activebackground=BG_PANEL,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=8, pady=(0, 4))
         tk.Checkbutton(
             right, text="랜드마크 이름",
             variable=self._show_names,
@@ -766,7 +818,7 @@ class CameraPanel:
                 # 최적화: 2프레임마다 감지 (녹화 중에는 매 프레임 감지)
                 _det_tick += 1
                 _overlay_on = (self._show_face.get() or self._show_body.get()
-                               or self._show_hands.get())
+                               or self._show_hands.get() or self._show_cartoon_hands.get())
                 _fi_on     = self._face_img is not None
                 _mosaic_on = self._show_mosaic.get()
                 _need_det = (_det_tick % 2 == 1) or self._recording
@@ -783,7 +835,7 @@ class CameraPanel:
                     try:
                         if self._show_face.get() or self._recording or _fi_on or _mosaic_on:
                             _last_f = face_det.detect(_inf)
-                        if self._show_hands.get() or self._recording:
+                        if self._show_hands.get() or self._recording or self._show_cartoon_hands.get():
                             _last_h = hand_det.detect(_inf)
                         if self._show_body.get() or self._recording:
                             _last_p = pose_det.detect(_inf)
@@ -846,14 +898,17 @@ class CameraPanel:
                                            (int(_lf[_i].x*w_px), int(_lf[_i].y*h_px)),
                                            2, _nc, -1)
                 # ── 손
-                if self._show_hands.get() and hand_res.hand_landmarks:
-                    for hlms in hand_res.hand_landmarks:
-                        mp_draw.draw_landmarks(
-                            overlay, hlms,
-                            HandLandmarksConnections.HAND_CONNECTIONS,
-                            landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
-                            connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
-                        )
+                if hand_res.hand_landmarks:
+                    if self._show_cartoon_hands.get():
+                        _draw_cartoon_hands(overlay, hand_res, w_px, h_px)
+                    elif self._show_hands.get():
+                        for hlms in hand_res.hand_landmarks:
+                            mp_draw.draw_landmarks(
+                                overlay, hlms,
+                                HandLandmarksConnections.HAND_CONNECTIONS,
+                                landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
+                                connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
+                            )
                 # ── 랜드마크 이름
                 if self._show_names.get():
                     _draw_landmark_names(overlay, face_res, hand_res, pose_res,

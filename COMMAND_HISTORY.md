@@ -60,6 +60,7 @@
 | 48 | ref/ 폴더의 고양이 일러스트로 테스트 — 그림/일러스트 지원 요청 | `_apply_face_img_overlay` 이중 모드 구현: 실사 [정밀] Homography / 일러스트 [자동] Affine 폴백. 눈 위치Y(%)·크기(%) 슬라이더 추가. ref/ 4개 고양이 이미지 모두 [자동] 모드 정상 동작 확인 |
 | 49 | 두 view UI 오른쪽 패널에 스크롤바 추가 (아래가 안 보임) | `camera_panel.py`/`video_panel.py` — 우측 패널을 Canvas+Scrollbar 구조로 교체, 마우스 휠 스크롤 지원 |
 | 50 | 체크박스로 얼굴 모자이크 효과 추가 | `camera_panel.py`/`video_panel.py` — `_apply_face_mosaic()` 함수, "얼굴 모자이크" 체크박스, overlay 최초 적용 (block=20 픽셀화) |
+| 51 | 손을 2D 애니메이션(만화 손) 스타일로 체크박스 추가 | `camera_panel.py`/`video_panel.py` — `_HAND_BONES` 상수, `_draw_cartoon_hands()` 함수 (외곽선→살색→손톱→관절 하이라이트 4패스), "└ 만화 손 스타일" 체크박스 추가 |
 
 ---
 
