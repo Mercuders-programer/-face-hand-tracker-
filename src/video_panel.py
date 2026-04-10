@@ -141,36 +141,80 @@ def _apply_face_mosaic(frame, face_res, w, h, block=20):
                                            interpolation=cv2.INTER_NEAREST)
 
 
-def _draw_cartoon_hands(overlay, hand_res, w, h):
-    """손 랜드마크를 2D 애니메이션 스타일로 그린다 (두꺼운 뼈대 + 관절)."""
+def _draw_cartoon_hands_hq(overlay, hand_res, w, h):
+    """고품질 만화 손 렌더링.
+    팜(손바닥) 볼록껍질 채우기 + 3단 셰이딩 + 손톱 광택 디테일.
+    """
     if not hand_res.hand_landmarks:
         return
+
+    # ── 색상 팔레트 (BGR) ──────────────────────────────────────────
+    _OUTLINE    = (12,  12,  16)    # 검정 윤곽선
+    _PALM_FILL  = (185, 205, 225)   # 손바닥 기본색
+    _BONE_BASE  = (195, 212, 232)   # 뼈대 기본색
+    _BONE_LIGHT = (222, 234, 250)   # 뼈대 하이라이트 중심선
+    _JNT_SHADOW = (160, 180, 205)   # 관절 그림자
+    _JNT_MID    = (205, 218, 238)   # 관절 중간색
+    _JNT_LIGHT  = (232, 240, 254)   # 관절 하이라이트
+    _NAIL_FILL  = (242, 247, 255)   # 손톱
+    _NAIL_EDGE  = (110, 135, 170)   # 손톱 테두리
+    _NAIL_SHINE = (255, 255, 255)   # 손톱 광택
+
     for hlms in hand_res.hand_landmarks:
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in hlms]
         if len(pts) < 21:
             continue
+
+        # wrist(0) → middle_mcp(9) 거리로 스케일 계산
         _dist = float(np.linalg.norm(np.array(pts[0]) - np.array(pts[9])))
-        _dist = max(_dist, 30.0)
-        bone_w  = max(8,  int(_dist * 0.20))
-        joint_r = max(6,  int(_dist * 0.13))
-        nail_r  = max(4,  int(_dist * 0.09))
-        # 1st pass: 외곽 윤곽선
+        _dist = max(_dist, 35.0)
+
+        bone_w  = max(11, int(_dist * 0.23))
+        joint_r = max(8,  int(_dist * 0.15))
+        nail_r  = max(5,  int(_dist * 0.10))
+        out_ext = max(6,  int(bone_w * 0.55))   # 윤곽선 추가 두께
+
+        # ── Pass 1: 외곽 윤곽선 (뼈대 + 관절) ──────────────────────
         for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], (20, 20, 20), bone_w + 6, cv2.LINE_AA)
+            cv2.line(overlay, pts[s], pts[e],
+                     _OUTLINE, bone_w + out_ext * 2, cv2.LINE_AA)
         for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r + 4, (20, 20, 20), -1)
-        # 2nd pass: 살색 본체 (BGR 200,215,235 = 따뜻한 크림)
+            cv2.circle(overlay, pts[i], joint_r + out_ext, _OUTLINE, -1)
+
+        # ── Pass 2: 손바닥 볼록껍질 채우기 ──────────────────────────
+        palm_arr = np.array([pts[i] for i in [0, 1, 5, 9, 13, 17]], dtype=np.int32)
+        hull = cv2.convexHull(palm_arr)
+        cv2.fillConvexPoly(overlay, hull, _PALM_FILL, cv2.LINE_AA)
+        cv2.polylines(overlay, [hull], True, _OUTLINE, 2, cv2.LINE_AA)
+
+        # ── Pass 3: 뼈대 선 ──────────────────────────────────────────
         for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], (200, 215, 235), bone_w, cv2.LINE_AA)
+            cv2.line(overlay, pts[s], pts[e], _BONE_BASE, bone_w, cv2.LINE_AA)
+        # 뼈대 중심 하이라이트 (얇은 밝은 선)
+        hl_w = max(2, bone_w // 3)
+        for s, e in _HAND_BONES:
+            cv2.line(overlay, pts[s], pts[e], _BONE_LIGHT, hl_w, cv2.LINE_AA)
+
+        # ── Pass 4: 관절 구체 3단 셰이딩 ────────────────────────────
         for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r, (215, 225, 240), -1)
-        # 3rd pass: 손가락 끝 손톱 하이라이트
+            cv2.circle(overlay, pts[i], joint_r, _JNT_SHADOW, -1)
+            cv2.circle(overlay, pts[i], int(joint_r * 0.75), _JNT_MID, -1)
+            # 하이라이트 (약간 좌상단 오프셋)
+            hx = pts[i][0] - max(1, joint_r // 5)
+            hy = pts[i][1] - max(1, joint_r // 3)
+            cv2.circle(overlay, (hx, hy), max(2, joint_r // 3), _JNT_LIGHT, -1)
+        # 관절 테두리
+        for i in [1,2,3,5,6,7,9,10,11,13,14,15,17,18,19]:
+            cv2.circle(overlay, pts[i], joint_r, _OUTLINE, 1, cv2.LINE_AA)
+
+        # ── Pass 5: 손가락 끝 손톱 ──────────────────────────────────
         for tip in [4, 8, 12, 16, 20]:
-            cv2.circle(overlay, pts[tip], nail_r, (240, 245, 255), -1)
-            cv2.circle(overlay, pts[tip], nail_r, (20, 20, 20), 2)
-        # 4th pass: 관절 중심 하이라이트
-        for i in range(21):
-            cv2.circle(overlay, pts[i], max(2, joint_r // 3), (245, 248, 255), -1)
+            cv2.circle(overlay, pts[tip], nail_r, _NAIL_FILL, -1)
+            cv2.circle(overlay, pts[tip], nail_r, _NAIL_EDGE, 1, cv2.LINE_AA)
+            # 광택 (좌상단)
+            sx = pts[tip][0] - max(1, nail_r // 3)
+            sy = pts[tip][1] - max(1, nail_r // 3)
+            cv2.circle(overlay, (sx, sy), max(1, nail_r // 3), _NAIL_SHINE, -1)
 
 
 def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
@@ -264,6 +308,7 @@ class VideoPanel:
         self._show_names  = tk.BooleanVar(value=False)
         self._show_mosaic         = tk.BooleanVar(value=False)
         self._show_cartoon_hands  = tk.BooleanVar(value=False)
+        self._ai_quality_var      = tk.StringVar(value="fast")  # fast/balance/quality
         self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._export_status_var  = tk.StringVar(value="")
@@ -282,7 +327,7 @@ class VideoPanel:
         self._build_ui()
         self._init_mediapipe()
         for _v in (self._show_face, self._show_body, self._show_hands, self._show_names,
-                   self._show_mosaic, self._show_cartoon_hands):
+                   self._show_mosaic):
             _v.trace_add("write", lambda *_: self._refresh_frame())
         # 첫 프레임 표시 (레이아웃 완료 후)
         self.win.after(100, lambda: self._seek_to(0))
@@ -456,14 +501,24 @@ class VideoPanel:
                 anchor="w",
             ).pack(fill=tk.X, padx=10, pady=(0, 2))
         tk.Checkbutton(
-            parent, text="  └ 만화 손 스타일",
+            parent, text="  └ 만화 손 스타일 (내보내기 AI)",
             variable=self._show_cartoon_hands,
             font=("Segoe UI", 10),
             fg="#88ccff", bg=BG_PANEL,
             selectcolor="#0f3460",
             activeforeground="#88ccff", activebackground=BG_PANEL,
             anchor="w",
-        ).pack(fill=tk.X, padx=10, pady=(0, 4))
+        ).pack(fill=tk.X, padx=10, pady=(0, 2))
+        # ── AI 품질 라디오 버튼 ──
+        _q_frame = tk.Frame(parent, bg=BG_PANEL)
+        _q_frame.pack(fill=tk.X, padx=20, pady=(0, 6))
+        for _lbl, _val in [("⚡ 빠름", "fast"), ("⚖ 균형", "balance"), ("🎨 고품질", "quality")]:
+            tk.Radiobutton(
+                _q_frame, text=_lbl, variable=self._ai_quality_var, value=_val,
+                font=("Segoe UI", 9), fg="#88ccff", bg=BG_PANEL,
+                selectcolor="#0f3460",
+                activeforeground="#88ccff", activebackground=BG_PANEL,
+            ).pack(side=tk.LEFT, padx=(0, 6))
         tk.Checkbutton(
             parent, text="랜드마크 이름",
             variable=self._show_names,
@@ -718,7 +773,6 @@ class VideoPanel:
     # ── 프레임 표시 ────────────────────────────────────────────────────────
     def _display_frame(self, bgr, playback=False):
         if (self._show_face.get() or self._show_body.get() or self._show_hands.get()
-                or self._show_cartoon_hands.get()
                 or self._face_img is not None or self._show_mosaic.get()):
             bgr = self._apply_overlay(bgr, playback=playback)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -737,7 +791,11 @@ class VideoPanel:
         self._canvas.delete("all")
         self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
 
-    def _apply_overlay(self, bgr, playback=False):
+    def _apply_overlay(self, bgr, playback=False, ext_hand_res=None):
+        """오버레이 렌더링.
+        ext_hand_res: 외부에서 제공된 hand 감지 결과 (AI 렌더링 모드).
+                      None이면 내부에서 감지. 값이 있으면 만화 손 그리기를 건너뜀.
+        """
         if self._face_det is None or self._hand_det is None:
             return bgr
         overlay = bgr.copy()
@@ -759,7 +817,7 @@ class VideoPanel:
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             try:
                 face_res = self._face_det.detect(mp_img)
-                hand_res = self._hand_det.detect(mp_img)
+                hand_res = self._hand_det.detect(mp_img) if ext_hand_res is None else ext_hand_res
                 pose_res = self._pose_det.detect(mp_img) if self._pose_det else None
             except Exception as e:
                 print(f"[detect error] {e}")
@@ -768,6 +826,8 @@ class VideoPanel:
                 self._det_cache = (face_res, hand_res, pose_res)
         else:
             face_res, hand_res, pose_res = self._det_cache
+            if ext_hand_res is not None:
+                hand_res = ext_hand_res
 
         _oh, _ow = overlay.shape[:2]
 
@@ -825,11 +885,9 @@ class VideoPanel:
                                    (int(_lf[_i].x*_ow), int(_lf[_i].y*_oh)),
                                    2, _nc, -1)
 
-        # ── 손
+        # ── 손 (만화 손 스타일은 내보내기 시에만 AI로 적용, 실시간 뷰에서는 미표시)
         if hand_res.hand_landmarks:
-            if self._show_cartoon_hands.get():
-                _draw_cartoon_hands(overlay, hand_res, _ow, _oh)
-            elif self._show_hands.get():
+            if self._show_hands.get():
                 for hlms in hand_res.hand_landmarks:
                     mp_draw.draw_landmarks(
                         overlay, hlms,
@@ -965,7 +1023,63 @@ class VideoPanel:
         if not save_path:
             return
 
-        with_overlay = self._show_face.get() or self._show_body.get() or self._show_hands.get()
+        use_ai_hand = self._show_cartoon_hands.get()
+        with_overlay = (self._show_face.get() or self._show_body.get()
+                        or self._show_hands.get() or use_ai_hand)
+
+        # AI 만화 손 모드: diffusers 확인 + SD 모델 파일 선택
+        ai_sd_model = None
+        if use_ai_hand:
+            try:
+                import diffusers  # noqa: F401
+            except ImportError:
+                messagebox.showerror(
+                    "패키지 필요",
+                    "AI 만화 손 렌더링에 diffusers 패키지가 필요합니다.\n\n"
+                    "pip install diffusers transformers accelerate\n\n"
+                    "설치 후 다시 시도하세요.",
+                    parent=self.win,
+                )
+                return
+
+            # SD 모델 파일 선택 (로컬 safetensors/ckpt)
+            messagebox.showinfo(
+                "SD 모델 파일 선택",
+                "Stable Diffusion 모델 파일(.safetensors 또는 .ckpt)을 선택하세요.\n\n"
+                "Civitai 등에서 다운받은 만화/애니 스타일 모델을 추천합니다.\n"
+                "(예: anything-v4.safetensors, CounterfeitV30.safetensors 등)\n\n"
+                "SD 1.5 기반 모델이어야 합니다.",
+                parent=self.win,
+            )
+            ai_sd_model = filedialog.askopenfilename(
+                parent=self.win,
+                title="SD 모델 파일 선택 (.safetensors / .ckpt)",
+                filetypes=[
+                    ("Stable Diffusion 모델", "*.safetensors *.ckpt"),
+                    ("모든 파일", "*.*"),
+                ],
+            )
+            if not ai_sd_model:
+                return  # 취소
+
+            _quality = self._ai_quality_var.get()
+            _quality_info = {
+                "fast":    "⚡ 빠름 — LCM 4스텝 (~0.25초/프레임, 5배 빠름)",
+                "balance": "⚖ 균형 — DPM++ 10스텝 (~0.6초/프레임)",
+                "quality": "🎨 고품질 — DPM++ 20스텝 (~1.2초/프레임)",
+            }
+            ok = messagebox.askyesno(
+                "AI 렌더링 확인",
+                f"선택한 모델: {os.path.basename(ai_sd_model)}\n"
+                f"품질 모드: {_quality_info.get(_quality, _quality)}\n\n"
+                "• ControlNet 모델 자동 다운로드 (최초 1회, ~1.4GB)\n"
+                "• ⚡ 빠름 선택 시 LCM-LoRA 추가 다운로드 (~200MB)\n"
+                "• 렌더링 중 창을 닫지 마세요\n\n"
+                "계속하시겠습니까?",
+                parent=self.win,
+            )
+            if not ok:
+                return
 
         # 오버레이 모드인데 MediaPipe 없으면 경고
         if with_overlay and self._face_det is None:
@@ -985,12 +1099,20 @@ class VideoPanel:
             self._play_btn.config(text="▶ 재생")
 
         self._set_export_btns(tk.DISABLED)
-        label = "오버레이 렌더링 중..." if with_overlay else "영상 저장 중..."
+        if use_ai_hand:
+            label = "AI 만화 손 렌더링 준비 중..."
+        elif with_overlay:
+            label = "오버레이 렌더링 중..."
+        else:
+            label = "영상 저장 중..."
         self._export_status_var.set(label)
 
         def _run():
             try:
-                self._save_video_frames(save_path, with_overlay)
+                self._save_video_frames(save_path, with_overlay,
+                                        use_ai_hand=use_ai_hand,
+                                        ai_sd_model=ai_sd_model,
+                                        ai_quality=self._ai_quality_var.get())
                 msg = f"영상 저장 완료!\n{save_path}"
                 def _done():
                     self._export_status_var.set("저장 완료!")
@@ -1012,7 +1134,9 @@ class VideoPanel:
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _save_video_frames(self, save_path: str, with_overlay: bool):
+    def _save_video_frames(self, save_path: str, with_overlay: bool,
+                           use_ai_hand: bool = False, ai_sd_model: str = None,
+                           ai_quality: str = "fast"):
         cap = cv2.VideoCapture(self._video_path)
         if not cap.isOpened():
             raise RuntimeError(f"영상을 열 수 없습니다: {self._video_path}")
@@ -1028,6 +1152,39 @@ class VideoPanel:
             cap.release()
             raise RuntimeError(f"VideoWriter를 열 수 없습니다: {save_path}")
 
+        # ── AI 만화 손 모드 초기화 ──────────────────────────────────────
+        ai          = None
+        ai_hand_det = None
+        if use_ai_hand:
+            try:
+                from .cartoon_hand_ai import CartoonHandAI
+            except ImportError:
+                from cartoon_hand_ai import CartoonHandAI
+
+            def _cb(msg):
+                self.win.after(0, lambda m=msg: self._export_status_var.set(m))
+
+            _preset   = CartoonHandAI.QUALITY_PRESETS.get(
+                            ai_quality, CartoonHandAI.QUALITY_PRESETS["fast"])
+            _use_lcm  = _preset["use_lcm"]
+            _steps    = _preset["steps"]
+            _guidance = _preset["guidance"]
+
+            ai = CartoonHandAI(sd_model=ai_sd_model)
+            ai.load(progress_cb=_cb, use_lcm=_use_lcm)
+
+            # 별도 HandLandmarker (풀 해상도 감지)
+            _h_opts = mp_python.BaseOptions(model_asset_path=HAND_MODEL)
+            _h_run  = mp_vision.HandLandmarkerOptions(
+                base_options=_h_opts,
+                running_mode=RunningMode.IMAGE,
+                num_hands=MAX_PERSONS * 2,
+            )
+            ai_hand_det = mp_vision.HandLandmarker.create_from_options(_h_run)
+
+        import time
+        _t0 = time.time()
+
         try:
             idx = 0
             while True:
@@ -1036,18 +1193,48 @@ class VideoPanel:
                     break
 
                 if with_overlay:
-                    frame = self._apply_overlay(frame)
+                    if use_ai_hand:
+                        # 1) 손 감지 (풀 해상도)
+                        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                        try:
+                            hand_res = ai_hand_det.detect(mp_img)
+                        except Exception:
+                            hand_res = None
+
+                        # 2) 얼굴/포즈 오버레이 (만화 손 그리기 스킵)
+                        frame = self._apply_overlay(frame, ext_hand_res=hand_res)
+
+                        # 3) AI 만화 손 렌더링
+                        if hand_res and hand_res.hand_landmarks:
+                            frame = ai.render_frame(
+                                frame, hand_res,
+                                steps=_steps, guidance=_guidance)
+                    else:
+                        frame = self._apply_overlay(frame)
 
                 writer.write(frame)
                 idx += 1
 
-                if idx % 15 == 0:
-                    pct = int(idx / total * 100)
-                    label = f"렌더링 중... {pct}%" if with_overlay else f"저장 중... {pct}%"
+                if idx % 5 == 0:
+                    pct      = int(idx / total * 100)
+                    elapsed  = time.time() - _t0
+                    per_fr   = elapsed / max(idx, 1)
+                    if use_ai_hand:
+                        label = f"AI 렌더링 중... {idx}/{total} ({per_fr:.1f}초/프레임)"
+                    elif with_overlay:
+                        label = f"렌더링 중... {pct}%"
+                    else:
+                        label = f"저장 중... {pct}%"
                     self.win.after(0, lambda l=label: self._export_status_var.set(l))
         finally:
             writer.release()
             cap.release()
+            if ai_hand_det is not None:
+                try:
+                    ai_hand_det.close()
+                except Exception:
+                    pass
 
     def _process_all_frames(self):
         """영상 전체 프레임을 MediaPipe로 처리 → (List[FrameData], VideoInfo) 반환"""

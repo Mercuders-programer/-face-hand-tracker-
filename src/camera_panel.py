@@ -152,36 +152,80 @@ def _apply_face_mosaic(frame, face_res, w, h, block=20):
                                            interpolation=cv2.INTER_NEAREST)
 
 
-def _draw_cartoon_hands(overlay, hand_res, w, h):
-    """손 랜드마크를 2D 애니메이션 스타일로 그린다 (두꺼운 뼈대 + 관절)."""
+def _draw_cartoon_hands_hq(overlay, hand_res, w, h):
+    """고품질 만화 손 렌더링.
+    팜(손바닥) 볼록껍질 채우기 + 3단 셰이딩 + 손톱 광택 디테일.
+    """
     if not hand_res.hand_landmarks:
         return
+
+    # ── 색상 팔레트 (BGR) ──────────────────────────────────────────
+    _OUTLINE    = (12,  12,  16)    # 검정 윤곽선
+    _PALM_FILL  = (185, 205, 225)   # 손바닥 기본색
+    _BONE_BASE  = (195, 212, 232)   # 뼈대 기본색
+    _BONE_LIGHT = (222, 234, 250)   # 뼈대 하이라이트 중심선
+    _JNT_SHADOW = (160, 180, 205)   # 관절 그림자
+    _JNT_MID    = (205, 218, 238)   # 관절 중간색
+    _JNT_LIGHT  = (232, 240, 254)   # 관절 하이라이트
+    _NAIL_FILL  = (242, 247, 255)   # 손톱
+    _NAIL_EDGE  = (110, 135, 170)   # 손톱 테두리
+    _NAIL_SHINE = (255, 255, 255)   # 손톱 광택
+
     for hlms in hand_res.hand_landmarks:
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in hlms]
         if len(pts) < 21:
             continue
+
+        # wrist(0) → middle_mcp(9) 거리로 스케일 계산
         _dist = float(np.linalg.norm(np.array(pts[0]) - np.array(pts[9])))
-        _dist = max(_dist, 30.0)
-        bone_w  = max(8,  int(_dist * 0.20))
-        joint_r = max(6,  int(_dist * 0.13))
-        nail_r  = max(4,  int(_dist * 0.09))
-        # 1st pass: 외곽 윤곽선
+        _dist = max(_dist, 35.0)
+
+        bone_w  = max(11, int(_dist * 0.23))
+        joint_r = max(8,  int(_dist * 0.15))
+        nail_r  = max(5,  int(_dist * 0.10))
+        out_ext = max(6,  int(bone_w * 0.55))   # 윤곽선 추가 두께
+
+        # ── Pass 1: 외곽 윤곽선 (뼈대 + 관절) ──────────────────────
         for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], (20, 20, 20), bone_w + 6, cv2.LINE_AA)
+            cv2.line(overlay, pts[s], pts[e],
+                     _OUTLINE, bone_w + out_ext * 2, cv2.LINE_AA)
         for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r + 4, (20, 20, 20), -1)
-        # 2nd pass: 살색 본체 (BGR 200,215,235 = 따뜻한 크림)
+            cv2.circle(overlay, pts[i], joint_r + out_ext, _OUTLINE, -1)
+
+        # ── Pass 2: 손바닥 볼록껍질 채우기 ──────────────────────────
+        palm_arr = np.array([pts[i] for i in [0, 1, 5, 9, 13, 17]], dtype=np.int32)
+        hull = cv2.convexHull(palm_arr)
+        cv2.fillConvexPoly(overlay, hull, _PALM_FILL, cv2.LINE_AA)
+        cv2.polylines(overlay, [hull], True, _OUTLINE, 2, cv2.LINE_AA)
+
+        # ── Pass 3: 뼈대 선 ──────────────────────────────────────────
         for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], (200, 215, 235), bone_w, cv2.LINE_AA)
+            cv2.line(overlay, pts[s], pts[e], _BONE_BASE, bone_w, cv2.LINE_AA)
+        # 뼈대 중심 하이라이트 (얇은 밝은 선)
+        hl_w = max(2, bone_w // 3)
+        for s, e in _HAND_BONES:
+            cv2.line(overlay, pts[s], pts[e], _BONE_LIGHT, hl_w, cv2.LINE_AA)
+
+        # ── Pass 4: 관절 구체 3단 셰이딩 ────────────────────────────
         for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r, (215, 225, 240), -1)
-        # 3rd pass: 손가락 끝 손톱 하이라이트
+            cv2.circle(overlay, pts[i], joint_r, _JNT_SHADOW, -1)
+            cv2.circle(overlay, pts[i], int(joint_r * 0.75), _JNT_MID, -1)
+            # 하이라이트 (약간 좌상단 오프셋)
+            hx = pts[i][0] - max(1, joint_r // 5)
+            hy = pts[i][1] - max(1, joint_r // 3)
+            cv2.circle(overlay, (hx, hy), max(2, joint_r // 3), _JNT_LIGHT, -1)
+        # 관절 테두리
+        for i in [1,2,3,5,6,7,9,10,11,13,14,15,17,18,19]:
+            cv2.circle(overlay, pts[i], joint_r, _OUTLINE, 1, cv2.LINE_AA)
+
+        # ── Pass 5: 손가락 끝 손톱 ──────────────────────────────────
         for tip in [4, 8, 12, 16, 20]:
-            cv2.circle(overlay, pts[tip], nail_r, (240, 245, 255), -1)
-            cv2.circle(overlay, pts[tip], nail_r, (20, 20, 20), 2)
-        # 4th pass: 관절 중심 하이라이트
-        for i in range(21):
-            cv2.circle(overlay, pts[i], max(2, joint_r // 3), (245, 248, 255), -1)
+            cv2.circle(overlay, pts[tip], nail_r, _NAIL_FILL, -1)
+            cv2.circle(overlay, pts[tip], nail_r, _NAIL_EDGE, 1, cv2.LINE_AA)
+            # 광택 (좌상단)
+            sx = pts[tip][0] - max(1, nail_r // 3)
+            sy = pts[tip][1] - max(1, nail_r // 3)
+            cv2.circle(overlay, (sx, sy), max(1, nail_r // 3), _NAIL_SHINE, -1)
 
 
 def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
@@ -360,15 +404,6 @@ class CameraPanel:
                 anchor=tk.W,
             ).pack(fill=tk.X, padx=8, pady=(0, 2))
         tk.Checkbutton(
-            right, text="  └ 만화 손 스타일",
-            variable=self._show_cartoon_hands,
-            font=("Segoe UI", 10),
-            fg="#88ccff", bg=BG_PANEL,
-            selectcolor=BG_CTRL,
-            activeforeground="#88ccff", activebackground=BG_PANEL,
-            anchor=tk.W,
-        ).pack(fill=tk.X, padx=8, pady=(0, 4))
-        tk.Checkbutton(
             right, text="랜드마크 이름",
             variable=self._show_names,
             font=("Segoe UI", 10),
@@ -386,6 +421,15 @@ class CameraPanel:
             activeforeground="#ff8888", activebackground=BG_PANEL,
             anchor=tk.W,
         ).pack(fill=tk.X, padx=8, pady=(2, 2))
+        tk.Checkbutton(
+            right, text="  └ 만화 손 스타일",
+            variable=self._show_cartoon_hands,
+            font=("Segoe UI", 10),
+            fg="#88ccff", bg=BG_PANEL,
+            selectcolor=BG_CTRL,
+            activeforeground="#88ccff", activebackground=BG_PANEL,
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=8, pady=(0, 4))
 
         self._separator(right)
 
@@ -900,7 +944,7 @@ class CameraPanel:
                 # ── 손
                 if hand_res.hand_landmarks:
                     if self._show_cartoon_hands.get():
-                        _draw_cartoon_hands(overlay, hand_res, w_px, h_px)
+                        _draw_cartoon_hands_hq(overlay, hand_res, w_px, h_px)
                     elif self._show_hands.get():
                         for hlms in hand_res.hand_landmarks:
                             mp_draw.draw_landmarks(

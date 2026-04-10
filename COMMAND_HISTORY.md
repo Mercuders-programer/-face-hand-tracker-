@@ -5,6 +5,11 @@
 
 ---
 
+// 프로그램실행
+cd C:\Users\PHS\Desktop\Claude_Code\my_openPose_proj\
+python app.py
+
+
 ## 2026-04-06
 
 | # | 명령 / 질문 | 결과 |
@@ -61,6 +66,38 @@
 | 49 | 두 view UI 오른쪽 패널에 스크롤바 추가 (아래가 안 보임) | `camera_panel.py`/`video_panel.py` — 우측 패널을 Canvas+Scrollbar 구조로 교체, 마우스 휠 스크롤 지원 |
 | 50 | 체크박스로 얼굴 모자이크 효과 추가 | `camera_panel.py`/`video_panel.py` — `_apply_face_mosaic()` 함수, "얼굴 모자이크" 체크박스, overlay 최초 적용 (block=20 픽셀화) |
 | 51 | 손을 2D 애니메이션(만화 손) 스타일로 체크박스 추가 | `camera_panel.py`/`video_panel.py` — `_HAND_BONES` 상수, `_draw_cartoon_hands()` 함수 (외곽선→살색→손톱→관절 하이라이트 4패스), "└ 만화 손 스타일" 체크박스 추가 |
+
+
+---
+
+## 2026-04-10
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 52 | 게속해서 작업해줘 → camera_panel.py에도 HQ 만화 손 추가 선택 | `camera_panel.py` — `_HAND_BONES`, `_draw_cartoon_hands_hq()`, `_show_cartoon_hands` BooleanVar, 체크박스 추가. WSL2 10초 정상 실행 확인 |
+| 53 | 만화 손 퀄리티를 AI로 높이는 계획 세우고 txt 파일로 저장 | `AI_HandStyle_Plan.txt` 생성 — 4가지 AI 방향 정리 (ControlNet/Toon Shader/AnimeGAN ONNX/3D Mesh) |
+| 54 | 방향 1(ControlNet+SD)으로 영상 내보내기 시 프레임별 AI 렌더링 구현 | `src/cartoon_hand_ai.py` 신규 생성, `video_panel.py` — `_apply_overlay` ext_hand_res 파라미터, `_export_video` AI 확인 다이얼로그, `_save_video_frames` AI 렌더링 루프 추가 |
+| 55 | 영상 분석 뷰에서 만화 손 스타일 실시간 렌더링 제거 | `video_panel.py` — trace_add에서 `_show_cartoon_hands` 제거, `_display_frame` 조건 제거, `_apply_overlay` 만화 손 그리기 제거 (내보내기 시 AI 렌더링만 유지) |
+| 56 | SD 모델 로드 실패 (andite/anything-v4.0 HF 접근 불가) — 로컬 safetensors 파일 선택으로 변경 | `cartoon_hand_ai.py` — from_single_file() 지원, _pipe_sd_model 캐시 추가. `video_panel.py` — SD 모델 파일 선택 다이얼로그 추가, ai_sd_model 파라미터 전달 |
+| 57 | AI 만화 손 속도 개선 계획 세워줘 | `AI_HandStyle_Speed_Plan.txt` 생성 — LCM-LoRA/DPM++/torch.compile/배치 등 5가지 방법 분석 |
+| 58 | 가장 효과적인 방법으로 속도 개선 구현 | `cartoon_hand_ai.py` — QUALITY_PRESETS(fast/balance/quality), LCM-LoRA+LCMScheduler, DPM++Karras 스케줄러, _pipe_lcm_mode 캐시. `video_panel.py` — ⚡/⚖/🎨 라디오 버튼 UI, ai_quality 파라미터 전달 |
+  이제 사용 방법:
+
+  1. 만화 손 체크박스 ON → 영상 저장
+   클릭
+  2. SD 모델 파일 선택 안내 팝업 →
+  확인
+  3. .safetensors 파일 선택
+  다이얼로그 → 로컬 파일 선택
+  4. 확인 팝업 → 계속
+  5. ControlNet 자동 다운로드
+  (~1.4GB, 최초 1회) 후 렌더링 시작
+
+  추천 SD 1.5 기반 만화 모델
+  (Civitai에서 다운):
+  - Counterfeit-V3.0.safetensors
+  - anything-v4.5.safetensors
+  - ghostmix_v20Bakedvae.safetensors
 
 ---
 
