@@ -780,8 +780,8 @@ class VideoPanel:
         if not use_cache:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             h_px, w_px = bgr.shape[:2]
-            # 추론 해상도 축소 (최대 640px 너비)
-            _sc = min(1.0, 640 / max(w_px, 1))
+            # 추론 해상도 축소 (최대 변 640px 기준 — 세로 영상 대응)
+            _sc = min(1.0, 640 / max(w_px, h_px, 1))
             if _sc < 0.99:
                 _iw, _ih = int(w_px * _sc), int(h_px * _sc)
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
@@ -1124,7 +1124,12 @@ class VideoPanel:
                 if with_anime:
                     _fr = _hr = _pr = None
                     try:
-                        _rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        _fh, _fw = frame.shape[:2]
+                        _asc = min(1.0, 640 / max(_fw, _fh, 1))
+                        _rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        if _asc < 0.99:
+                            _rgb = cv2.resize(_rgb,
+                                              (int(_fw*_asc), int(_fh*_asc)))
                         _mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
                                            data=_rgb)
                         if self._face_det:
