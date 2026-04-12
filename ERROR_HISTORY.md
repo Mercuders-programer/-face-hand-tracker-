@@ -5,6 +5,27 @@
 
 ---
 
+## [2026-04-12] retina-face 설치로 tensorflow 설치 → mediapipe segfault
+
+### 오류 유형
+의존성 충돌로 인한 환경 파괴
+
+### 발생 상황
+- insightface 설치 실패 → 대안으로 `pip install retina-face` 실행
+- retina-face가 tensorflow 2.21.0 + keras를 자동 설치
+- TF의 CUDA/GPU 관련 공유 라이브러리가 mediapipe의 EGL 처리와 충돌
+- mediapipe FaceLandmarker.create_from_options() 에서 segfault (exit 139)
+
+### 해결
+`pip uninstall tensorflow keras -y --break-system-packages` → mediapipe 복구
+
+### 재발 방지
+- 새 패키지 설치 전 mediapipe 동작 여부 미리 확인
+- TF/TF-관련 패키지는 mediapipe와 함께 설치 금지
+- retina-face는 TF 의존이므로 사용 불가
+
+---
+
 ## [2026-04-06] 규칙 미준수 — PHS_AI_Rule.md 미참조 + 세션 파일 미업데이트
 
 ### 오류 유형
