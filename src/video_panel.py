@@ -46,6 +46,14 @@ except ImportError:
 
 try:
     try:
+        from .face_pipeline import RobustFaceLandmarker
+    except ImportError:
+        from face_pipeline import RobustFaceLandmarker
+except Exception:
+    RobustFaceLandmarker = None
+
+try:
+    try:
         from .anime_converter import AnimeGANConverter, apply_anime_to_person
     except ImportError:
         from anime_converter import AnimeGANConverter, apply_anime_to_person
@@ -633,7 +641,7 @@ class VideoPanel:
                 min_pose_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
-            self._face_det = mp_vision.FaceLandmarker.create_from_options(face_opts)
+            self._face_det = RobustFaceLandmarker(FACE_MODEL, num_faces=MAX_PERSONS)
             self._hand_det = mp_vision.HandLandmarker.create_from_options(hand_opts)
             self._pose_det = mp_vision.PoseLandmarker.create_from_options(pose_opts)
         except Exception as e:

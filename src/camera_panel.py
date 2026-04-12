@@ -47,6 +47,14 @@ except ImportError:
                          _build_persons, MAX_PERSONS, PERSON_COLORS)
     from exporter import export_json, export_ae_keyframes
 
+try:
+    try:
+        from .face_pipeline import RobustFaceLandmarker
+    except ImportError:
+        from face_pipeline import RobustFaceLandmarker
+except Exception:
+    RobustFaceLandmarker = None
+
 
 # ── 테마 색상 ──────────────────────────────────────────────────────────────
 BG_DARK   = "#1a1a2e"
@@ -746,7 +754,9 @@ class CameraPanel:
         )
 
         try:
-            face_det = mp_vision.FaceLandmarker.create_from_options(face_opts)
+            face_det = (RobustFaceLandmarker(FACE_MODEL, num_faces=MAX_PERSONS)
+                        if RobustFaceLandmarker is not None
+                        else mp_vision.FaceLandmarker.create_from_options(face_opts))
             hand_det = mp_vision.HandLandmarker.create_from_options(hand_opts)
             pose_det = mp_vision.PoseLandmarker.create_from_options(pose_opts)
         except Exception as e:

@@ -390,7 +390,19 @@ class Tracker:
 
         frames: List[FrameData] = []
 
-        with mp_vision.FaceLandmarker.create_from_options(face_opts) as face_det, \
+        try:
+            from .face_pipeline import RobustFaceLandmarker
+        except ImportError:
+            try:
+                from face_pipeline import RobustFaceLandmarker
+            except ImportError:
+                RobustFaceLandmarker = None
+
+        face_det = (RobustFaceLandmarker(FACE_MODEL, num_faces=MAX_PERSONS)
+                    if RobustFaceLandmarker is not None
+                    else mp_vision.FaceLandmarker.create_from_options(face_opts))
+
+        with face_det, \
              mp_vision.HandLandmarker.create_from_options(hand_opts) as hand_det, \
              mp_vision.PoseLandmarker.create_from_options(pose_opts) as pose_det:
 
