@@ -44,6 +44,17 @@ try:
 except ImportError:
     raise ImportError("Pillow가 필요합니다: pip install Pillow")
 
+try:
+    try:
+        from .anime_converter import AnimeGANConverter, apply_anime_to_person
+    except ImportError:
+        from anime_converter import AnimeGANConverter, apply_anime_to_person
+    _ANIME_AVAILABLE = True
+except Exception:
+    _ANIME_AVAILABLE = False
+    AnimeGANConverter      = None
+    apply_anime_to_person  = None
+
 # ── 테마 색상 ──────────────────────────────────────────────────────────────
 BG_DARK  = "#1a1a2e"
 BG_PANEL = "#16213e"
@@ -56,19 +67,8 @@ TL_H     = 30
 # 얼굴 이미지 워핑에 사용할 랜드마크 인덱스 (6점)
 _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, Mouth.R, Mouth.L
 
-# 만화 손 스타일 뼈대 연결 정의
-_HAND_BONES = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17),
-]
-
-
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
-                             eye_y_pct=55, size_pct=100):
+                             eye_y_pct=55, eye_x_pct=50, size_pct=100):
     """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
     face_img_pts is not None → Homography 정밀 모드 (실제 얼굴 사진)
     face_img_pts is None     → Affine 자동 모드  (일러스트/그림)
@@ -101,7 +101,7 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             ys = [_lf[i].y * h for i in range(len(_lf))]
             face_h_px = max(ys) - min(ys)
             scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
-            src_cx = img_w / 2.0
+            src_cx = img_w * (eye_x_pct / 100.0)
             src_cy = img_h * (eye_y_pct / 100.0)
             M = cv2.getRotationMatrix2D((src_cx, src_cy), -angle, scale)
             M[0, 2] += eye_center[0] - src_cx
@@ -139,82 +139,6 @@ def _apply_face_mosaic(frame, face_res, w, h, block=20):
                            interpolation=cv2.INTER_LINEAR)
         frame[y1:y2, x1:x2] = cv2.resize(small, (rw, rh),
                                            interpolation=cv2.INTER_NEAREST)
-
-
-def _draw_cartoon_hands_hq(overlay, hand_res, w, h):
-    """고품질 만화 손 렌더링.
-    팜(손바닥) 볼록껍질 채우기 + 3단 셰이딩 + 손톱 광택 디테일.
-    """
-    if not hand_res.hand_landmarks:
-        return
-
-    # ── 색상 팔레트 (BGR) ──────────────────────────────────────────
-    _OUTLINE    = (12,  12,  16)    # 검정 윤곽선
-    _PALM_FILL  = (185, 205, 225)   # 손바닥 기본색
-    _BONE_BASE  = (195, 212, 232)   # 뼈대 기본색
-    _BONE_LIGHT = (222, 234, 250)   # 뼈대 하이라이트 중심선
-    _JNT_SHADOW = (160, 180, 205)   # 관절 그림자
-    _JNT_MID    = (205, 218, 238)   # 관절 중간색
-    _JNT_LIGHT  = (232, 240, 254)   # 관절 하이라이트
-    _NAIL_FILL  = (242, 247, 255)   # 손톱
-    _NAIL_EDGE  = (110, 135, 170)   # 손톱 테두리
-    _NAIL_SHINE = (255, 255, 255)   # 손톱 광택
-
-    for hlms in hand_res.hand_landmarks:
-        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hlms]
-        if len(pts) < 21:
-            continue
-
-        # wrist(0) → middle_mcp(9) 거리로 스케일 계산
-        _dist = float(np.linalg.norm(np.array(pts[0]) - np.array(pts[9])))
-        _dist = max(_dist, 35.0)
-
-        bone_w  = max(11, int(_dist * 0.23))
-        joint_r = max(8,  int(_dist * 0.15))
-        nail_r  = max(5,  int(_dist * 0.10))
-        out_ext = max(6,  int(bone_w * 0.55))   # 윤곽선 추가 두께
-
-        # ── Pass 1: 외곽 윤곽선 (뼈대 + 관절) ──────────────────────
-        for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e],
-                     _OUTLINE, bone_w + out_ext * 2, cv2.LINE_AA)
-        for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r + out_ext, _OUTLINE, -1)
-
-        # ── Pass 2: 손바닥 볼록껍질 채우기 ──────────────────────────
-        palm_arr = np.array([pts[i] for i in [0, 1, 5, 9, 13, 17]], dtype=np.int32)
-        hull = cv2.convexHull(palm_arr)
-        cv2.fillConvexPoly(overlay, hull, _PALM_FILL, cv2.LINE_AA)
-        cv2.polylines(overlay, [hull], True, _OUTLINE, 2, cv2.LINE_AA)
-
-        # ── Pass 3: 뼈대 선 ──────────────────────────────────────────
-        for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], _BONE_BASE, bone_w, cv2.LINE_AA)
-        # 뼈대 중심 하이라이트 (얇은 밝은 선)
-        hl_w = max(2, bone_w // 3)
-        for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], _BONE_LIGHT, hl_w, cv2.LINE_AA)
-
-        # ── Pass 4: 관절 구체 3단 셰이딩 ────────────────────────────
-        for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r, _JNT_SHADOW, -1)
-            cv2.circle(overlay, pts[i], int(joint_r * 0.75), _JNT_MID, -1)
-            # 하이라이트 (약간 좌상단 오프셋)
-            hx = pts[i][0] - max(1, joint_r // 5)
-            hy = pts[i][1] - max(1, joint_r // 3)
-            cv2.circle(overlay, (hx, hy), max(2, joint_r // 3), _JNT_LIGHT, -1)
-        # 관절 테두리
-        for i in [1,2,3,5,6,7,9,10,11,13,14,15,17,18,19]:
-            cv2.circle(overlay, pts[i], joint_r, _OUTLINE, 1, cv2.LINE_AA)
-
-        # ── Pass 5: 손가락 끝 손톱 ──────────────────────────────────
-        for tip in [4, 8, 12, 16, 20]:
-            cv2.circle(overlay, pts[tip], nail_r, _NAIL_FILL, -1)
-            cv2.circle(overlay, pts[tip], nail_r, _NAIL_EDGE, 1, cv2.LINE_AA)
-            # 광택 (좌상단)
-            sx = pts[tip][0] - max(1, nail_r // 3)
-            sy = pts[tip][1] - max(1, nail_r // 3)
-            cv2.circle(overlay, (sx, sy), max(1, nail_r // 3), _NAIL_SHINE, -1)
 
 
 def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
@@ -307,8 +231,10 @@ class VideoPanel:
         self._show_hands  = tk.BooleanVar(value=False)
         self._show_names  = tk.BooleanVar(value=False)
         self._show_mosaic         = tk.BooleanVar(value=False)
-        self._show_cartoon_hands  = tk.BooleanVar(value=False)
-        self._ai_quality_var      = tk.StringVar(value="fast")  # fast/balance/quality
+        self._show_anime_var   = tk.BooleanVar(value=False)
+        self._anime_style_var  = tk.StringVar(value="animegan")
+        self._anime_bg_var     = tk.StringVar(value="original")
+        self._anime_model_path = ""
         self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._export_status_var  = tk.StringVar(value="")
@@ -322,6 +248,7 @@ class VideoPanel:
         self._face_img      = None  # BGRA numpy array (얼굴 이미지)
         self._face_img_pts  = None  # 소스 키포인트 (None = Affine 자동 모드)
         self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
+        self._eye_x_var     = tk.IntVar(value=50)   # 눈 위치 X (%)
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
 
         self._build_ui()
@@ -501,25 +428,6 @@ class VideoPanel:
                 anchor="w",
             ).pack(fill=tk.X, padx=10, pady=(0, 2))
         tk.Checkbutton(
-            parent, text="  └ 만화 손 스타일 (내보내기 AI)",
-            variable=self._show_cartoon_hands,
-            font=("Segoe UI", 10),
-            fg="#88ccff", bg=BG_PANEL,
-            selectcolor="#0f3460",
-            activeforeground="#88ccff", activebackground=BG_PANEL,
-            anchor="w",
-        ).pack(fill=tk.X, padx=10, pady=(0, 2))
-        # ── AI 품질 라디오 버튼 ──
-        _q_frame = tk.Frame(parent, bg=BG_PANEL)
-        _q_frame.pack(fill=tk.X, padx=20, pady=(0, 6))
-        for _lbl, _val in [("⚡ 빠름", "fast"), ("⚖ 균형", "balance"), ("🎨 고품질", "quality")]:
-            tk.Radiobutton(
-                _q_frame, text=_lbl, variable=self._ai_quality_var, value=_val,
-                font=("Segoe UI", 9), fg="#88ccff", bg=BG_PANEL,
-                selectcolor="#0f3460",
-                activeforeground="#88ccff", activebackground=BG_PANEL,
-            ).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Checkbutton(
             parent, text="랜드마크 이름",
             variable=self._show_names,
             font=("Segoe UI", 10),
@@ -537,6 +445,65 @@ class VideoPanel:
             activeforeground="#ff8888", activebackground=BG_PANEL,
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(2, 2))
+
+        # ── 애니화 ──────────────────────────────────────────────────────────
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(8, 4))
+        tk.Checkbutton(
+            parent, text="🎨 애니화  (내보내기 전용)",
+            variable=self._show_anime_var,
+            font=("Segoe UI", 10, "bold"),
+            fg="#88ddff", bg=BG_PANEL,
+            selectcolor="#0f3460",
+            activeforeground="#88ddff", activebackground=BG_PANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        # 스타일
+        tk.Label(parent, text="  스타일",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        _sf = tk.Frame(parent, bg=BG_PANEL)
+        _sf.pack(fill=tk.X, padx=20, pady=(0, 4))
+        for _sv, _sl in [("animegan", "AnimeGAN"), ("opencv", "OpenCV")]:
+            tk.Radiobutton(
+                _sf, text=_sl, variable=self._anime_style_var, value=_sv,
+                font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL,
+                selectcolor="#0f3460",
+                activeforeground=TEXT_W, activebackground=BG_PANEL,
+                command=self._on_anime_style_change,
+            ).pack(side=tk.LEFT, padx=(0, 8))
+
+        # 배경
+        tk.Label(parent, text="  배경",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        _bf = tk.Frame(parent, bg=BG_PANEL)
+        _bf.pack(fill=tk.X, padx=20, pady=(0, 4))
+        for _bv, _bl in [("original", "원본"), ("blur", "블러"), ("solid", "단색")]:
+            tk.Radiobutton(
+                _bf, text=_bl, variable=self._anime_bg_var, value=_bv,
+                font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL,
+                selectcolor="#0f3460",
+                activeforeground=TEXT_W, activebackground=BG_PANEL,
+            ).pack(side=tk.LEFT, padx=(0, 4))
+
+        # ONNX 모델 선택 (AnimeGAN용)
+        self._anime_model_btn = tk.Button(
+            parent, text="  ONNX 모델 선택",
+            font=("Segoe UI", 9),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=4, anchor="w", padx=12,
+            command=self._select_anime_model,
+        )
+        self._anime_model_btn.pack(fill=tk.X, padx=20, pady=(0, 2))
+        self._anime_model_lbl = tk.Label(
+            parent, text="미선택 (OpenCV로 대체)",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+            wraplength=160,
+        )
+        self._anime_model_lbl.pack(fill=tk.X, padx=20, pady=(0, 4))
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
@@ -585,6 +552,14 @@ class VideoPanel:
                  ).pack(fill=tk.X, padx=14)
         tk.Scale(parent, from_=10, to=90, orient=tk.HORIZONTAL,
                  variable=self._eye_y_var, length=160,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(parent, text="눈 위치 X (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(parent, from_=10, to=90, orient=tk.HORIZONTAL,
+                 variable=self._eye_x_var, length=160,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
                  highlightthickness=0, showvalue=True,
                  ).pack(padx=10, pady=(0, 2))
@@ -791,11 +766,8 @@ class VideoPanel:
         self._canvas.delete("all")
         self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
 
-    def _apply_overlay(self, bgr, playback=False, ext_hand_res=None):
-        """오버레이 렌더링.
-        ext_hand_res: 외부에서 제공된 hand 감지 결과 (AI 렌더링 모드).
-                      None이면 내부에서 감지. 값이 있으면 만화 손 그리기를 건너뜀.
-        """
+    def _apply_overlay(self, bgr, playback=False):
+        """오버레이 렌더링."""
         if self._face_det is None or self._hand_det is None:
             return bgr
         overlay = bgr.copy()
@@ -817,7 +789,7 @@ class VideoPanel:
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             try:
                 face_res = self._face_det.detect(mp_img)
-                hand_res = self._hand_det.detect(mp_img) if ext_hand_res is None else ext_hand_res
+                hand_res = self._hand_det.detect(mp_img)
                 pose_res = self._pose_det.detect(mp_img) if self._pose_det else None
             except Exception as e:
                 print(f"[detect error] {e}")
@@ -826,8 +798,6 @@ class VideoPanel:
                 self._det_cache = (face_res, hand_res, pose_res)
         else:
             face_res, hand_res, pose_res = self._det_cache
-            if ext_hand_res is not None:
-                hand_res = ext_hand_res
 
         _oh, _ow = overlay.shape[:2]
 
@@ -885,7 +855,7 @@ class VideoPanel:
                                    (int(_lf[_i].x*_ow), int(_lf[_i].y*_oh)),
                                    2, _nc, -1)
 
-        # ── 손 (만화 손 스타일은 내보내기 시에만 AI로 적용, 실시간 뷰에서는 미표시)
+        # ── 손 랜드마크 / 만화 손
         if hand_res.hand_landmarks:
             if self._show_hands.get():
                 for hlms in hand_res.hand_landmarks:
@@ -909,6 +879,7 @@ class VideoPanel:
         if _fi is not None:
             _apply_face_img_overlay(overlay, face_res, _ow, _oh, _fi, _fp,
                                     eye_y_pct=self._eye_y_var.get(),
+                                    eye_x_pct=self._eye_x_var.get(),
                                     size_pct=self._img_size_var.get())
 
         return overlay
@@ -1013,6 +984,24 @@ class VideoPanel:
         self._ae_btn.config(state=state)
         self._video_btn.config(state=state)
 
+    def _select_anime_model(self):
+        """AnimeGAN ONNX 모델 파일 선택."""
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="AnimeGAN ONNX 모델 선택",
+            filetypes=[("ONNX 모델", "*.onnx"), ("모든 파일", "*.*")],
+        )
+        if path:
+            self._anime_model_path = path
+            self._anime_model_lbl.config(text=os.path.basename(path))
+
+    def _on_anime_style_change(self):
+        """스타일 라디오 변경 시 모델 버튼 상태 업데이트."""
+        is_gan = self._anime_style_var.get() == "animegan"
+        self._anime_model_btn.config(state=tk.NORMAL if is_gan else tk.DISABLED)
+        if not is_gan:
+            self._anime_model_lbl.config(text="OpenCV 사용 (모델 불필요)")
+
     def _export_video(self):
         save_path = filedialog.asksaveasfilename(
             parent=self.win,
@@ -1023,72 +1012,30 @@ class VideoPanel:
         if not save_path:
             return
 
-        use_ai_hand = self._show_cartoon_hands.get()
         with_overlay = (self._show_face.get() or self._show_body.get()
-                        or self._show_hands.get() or use_ai_hand)
+                        or self._show_hands.get()
+                        or self._show_mosaic.get() or self._face_img is not None)
+        with_anime   = self._show_anime_var.get() and _ANIME_AVAILABLE
 
-        # AI 만화 손 모드: diffusers 확인 + SD 모델 파일 선택
-        ai_sd_model = None
-        if use_ai_hand:
-            try:
-                import diffusers  # noqa: F401
-            except ImportError:
-                messagebox.showerror(
-                    "패키지 필요",
-                    "AI 만화 손 렌더링에 diffusers 패키지가 필요합니다.\n\n"
-                    "pip install diffusers transformers accelerate\n\n"
-                    "설치 후 다시 시도하세요.",
-                    parent=self.win,
-                )
-                return
-
-            # SD 모델 파일 선택 (로컬 safetensors/ckpt)
-            messagebox.showinfo(
-                "SD 모델 파일 선택",
-                "Stable Diffusion 모델 파일(.safetensors 또는 .ckpt)을 선택하세요.\n\n"
-                "Civitai 등에서 다운받은 만화/애니 스타일 모델을 추천합니다.\n"
-                "(예: anything-v4.safetensors, CounterfeitV30.safetensors 등)\n\n"
-                "SD 1.5 기반 모델이어야 합니다.",
-                parent=self.win,
-            )
-            ai_sd_model = filedialog.askopenfilename(
-                parent=self.win,
-                title="SD 모델 파일 선택 (.safetensors / .ckpt)",
-                filetypes=[
-                    ("Stable Diffusion 모델", "*.safetensors *.ckpt"),
-                    ("모든 파일", "*.*"),
-                ],
-            )
-            if not ai_sd_model:
-                return  # 취소
-
-            _quality = self._ai_quality_var.get()
-            _quality_info = {
-                "fast":    "⚡ 빠름 — LCM 4스텝 (~0.25초/프레임, 5배 빠름)",
-                "balance": "⚖ 균형 — DPM++ 10스텝 (~0.6초/프레임)",
-                "quality": "🎨 고품질 — DPM++ 20스텝 (~1.2초/프레임)",
-            }
-            ok = messagebox.askyesno(
-                "AI 렌더링 확인",
-                f"선택한 모델: {os.path.basename(ai_sd_model)}\n"
-                f"품질 모드: {_quality_info.get(_quality, _quality)}\n\n"
-                "• ControlNet 모델 자동 다운로드 (최초 1회, ~1.4GB)\n"
-                "• ⚡ 빠름 선택 시 LCM-LoRA 추가 다운로드 (~200MB)\n"
-                "• 렌더링 중 창을 닫지 마세요\n\n"
-                "계속하시겠습니까?",
-                parent=self.win,
-            )
-            if not ok:
-                return
-
-        # 오버레이 모드인데 MediaPipe 없으면 경고
-        if with_overlay and self._face_det is None:
+        # 오버레이/애니화 모드인데 MediaPipe 없으면 경고
+        if (with_overlay or with_anime) and self._face_det is None:
             messagebox.showwarning(
                 "경고",
                 "MediaPipe 초기화 실패 — 랜드마크 없이 원본 영상으로 저장합니다.",
                 parent=self.win,
             )
             with_overlay = False
+            with_anime   = False
+
+        # AnimeGAN 선택 시 모델 없으면 OpenCV로 대체 안내
+        if with_anime and self._anime_style_var.get() == "animegan" and not self._anime_model_path:
+            if not messagebox.askyesno(
+                "모델 미선택",
+                "AnimeGAN ONNX 모델이 선택되지 않았습니다.\n"
+                "OpenCV 방식으로 대체하여 저장하시겠습니까?",
+                parent=self.win,
+            ):
+                return
 
         was_playing = self._playing
         if self._playing:
@@ -1099,20 +1046,16 @@ class VideoPanel:
             self._play_btn.config(text="▶ 재생")
 
         self._set_export_btns(tk.DISABLED)
-        if use_ai_hand:
-            label = "AI 만화 손 렌더링 준비 중..."
+        if with_anime:
+            self._export_status_var.set("애니화 렌더링 중...")
         elif with_overlay:
-            label = "오버레이 렌더링 중..."
+            self._export_status_var.set("오버레이 렌더링 중...")
         else:
-            label = "영상 저장 중..."
-        self._export_status_var.set(label)
+            self._export_status_var.set("영상 저장 중...")
 
         def _run():
             try:
-                self._save_video_frames(save_path, with_overlay,
-                                        use_ai_hand=use_ai_hand,
-                                        ai_sd_model=ai_sd_model,
-                                        ai_quality=self._ai_quality_var.get())
+                self._save_video_frames(save_path, with_overlay, with_anime)
                 msg = f"영상 저장 완료!\n{save_path}"
                 def _done():
                     self._export_status_var.set("저장 완료!")
@@ -1135,8 +1078,7 @@ class VideoPanel:
         threading.Thread(target=_run, daemon=True).start()
 
     def _save_video_frames(self, save_path: str, with_overlay: bool,
-                           use_ai_hand: bool = False, ai_sd_model: str = None,
-                           ai_quality: str = "fast"):
+                           with_anime: bool = False):
         cap = cv2.VideoCapture(self._video_path)
         if not cap.isOpened():
             raise RuntimeError(f"영상을 열 수 없습니다: {self._video_path}")
@@ -1152,38 +1094,23 @@ class VideoPanel:
             cap.release()
             raise RuntimeError(f"VideoWriter를 열 수 없습니다: {save_path}")
 
-        # ── AI 만화 손 모드 초기화 ──────────────────────────────────────
-        ai          = None
-        ai_hand_det = None
-        if use_ai_hand:
-            try:
-                from .cartoon_hand_ai import CartoonHandAI
-            except ImportError:
-                from cartoon_hand_ai import CartoonHandAI
-
-            def _cb(msg):
-                self.win.after(0, lambda m=msg: self._export_status_var.set(m))
-
-            _preset   = CartoonHandAI.QUALITY_PRESETS.get(
-                            ai_quality, CartoonHandAI.QUALITY_PRESETS["fast"])
-            _use_lcm  = _preset["use_lcm"]
-            _steps    = _preset["steps"]
-            _guidance = _preset["guidance"]
-
-            ai = CartoonHandAI(sd_model=ai_sd_model)
-            ai.load(progress_cb=_cb, use_lcm=_use_lcm)
-
-            # 별도 HandLandmarker (풀 해상도 감지)
-            _h_opts = mp_python.BaseOptions(model_asset_path=HAND_MODEL)
-            _h_run  = mp_vision.HandLandmarkerOptions(
-                base_options=_h_opts,
-                running_mode=RunningMode.IMAGE,
-                num_hands=MAX_PERSONS * 2,
-            )
-            ai_hand_det = mp_vision.HandLandmarker.create_from_options(_h_run)
-
         import time
         _t0 = time.time()
+
+        # ── 애니화 사전 준비 ────────────────────────────────────────────────
+        _anime_converter = None
+        _anime_bg_mode   = "original"
+        _anime_style     = "opencv"
+        if with_anime:
+            _anime_style   = self._anime_style_var.get()
+            _anime_bg_mode = self._anime_bg_var.get()
+            if _anime_style == "animegan" and self._anime_model_path:
+                try:
+                    _anime_converter = AnimeGANConverter()
+                    _anime_converter.load(self._anime_model_path)
+                except Exception as _e:
+                    print(f"[AnimeGAN load error] {_e} — OpenCV로 대체합니다.")
+                    _anime_style = "opencv"
 
         try:
             idx = 0
@@ -1192,49 +1119,48 @@ class VideoPanel:
                 if not ret:
                     break
 
+                # ── 애니화 (사람 마스크 + 스타일 변환) ─────────────────────
+                if with_anime:
+                    _fr = _hr = _pr = None
+                    try:
+                        _rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        _mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                           data=_rgb)
+                        if self._face_det:
+                            _fr = self._face_det.detect(_mp_img)
+                        if self._hand_det:
+                            _hr = self._hand_det.detect(_mp_img)
+                        if self._pose_det:
+                            _pr = self._pose_det.detect(_mp_img)
+                    except Exception:
+                        pass
+                    frame = apply_anime_to_person(
+                        frame, _pr, _fr, _hr,
+                        style=_anime_style,
+                        bg_mode=_anime_bg_mode,
+                        converter=_anime_converter,
+                    )
+
+                # ── 오버레이 (랜드마크/모자이크 등) ─────────────────────────
                 if with_overlay:
-                    if use_ai_hand:
-                        # 1) 손 감지 (풀 해상도)
-                        rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                        try:
-                            hand_res = ai_hand_det.detect(mp_img)
-                        except Exception:
-                            hand_res = None
-
-                        # 2) 얼굴/포즈 오버레이 (만화 손 그리기 스킵)
-                        frame = self._apply_overlay(frame, ext_hand_res=hand_res)
-
-                        # 3) AI 만화 손 렌더링
-                        if hand_res and hand_res.hand_landmarks:
-                            frame = ai.render_frame(
-                                frame, hand_res,
-                                steps=_steps, guidance=_guidance)
-                    else:
-                        frame = self._apply_overlay(frame)
+                    frame = self._apply_overlay(frame)
 
                 writer.write(frame)
                 idx += 1
 
                 if idx % 5 == 0:
-                    pct      = int(idx / total * 100)
-                    elapsed  = time.time() - _t0
-                    per_fr   = elapsed / max(idx, 1)
-                    if use_ai_hand:
-                        label = f"AI 렌더링 중... {idx}/{total} ({per_fr:.1f}초/프레임)"
+                    elapsed = time.time() - _t0
+                    fps_est = idx / max(elapsed, 0.001)
+                    if with_anime:
+                        label = f"애니화 중... {idx}/{total}  ({fps_est:.1f}fps)"
                     elif with_overlay:
-                        label = f"렌더링 중... {pct}%"
+                        label = f"렌더링 중... {idx}/{total}"
                     else:
-                        label = f"저장 중... {pct}%"
+                        label = f"저장 중... {int(idx/total*100)}%"
                     self.win.after(0, lambda l=label: self._export_status_var.set(l))
         finally:
             writer.release()
             cap.release()
-            if ai_hand_det is not None:
-                try:
-                    ai_hand_det.close()
-                except Exception:
-                    pass
 
     def _process_all_frames(self):
         """영상 전체 프레임을 MediaPipe로 처리 → (List[FrameData], VideoInfo) 반환"""
