@@ -55,15 +55,6 @@ except Exception:
     AnimeGANConverter      = None
     apply_anime_to_person  = None
 
-try:
-    try:
-        from .avatar_renderer import draw_avatar, AVATAR_LABELS, AVATAR_LABELS_KO
-    except ImportError:
-        from avatar_renderer import draw_avatar, AVATAR_LABELS, AVATAR_LABELS_KO
-    _AVATAR_AVAILABLE = True
-except Exception:
-    _AVATAR_AVAILABLE = False
-    draw_avatar = None
 
 # ── 테마 색상 ──────────────────────────────────────────────────────────────
 BG_DARK  = "#1a1a2e"
@@ -241,8 +232,6 @@ class VideoPanel:
         self._show_hands  = tk.BooleanVar(value=False)
         self._show_names  = tk.BooleanVar(value=False)
         self._show_mosaic         = tk.BooleanVar(value=False)
-        self._show_avatar_var  = tk.BooleanVar(value=False)
-        self._avatar_skin_var  = tk.StringVar(value="anime")
         self._show_anime_var   = tk.BooleanVar(value=False)
         self._anime_style_var  = tk.StringVar(value="animegan")
         self._anime_bg_var     = tk.StringVar(value="original")
@@ -266,7 +255,7 @@ class VideoPanel:
         self._build_ui()
         self._init_mediapipe()
         for _v in (self._show_face, self._show_body, self._show_hands, self._show_names,
-                   self._show_mosaic, self._show_avatar_var):
+                   self._show_mosaic):
             _v.trace_add("write", lambda *_: self._refresh_frame())
         # 첫 프레임 표시 (레이아웃 완료 후)
         self.win.after(100, lambda: self._seek_to(0))
@@ -457,29 +446,6 @@ class VideoPanel:
             activeforeground="#ff8888", activebackground=BG_PANEL,
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(2, 2))
-
-        # ── 캐릭터 오버레이 (방향 C) ─────────────────────────────────────────
-        tk.Checkbutton(
-            parent, text="🧑 캐릭터 오버레이",
-            variable=self._show_avatar_var,
-            font=("Segoe UI", 10),
-            fg="#aaffcc", bg=BG_PANEL,
-            selectcolor="#0f3460",
-            activeforeground="#aaffcc", activebackground=BG_PANEL,
-            anchor="w",
-            command=lambda: self._refresh_frame(),
-        ).pack(fill=tk.X, padx=10, pady=(4, 2))
-        _avf = tk.Frame(parent, bg=BG_PANEL)
-        _avf.pack(fill=tk.X, padx=22, pady=(0, 4))
-        for _sv, _sl in zip(AVATAR_LABELS if _AVATAR_AVAILABLE else [],
-                            AVATAR_LABELS_KO if _AVATAR_AVAILABLE else []):
-            tk.Radiobutton(
-                _avf, text=_sl, variable=self._avatar_skin_var, value=_sv,
-                font=("Segoe UI", 8), fg=TEXT_W, bg=BG_PANEL,
-                selectcolor="#0f3460",
-                activeforeground=TEXT_W, activebackground=BG_PANEL,
-                command=lambda: self._refresh_frame(),
-            ).pack(side=tk.LEFT, padx=(0, 4))
 
         # ── 애니화 ──────────────────────────────────────────────────────────
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(8, 4))
@@ -783,8 +749,7 @@ class VideoPanel:
     # ── 프레임 표시 ────────────────────────────────────────────────────────
     def _display_frame(self, bgr, playback=False):
         if (self._show_face.get() or self._show_body.get() or self._show_hands.get()
-                or self._face_img is not None or self._show_mosaic.get()
-                or self._show_avatar_var.get()):
+                or self._face_img is not None or self._show_mosaic.get()):
             bgr = self._apply_overlay(bgr, playback=playback)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
@@ -908,11 +873,6 @@ class VideoPanel:
                                  self._show_face.get(),
                                  self._show_body.get(),
                                  self._show_hands.get())
-
-        # ── 캐릭터 오버레이 (방향 C)
-        if self._show_avatar_var.get() and _AVATAR_AVAILABLE and pose_res:
-            draw_avatar(overlay, pose_res, _ow, _oh,
-                        skin=self._avatar_skin_var.get())
 
         # ── 얼굴 이미지 오버레이
         _fi = self._face_img
@@ -1055,8 +1015,7 @@ class VideoPanel:
 
         with_overlay = (self._show_face.get() or self._show_body.get()
                         or self._show_hands.get()
-                        or self._show_mosaic.get() or self._face_img is not None
-                        or self._show_avatar_var.get())
+                        or self._show_mosaic.get() or self._face_img is not None)
         with_anime   = self._show_anime_var.get() and _ANIME_AVAILABLE
 
         # 오버레이/애니화 모드인데 MediaPipe 없으면 경고
