@@ -64,19 +64,10 @@ CTRL_W    = 230
 # 얼굴 이미지 워핑에 사용할 랜드마크 인덱스 (6점)
 _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, Mouth.R, Mouth.L
 
-# 만화 손 스타일 뼈대 연결 정의
-_HAND_BONES = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20),
-    (0, 17),
-]
 
 
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
-                             eye_y_pct=55, size_pct=100):
+                             eye_y_pct=55, eye_x_pct=50, size_pct=100):
     """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
     face_img_pts is not None → Homography 정밀 모드 (실제 얼굴 사진)
     face_img_pts is None     → Affine 자동 모드  (일러스트/그림)
@@ -110,8 +101,8 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             ys = [_lf[i].y * h for i in range(len(_lf))]
             face_h_px = max(ys) - min(ys)
             scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
-            # 소스 이미지에서 눈 중심 위치 (eye_y_pct% 높이, 가로 중앙)
-            src_cx = img_w / 2.0
+            # 소스 이미지에서 눈 중심 위치
+            src_cx = img_w * (eye_x_pct / 100.0)
             src_cy = img_h * (eye_y_pct / 100.0)
             # Affine: 소스 눈 중심 → 화면 눈 중심, 회전 + 스케일
             M = cv2.getRotationMatrix2D((src_cx, src_cy), -angle, scale)
@@ -150,82 +141,6 @@ def _apply_face_mosaic(frame, face_res, w, h, block=20):
                            interpolation=cv2.INTER_LINEAR)
         frame[y1:y2, x1:x2] = cv2.resize(small, (rw, rh),
                                            interpolation=cv2.INTER_NEAREST)
-
-
-def _draw_cartoon_hands_hq(overlay, hand_res, w, h):
-    """고품질 만화 손 렌더링.
-    팜(손바닥) 볼록껍질 채우기 + 3단 셰이딩 + 손톱 광택 디테일.
-    """
-    if not hand_res.hand_landmarks:
-        return
-
-    # ── 색상 팔레트 (BGR) ──────────────────────────────────────────
-    _OUTLINE    = (12,  12,  16)    # 검정 윤곽선
-    _PALM_FILL  = (185, 205, 225)   # 손바닥 기본색
-    _BONE_BASE  = (195, 212, 232)   # 뼈대 기본색
-    _BONE_LIGHT = (222, 234, 250)   # 뼈대 하이라이트 중심선
-    _JNT_SHADOW = (160, 180, 205)   # 관절 그림자
-    _JNT_MID    = (205, 218, 238)   # 관절 중간색
-    _JNT_LIGHT  = (232, 240, 254)   # 관절 하이라이트
-    _NAIL_FILL  = (242, 247, 255)   # 손톱
-    _NAIL_EDGE  = (110, 135, 170)   # 손톱 테두리
-    _NAIL_SHINE = (255, 255, 255)   # 손톱 광택
-
-    for hlms in hand_res.hand_landmarks:
-        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hlms]
-        if len(pts) < 21:
-            continue
-
-        # wrist(0) → middle_mcp(9) 거리로 스케일 계산
-        _dist = float(np.linalg.norm(np.array(pts[0]) - np.array(pts[9])))
-        _dist = max(_dist, 35.0)
-
-        bone_w  = max(11, int(_dist * 0.23))
-        joint_r = max(8,  int(_dist * 0.15))
-        nail_r  = max(5,  int(_dist * 0.10))
-        out_ext = max(6,  int(bone_w * 0.55))   # 윤곽선 추가 두께
-
-        # ── Pass 1: 외곽 윤곽선 (뼈대 + 관절) ──────────────────────
-        for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e],
-                     _OUTLINE, bone_w + out_ext * 2, cv2.LINE_AA)
-        for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r + out_ext, _OUTLINE, -1)
-
-        # ── Pass 2: 손바닥 볼록껍질 채우기 ──────────────────────────
-        palm_arr = np.array([pts[i] for i in [0, 1, 5, 9, 13, 17]], dtype=np.int32)
-        hull = cv2.convexHull(palm_arr)
-        cv2.fillConvexPoly(overlay, hull, _PALM_FILL, cv2.LINE_AA)
-        cv2.polylines(overlay, [hull], True, _OUTLINE, 2, cv2.LINE_AA)
-
-        # ── Pass 3: 뼈대 선 ──────────────────────────────────────────
-        for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], _BONE_BASE, bone_w, cv2.LINE_AA)
-        # 뼈대 중심 하이라이트 (얇은 밝은 선)
-        hl_w = max(2, bone_w // 3)
-        for s, e in _HAND_BONES:
-            cv2.line(overlay, pts[s], pts[e], _BONE_LIGHT, hl_w, cv2.LINE_AA)
-
-        # ── Pass 4: 관절 구체 3단 셰이딩 ────────────────────────────
-        for i in range(21):
-            cv2.circle(overlay, pts[i], joint_r, _JNT_SHADOW, -1)
-            cv2.circle(overlay, pts[i], int(joint_r * 0.75), _JNT_MID, -1)
-            # 하이라이트 (약간 좌상단 오프셋)
-            hx = pts[i][0] - max(1, joint_r // 5)
-            hy = pts[i][1] - max(1, joint_r // 3)
-            cv2.circle(overlay, (hx, hy), max(2, joint_r // 3), _JNT_LIGHT, -1)
-        # 관절 테두리
-        for i in [1,2,3,5,6,7,9,10,11,13,14,15,17,18,19]:
-            cv2.circle(overlay, pts[i], joint_r, _OUTLINE, 1, cv2.LINE_AA)
-
-        # ── Pass 5: 손가락 끝 손톱 ──────────────────────────────────
-        for tip in [4, 8, 12, 16, 20]:
-            cv2.circle(overlay, pts[tip], nail_r, _NAIL_FILL, -1)
-            cv2.circle(overlay, pts[tip], nail_r, _NAIL_EDGE, 1, cv2.LINE_AA)
-            # 광택 (좌상단)
-            sx = pts[tip][0] - max(1, nail_r // 3)
-            sy = pts[tip][1] - max(1, nail_r // 3)
-            cv2.circle(overlay, (sx, sy), max(1, nail_r // 3), _NAIL_SHINE, -1)
 
 
 def _draw_landmark_names(overlay, face_res, hand_res, pose_res,
@@ -304,7 +219,6 @@ class CameraPanel:
         self._show_hands  = tk.BooleanVar(value=True)
         self._show_names  = tk.BooleanVar(value=False)
         self._show_mosaic         = tk.BooleanVar(value=False)
-        self._show_cartoon_hands  = tk.BooleanVar(value=False)
         self._smooth_var  = tk.IntVar(value=3)
         self._status_var = tk.StringVar(value="대기중")
         self._frame_q: queue.Queue = queue.Queue(maxsize=2)
@@ -322,6 +236,7 @@ class CameraPanel:
         self._face_img      = None   # BGRA numpy array (얼굴 이미지)
         self._face_img_pts  = None   # 소스 키포인트 (None = Affine 자동 모드)
         self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
+        self._eye_x_var     = tk.IntVar(value=50)   # 눈 위치 X (%)
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
 
         self._build_ui()
@@ -421,16 +336,6 @@ class CameraPanel:
             activeforeground="#ff8888", activebackground=BG_PANEL,
             anchor=tk.W,
         ).pack(fill=tk.X, padx=8, pady=(2, 2))
-        tk.Checkbutton(
-            right, text="  └ 만화 손 스타일",
-            variable=self._show_cartoon_hands,
-            font=("Segoe UI", 10),
-            fg="#88ccff", bg=BG_PANEL,
-            selectcolor=BG_CTRL,
-            activeforeground="#88ccff", activebackground=BG_PANEL,
-            anchor=tk.W,
-        ).pack(fill=tk.X, padx=8, pady=(0, 4))
-
         self._separator(right)
 
         # ── 얼굴 이미지 오버레이 ──
@@ -450,6 +355,13 @@ class CameraPanel:
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
         tk.Scale(right, from_=10, to=90, orient=tk.HORIZONTAL,
                  variable=self._eye_y_var, length=170,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 2))
+        tk.Label(right, text="눈 위치 X (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(right, from_=10, to=90, orient=tk.HORIZONTAL,
+                 variable=self._eye_x_var, length=170,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
                  highlightthickness=0, showvalue=True,
                  ).pack(pady=(0, 2))
@@ -862,7 +774,7 @@ class CameraPanel:
                 # 최적화: 2프레임마다 감지 (녹화 중에는 매 프레임 감지)
                 _det_tick += 1
                 _overlay_on = (self._show_face.get() or self._show_body.get()
-                               or self._show_hands.get() or self._show_cartoon_hands.get())
+                               or self._show_hands.get())
                 _fi_on     = self._face_img is not None
                 _mosaic_on = self._show_mosaic.get()
                 _need_det = (_det_tick % 2 == 1) or self._recording
@@ -879,7 +791,7 @@ class CameraPanel:
                     try:
                         if self._show_face.get() or self._recording or _fi_on or _mosaic_on:
                             _last_f = face_det.detect(_inf)
-                        if self._show_hands.get() or self._recording or self._show_cartoon_hands.get():
+                        if self._show_hands.get() or self._recording:
                             _last_h = hand_det.detect(_inf)
                         if self._show_body.get() or self._recording:
                             _last_p = pose_det.detect(_inf)
@@ -942,17 +854,14 @@ class CameraPanel:
                                            (int(_lf[_i].x*w_px), int(_lf[_i].y*h_px)),
                                            2, _nc, -1)
                 # ── 손
-                if hand_res.hand_landmarks:
-                    if self._show_cartoon_hands.get():
-                        _draw_cartoon_hands_hq(overlay, hand_res, w_px, h_px)
-                    elif self._show_hands.get():
-                        for hlms in hand_res.hand_landmarks:
-                            mp_draw.draw_landmarks(
-                                overlay, hlms,
-                                HandLandmarksConnections.HAND_CONNECTIONS,
-                                landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
-                                connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
-                            )
+                if hand_res.hand_landmarks and self._show_hands.get():
+                    for hlms in hand_res.hand_landmarks:
+                        mp_draw.draw_landmarks(
+                            overlay, hlms,
+                            HandLandmarksConnections.HAND_CONNECTIONS,
+                            landmark_drawing_spec=mp_styles.get_default_hand_landmarks_style(),
+                            connection_drawing_spec=mp_styles.get_default_hand_connections_style(),
+                        )
                 # ── 랜드마크 이름
                 if self._show_names.get():
                     _draw_landmark_names(overlay, face_res, hand_res, pose_res,
@@ -967,6 +876,7 @@ class CameraPanel:
                 if _fi is not None:
                     _apply_face_img_overlay(overlay, face_res, w_px, h_px, _fi, _fp,
                                             eye_y_pct=self._eye_y_var.get(),
+                                            eye_x_pct=self._eye_x_var.get(),
                                             size_pct=self._img_size_var.get())
 
                 # 녹화 처리

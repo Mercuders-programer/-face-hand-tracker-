@@ -101,4 +101,19 @@ python app.py
 
 ---
 
+## 2026-04-12
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 59 | 하던작업 해줘 | 세션 파일·플랜 파일 확인 → AnimeConvert_Plan.txt, CartoonHand_Improvement_Plan.txt 기반 다음 작업 파악 |
+| 60 | 기능을 하나 만들건데 영상분석에서 영상 로드 후 애니화 체크박스 ON → 사람만 애니메이션으로 바꾸는 기능, 기존 감지 활용, 속도 최적화 고려해서 AI_Style_Plan.txt에 계획 작성 | `AI_Style_Plan.txt` 생성 — 포즈/얼굴/손 랜드마크 재활용 사람 마스크, OpenCV(STEP 1)/AnimeGAN ONNX(STEP 2) 방식 비교, 속도 최적화 6가지 포인트 정리 |
+| 61 | step 2부터 먼저 하고 확인 후에 step 1으로 | `src/anime_converter.py` 신규 생성 (build_person_mask/apply_opencv_anime/AnimeGANConverter/apply_anime_to_person). `video_panel.py` — 애니화 UI(스타일/배경/모델 선택), _export_video/_save_video_frames 연동. 문법·기능 테스트 통과, WSL2 정상 실행 |
+| 62 | onnx 모델은 어디서 받아야해? | github.com/TachibanaYoshino/AnimeGANv3 Releases 또는 HuggingFace, AnimeGANv3_Hayao/Shinkai.onnx (~9MB) 안내 |
+| 63 | AnimeConvert_Plan 방향 C — 체크박스 하나 만들어서 기능 추가 해줘 | `src/avatar_renderer.py` 신규 생성 (5-패스 셀 셰이딩 아바타, 스킨 4종). `video_panel.py` — 오버레이 섹션에 "🧑 캐릭터 오버레이" 체크박스 + 스킨 라디오 추가, 실시간+내보내기 연동 |
+| 64 | 별로네 캐릭터 오버레이는 삭제해줘 | `avatar_renderer.py` 삭제, `video_panel.py` avatar 관련 코드 전체 제거 |
+| 65 | KakaoTalk_20260412_144327214.mp4 로드 후 얼굴 인식 안되고 아기 몸 인식 안됨 — 원인 확인하고 Error_List.txt 저장 후 수정 계획 세워서 수정해줘 | 진단: 얼굴=모든 conf/해상도에서 0명(측면·하방 얼굴), 포즈=성인 1명만(아기 체형 한계). `Error_List.txt` 생성 — ERROR-01(스케일버그,수정완료)/ERROR-02(얼굴모델한계)/ERROR-03(아기포즈한계). `video_panel.py` — 세로 영상 스케일 버그 수정: `640/max(w,1)` → `640/max(w,h,1)` |
+| 66 | 왜 command_history.md에 기록 안 하는거야 | 누락 항목(#59~65) 즉시 추가 |
+
+---
+
 <!-- 새 명령/질문 발생 시 위 표에 행 추가 -->
