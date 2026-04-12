@@ -113,6 +113,7 @@ python app.py
 | 64 | 별로네 캐릭터 오버레이는 삭제해줘 | `avatar_renderer.py` 삭제, `video_panel.py` avatar 관련 코드 전체 제거 |
 | 65 | KakaoTalk_20260412_144327214.mp4 로드 후 얼굴 인식 안되고 아기 몸 인식 안됨 — 원인 확인하고 Error_List.txt 저장 후 수정 계획 세워서 수정해줘 | 진단: 얼굴=모든 conf/해상도에서 0명(측면·하방 얼굴), 포즈=성인 1명만(아기 체형 한계). `Error_List.txt` 생성 — ERROR-01(스케일버그,수정완료)/ERROR-02(얼굴모델한계)/ERROR-03(아기포즈한계). `video_panel.py` — 세로 영상 스케일 버그 수정: `640/max(w,1)` → `640/max(w,h,1)` |
 | 66 | 왜 command_history.md에 기록 안 하는거야 | 누락 항목(#59~65) 즉시 추가 |
+| 67 | KakaoTalk_20260412_144327214.mp4 1프레임부터 얼굴 인식 안 되는 이유 분석, Error_analyze.txt 작성 | diagnose_face.py 작성 → conf×해상도 12조합 전수 테스트. conf=0.05+202×360에서 얼굴 1명 감지 성공(yaw=-68.6°). Haar Cascade 원본/640에서 감지 성공 확인. Error_analyze.txt 생성 — 원인(측면 yaw -68.6°, BlazeFace 정면 편향, 임계값) + 해결방안(conf=0.05+소형 해상도 즉시 적용 가능) 기록 |
 
 ---
 
