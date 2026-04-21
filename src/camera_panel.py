@@ -66,14 +66,18 @@ _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, 
 
 
 
-def _ema_update(state: dict, key: str, value: float) -> float:
-    """Exponential Moving Average 업데이트. state[key]가 None이면 cold-start."""
-    alpha = state.get('alpha', 0.15)
+def _adaptive_ema_update(state: dict, key: str, value: float,
+                          catch_scale: float = 30.0) -> float:
+    """변화량에 따라 alpha를 자동 조정하는 Adaptive EMA.
+    정지 시 → base_alpha 유지(강한 보정), 빠른 이동 시 → alpha→1.0(즉각 추적)."""
+    base_alpha = state.get('alpha', 0.15)
     prev = state.get(key)
     if prev is None:
         state[key] = value
-    else:
-        state[key] = alpha * value + (1.0 - alpha) * prev
+        return value
+    delta = abs(value - prev)
+    dynamic_alpha = min(1.0, base_alpha + delta / catch_scale)
+    state[key] = dynamic_alpha * value + (1.0 - dynamic_alpha) * prev
     return state[key]
 
 
@@ -122,10 +126,10 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
 
             # ── EMA 평활화 적용 (떨림 제거) ──
             if ema_state is not None:
-                face_h_px  = _ema_update(ema_state, 'face_h',  raw_face_h)
-                _ec_x      = _ema_update(ema_state, 'eye_cx',  raw_eye_cx)
-                _ec_y      = _ema_update(ema_state, 'eye_cy',  raw_eye_cy)
-                angle      = _ema_update(ema_state, 'angle',   raw_angle)
+                face_h_px  = _adaptive_ema_update(ema_state, 'face_h', raw_face_h, catch_scale=30.0)
+                _ec_x      = _adaptive_ema_update(ema_state, 'eye_cx', raw_eye_cx, catch_scale=40.0)
+                _ec_y      = _adaptive_ema_update(ema_state, 'eye_cy', raw_eye_cy, catch_scale=40.0)
+                angle      = _adaptive_ema_update(ema_state, 'angle',  raw_angle,  catch_scale=10.0)
                 eye_center = (_ec_x, _ec_y)
             else:
                 face_h_px = raw_face_h
