@@ -266,6 +266,7 @@ class CameraPanel:
         self._face_img      = None   # BGRA numpy array (얼굴 이미지)
         self._face_img_pts  = None   # 소스 키포인트 (None = Affine 자동 모드)
         # EMA 평활화 상태 (얼굴 이미지 오버레이 떨림 제거)
+        self._ema_smooth_var = tk.IntVar(value=85)   # 떨림 보정 강도 (0~95 → α=1.00~0.05)
         self._face_img_ema: dict = {
             'face_h': None, 'eye_cx': None, 'eye_cy': None,
             'angle': None, 'alpha': 0.15,
@@ -275,6 +276,7 @@ class CameraPanel:
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
 
         self._build_ui()
+        self._on_ema_smooth_change()   # 슬라이더 초기값 → EMA alpha 동기화
         # 패널 열리면 자동으로 카메라 시작
         self.win.after(200, self._start_camera)
 
@@ -406,6 +408,14 @@ class CameraPanel:
                  variable=self._img_size_var, length=170,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
                  highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 2))
+        tk.Label(right, text="떨림 보정 (0=없음  →  95=최대)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(right, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._ema_smooth_var, length=170,
+                 bg=BG_PANEL, fg="#88ddff", troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_ema_smooth_change,
                  ).pack(pady=(0, 4))
 
         self._separator(right)
@@ -688,6 +698,13 @@ class CameraPanel:
         cur = self._rec_ind.cget("text")
         self._rec_ind.config(text="" if cur else "● REC")
         self.win.after(500, self._blink)
+
+    # ── EMA 떨림 보정 슬라이더 콜백 ──────────────────────────────────────
+    def _on_ema_smooth_change(self, _=None):
+        """슬라이더 값(0~95) → alpha(1.00~0.05) 변환 후 EMA 상태에 반영."""
+        v = self._ema_smooth_var.get()          # 0=보정없음, 95=최대보정
+        alpha = 1.0 - (v / 100.0)              # 0→1.00, 95→0.05
+        self._face_img_ema['alpha'] = alpha
 
     # ── 얼굴 이미지 로드/제거 ──────────────────────────────────────────────
     def _toggle_face_image(self):
