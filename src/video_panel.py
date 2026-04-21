@@ -68,13 +68,29 @@ TL_H     = 30
 # 얼굴 이미지 워핑에 사용할 랜드마크 인덱스 (6점)
 _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, Mouth.R, Mouth.L
 
+def _ema_update(state: dict, key: str, value: float) -> float:
+    """Exponential Moving Average 업데이트. state[key]가 None이면 cold-start."""
+    alpha = state.get('alpha', 0.15)
+    prev = state.get(key)
+    if prev is None:
+        state[key] = value
+    else:
+        state[key] = alpha * value + (1.0 - alpha) * prev
+    return state[key]
+
+
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
-                             eye_y_pct=55, eye_x_pct=50, size_pct=100):
+                             eye_y_pct=55, eye_x_pct=50, size_pct=100,
+                             ema_state: dict | None = None):
     """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
     face_img_pts is not None → Homography 정밀 모드 (실제 얼굴 사진)
     face_img_pts is None     → Affine 자동 모드  (일러스트/그림)
+    ema_state: {'face_h', 'eye_cx', 'eye_cy', 'angle', 'alpha'} — EMA 상태 dict
     """
     if not face_res.face_landmarks:
+        if ema_state is not None:
+            for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
+                ema_state[_k] = None
         return
     img_h, img_w = face_img.shape[:2]
     for _lf in face_res.face_landmarks:
@@ -100,7 +116,20 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
         else:
             # ── Affine 자동 모드 (일러스트) ──────────────────────────────
             ys = [_lf[i].y * h for i in range(len(_lf))]
-            face_h_px = max(ys) - min(ys)
+            raw_face_h = max(ys) - min(ys)
+            raw_eye_cx, raw_eye_cy = float(eye_center[0]), float(eye_center[1])
+            raw_angle = angle
+
+            # ── EMA 평활화 적용 (떨림 제거) ──
+            if ema_state is not None:
+                face_h_px  = _ema_update(ema_state, 'face_h',  raw_face_h)
+                _ec_x      = _ema_update(ema_state, 'eye_cx',  raw_eye_cx)
+                _ec_y      = _ema_update(ema_state, 'eye_cy',  raw_eye_cy)
+                angle      = _ema_update(ema_state, 'angle',   raw_angle)
+                eye_center = (_ec_x, _ec_y)
+            else:
+                face_h_px = raw_face_h
+
             scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
             src_cx = img_w * (eye_x_pct / 100.0)
             src_cy = img_h * (eye_y_pct / 100.0)
@@ -251,8 +280,14 @@ class VideoPanel:
         self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
         self._eye_x_var     = tk.IntVar(value=50)   # 눈 위치 X (%)
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
+        self._ema_smooth_var = tk.IntVar(value=85)  # 떨림 보정 강도 (0~95)
+        self._face_img_ema: dict = {
+            'face_h': None, 'eye_cx': None, 'eye_cy': None,
+            'angle': None, 'alpha': 0.15,
+        }
 
         self._build_ui()
+        self._on_ema_smooth_change()  # 슬라이더 초기값 → EMA alpha 동기화
         self._init_mediapipe()
         for _v in (self._show_face, self._show_body, self._show_hands, self._show_names,
                    self._show_mosaic):
@@ -571,6 +606,15 @@ class VideoPanel:
                  variable=self._img_size_var, length=160,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
                  highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(parent, text="떨림 보정 (0=없음  →  95=최대)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(parent, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._ema_smooth_var, length=160,
+                 bg=BG_PANEL, fg="#88ddff", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_ema_smooth_change,
                  ).pack(padx=10, pady=(0, 4))
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
@@ -881,7 +925,8 @@ class VideoPanel:
             _apply_face_img_overlay(overlay, face_res, _ow, _oh, _fi, _fp,
                                     eye_y_pct=self._eye_y_var.get(),
                                     eye_x_pct=self._eye_x_var.get(),
-                                    size_pct=self._img_size_var.get())
+                                    size_pct=self._img_size_var.get(),
+                                    ema_state=self._face_img_ema)
 
         return overlay
 
@@ -1210,11 +1255,19 @@ class VideoPanel:
         info = VideoInfo(width=w, height=h, fps=fps, total_frames=len(frames_data))
         return frames_data, info
 
+    # ── EMA 떨림 보정 슬라이더 콜백 ──────────────────────────────────────
+    def _on_ema_smooth_change(self, _=None):
+        """슬라이더 값(0~95) → alpha(1.00~0.05) 변환 후 EMA 상태에 반영."""
+        v = self._ema_smooth_var.get()
+        self._face_img_ema['alpha'] = 1.0 - (v / 100.0)
+
     # ── 얼굴 이미지 로드/제거 ──────────────────────────────────────────────
     def _toggle_face_image(self):
         if self._face_img is not None:
             self._face_img = None
             self._face_img_pts = None
+            for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
+                self._face_img_ema[_k] = None
             self._face_img_lbl.config(text="미선택")
             self._face_img_btn.config(text="🖼  이미지 로드")
             self._det_cache = None
