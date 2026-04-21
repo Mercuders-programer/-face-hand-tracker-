@@ -66,13 +66,30 @@ _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, 
 
 
 
+def _ema_update(state: dict, key: str, value: float) -> float:
+    """Exponential Moving Average 업데이트. state[key]가 None이면 cold-start."""
+    alpha = state.get('alpha', 0.15)
+    prev = state.get(key)
+    if prev is None:
+        state[key] = value
+    else:
+        state[key] = alpha * value + (1.0 - alpha) * prev
+    return state[key]
+
+
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
-                             eye_y_pct=55, eye_x_pct=50, size_pct=100):
+                             eye_y_pct=55, eye_x_pct=50, size_pct=100,
+                             ema_state: dict | None = None):
     """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
     face_img_pts is not None → Homography 정밀 모드 (실제 얼굴 사진)
     face_img_pts is None     → Affine 자동 모드  (일러스트/그림)
+    ema_state: {'face_h', 'eye_cx', 'eye_cy', 'angle', 'alpha'} — EMA 상태 dict
     """
     if not face_res.face_landmarks:
+        # 얼굴 없으면 EMA 상태 리셋 (다음 감지 때 cold-start)
+        if ema_state is not None:
+            for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
+                ema_state[_k] = None
         return
     img_h, img_w = face_img.shape[:2]
     for _lf in face_res.face_landmarks:
@@ -99,7 +116,20 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             # ── Affine 자동 모드 (일러스트) ──────────────────────────────
             # 얼굴 바운딩박스 높이 → 스케일 (이미지의 80%가 얼굴 영역이라 가정)
             ys = [_lf[i].y * h for i in range(len(_lf))]
-            face_h_px = max(ys) - min(ys)
+            raw_face_h = max(ys) - min(ys)
+            raw_eye_cx, raw_eye_cy = float(eye_center[0]), float(eye_center[1])
+            raw_angle = angle
+
+            # ── EMA 평활화 적용 (떨림 제거) ──
+            if ema_state is not None:
+                face_h_px  = _ema_update(ema_state, 'face_h',  raw_face_h)
+                _ec_x      = _ema_update(ema_state, 'eye_cx',  raw_eye_cx)
+                _ec_y      = _ema_update(ema_state, 'eye_cy',  raw_eye_cy)
+                angle      = _ema_update(ema_state, 'angle',   raw_angle)
+                eye_center = (_ec_x, _ec_y)
+            else:
+                face_h_px = raw_face_h
+
             scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
             # 소스 이미지에서 눈 중심 위치
             src_cx = img_w * (eye_x_pct / 100.0)
@@ -235,6 +265,11 @@ class CameraPanel:
         self._tracker       = Tracker()
         self._face_img      = None   # BGRA numpy array (얼굴 이미지)
         self._face_img_pts  = None   # 소스 키포인트 (None = Affine 자동 모드)
+        # EMA 평활화 상태 (얼굴 이미지 오버레이 떨림 제거)
+        self._face_img_ema: dict = {
+            'face_h': None, 'eye_cx': None, 'eye_cy': None,
+            'angle': None, 'alpha': 0.15,
+        }
         self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
         self._eye_x_var     = tk.IntVar(value=50)   # 눈 위치 X (%)
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
@@ -659,6 +694,8 @@ class CameraPanel:
         if self._face_img is not None:
             self._face_img = None
             self._face_img_pts = None
+            for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
+                self._face_img_ema[_k] = None
             self._face_img_lbl.config(text="미선택")
             self._face_img_btn.config(text="이미지 로드")
         else:
@@ -877,7 +914,8 @@ class CameraPanel:
                     _apply_face_img_overlay(overlay, face_res, w_px, h_px, _fi, _fp,
                                             eye_y_pct=self._eye_y_var.get(),
                                             eye_x_pct=self._eye_x_var.get(),
-                                            size_pct=self._img_size_var.get())
+                                            size_pct=self._img_size_var.get(),
+                                            ema_state=self._face_img_ema)
 
                 # 녹화 처리
                 if self._recording:
