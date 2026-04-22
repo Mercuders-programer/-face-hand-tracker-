@@ -384,28 +384,50 @@ class VideoPanel:
         # 상단 accent 바
         tk.Frame(parent, bg=ACCENT, height=3).pack(fill=tk.X)
 
-        # 헤더
-        tk.Label(
-            parent, text="파일 정보",
+        # 헤더 (클릭 토글)
+        _info_open = tk.BooleanVar(value=True)
+        hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        hdr.pack(fill=tk.X)
+        hdr_lbl = tk.Label(
+            hdr, text="▼  파일 정보",
             font=("Segoe UI", 12, "bold"),
             fg=TEXT_W, bg=BG_PANEL, anchor="w",
-        ).pack(fill=tk.X, padx=14, pady=(14, 4))
+        )
+        hdr_lbl.pack(fill=tk.X, padx=14, pady=(14, 4))
 
-        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(0, 6))
+        _sep = tk.Frame(parent, bg="#2a2a4a", height=1)
+        _sep.pack(fill=tk.X, padx=10, pady=(0, 6))
+
+        # 접힐 컨테이너
+        body = tk.Frame(parent, bg=BG_PANEL)
+        body.pack(fill=tk.X)
+
+        def _toggle(_e=None):
+            if _info_open.get():
+                body.pack_forget()
+                hdr_lbl.config(text="▶  파일 정보")
+                _info_open.set(False)
+            else:
+                body.pack(fill=tk.X, after=_sep)   # _sep 바로 아래 원위치 복원
+                hdr_lbl.config(text="▼  파일 정보")
+                _info_open.set(True)
+
+        hdr.bind("<Button-1>", _toggle)
+        hdr_lbl.bind("<Button-1>", _toggle)
 
         def row(label: str, value: str, wrap: bool = False):
             tk.Label(
-                parent, text=label,
+                body, text=label,
                 font=("Segoe UI", 8),
                 fg=TEXT_G, bg=BG_PANEL, anchor="w",
             ).pack(fill=tk.X, padx=14, pady=(8, 0))
             tk.Label(
-                parent, text=value,
+                body, text=value,
                 font=("Segoe UI", 10, "bold"),
                 fg=TEXT_W, bg=BG_PANEL, anchor="w",
                 wraplength=178, justify=tk.LEFT,
             ).pack(fill=tk.X, padx=14, pady=(1, 0))
-            tk.Frame(parent, bg="#1e1e3a", height=1).pack(fill=tk.X, padx=10, pady=(6, 0))
+            tk.Frame(body, bg="#1e1e3a", height=1).pack(fill=tk.X, padx=10, pady=(6, 0))
 
         # ── 파일명 ──
         fname = os.path.basename(self._video_path)
@@ -447,12 +469,33 @@ class VideoPanel:
         # ── 섹션 구분 ──
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(14, 8))
 
-        # ── 오버레이 ──
-        tk.Label(
-            parent, text="오버레이",
-            font=("Segoe UI", 8),
+        # ── 오버레이 (접기/펴기) ──
+        _ov_open = tk.BooleanVar(value=True)
+        _ov_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _ov_hdr.pack(fill=tk.X)
+        _ov_lbl = tk.Label(
+            _ov_hdr, text="▼  오버레이",
+            font=("Segoe UI", 10, "bold"),
             fg=TEXT_G, bg=BG_PANEL, anchor="w",
-        ).pack(fill=tk.X, padx=14, pady=(0, 4))
+        )
+        _ov_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _ov_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _ov_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _ov_body = tk.Frame(parent, bg=BG_PANEL)
+        _ov_body.pack(fill=tk.X)
+
+        def _toggle_overlay(_e=None):
+            if _ov_open.get():
+                _ov_body.pack_forget()
+                _ov_lbl.config(text="▶  오버레이")
+                _ov_open.set(False)
+            else:
+                _ov_body.pack(fill=tk.X, after=_ov_sep)
+                _ov_lbl.config(text="▼  오버레이")
+                _ov_open.set(True)
+
+        _ov_hdr.bind("<Button-1>", _toggle_overlay)
+        _ov_lbl.bind("<Button-1>", _toggle_overlay)
 
         for _var, _lbl in [
             (self._show_face,  "얼굴  (눈·코·입)"),
@@ -460,7 +503,7 @@ class VideoPanel:
             (self._show_hands, "손  (손가락·손바닥)"),
         ]:
             tk.Checkbutton(
-                parent, text=_lbl, variable=_var,
+                _ov_body, text=_lbl, variable=_var,
                 font=("Segoe UI", 10),
                 fg=TEXT_W, bg=BG_PANEL,
                 selectcolor="#0f3460",
@@ -468,7 +511,7 @@ class VideoPanel:
                 anchor="w",
             ).pack(fill=tk.X, padx=10, pady=(0, 2))
         tk.Checkbutton(
-            parent, text="랜드마크 이름",
+            _ov_body, text="랜드마크 이름",
             variable=self._show_names,
             font=("Segoe UI", 10),
             fg="#ffdd88", bg=BG_PANEL,
@@ -477,7 +520,7 @@ class VideoPanel:
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(4, 2))
         tk.Checkbutton(
-            parent, text="얼굴 모자이크",
+            _ov_body, text="얼굴 모자이크",
             variable=self._show_mosaic,
             font=("Segoe UI", 10),
             fg="#ff8888", bg=BG_PANEL,
@@ -486,10 +529,38 @@ class VideoPanel:
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(2, 2))
 
-        # ── 애니화 ──────────────────────────────────────────────────────────
+        # ── 애니화 (접기/펴기) ───────────────────────────────────────────────
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        _an_open = tk.BooleanVar(value=True)
+        _an_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _an_hdr.pack(fill=tk.X)
+        _an_lbl = tk.Label(
+            _an_hdr, text="▼  애니화",
+            font=("Segoe UI", 10, "bold"),
+            fg="#88ddff", bg=BG_PANEL, anchor="w",
+        )
+        _an_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _an_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _an_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _an_body = tk.Frame(parent, bg=BG_PANEL)
+        _an_body.pack(fill=tk.X)
+
+        def _toggle_anime(_e=None):
+            if _an_open.get():
+                _an_body.pack_forget()
+                _an_lbl.config(text="▶  애니화")
+                _an_open.set(False)
+            else:
+                _an_body.pack(fill=tk.X, after=_an_sep)
+                _an_lbl.config(text="▼  애니화")
+                _an_open.set(True)
+
+        _an_hdr.bind("<Button-1>", _toggle_anime)
+        _an_lbl.bind("<Button-1>", _toggle_anime)
+
         tk.Checkbutton(
-            parent, text="🎨 애니화  (내보내기 전용)",
+            _an_body, text="🎨 내보내기 전용",
             variable=self._show_anime_var,
             font=("Segoe UI", 10, "bold"),
             fg="#88ddff", bg=BG_PANEL,
@@ -499,10 +570,10 @@ class VideoPanel:
         ).pack(fill=tk.X, padx=10, pady=(0, 4))
 
         # 스타일
-        tk.Label(parent, text="  스타일",
+        tk.Label(_an_body, text="  스타일",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
                  ).pack(fill=tk.X, padx=14)
-        _sf = tk.Frame(parent, bg=BG_PANEL)
+        _sf = tk.Frame(_an_body, bg=BG_PANEL)
         _sf.pack(fill=tk.X, padx=20, pady=(0, 4))
         for _sv, _sl in [("animegan", "AnimeGAN"), ("opencv", "OpenCV")]:
             tk.Radiobutton(
@@ -514,10 +585,10 @@ class VideoPanel:
             ).pack(side=tk.LEFT, padx=(0, 8))
 
         # 배경
-        tk.Label(parent, text="  배경",
+        tk.Label(_an_body, text="  배경",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
                  ).pack(fill=tk.X, padx=14)
-        _bf = tk.Frame(parent, bg=BG_PANEL)
+        _bf = tk.Frame(_an_body, bg=BG_PANEL)
         _bf.pack(fill=tk.X, padx=20, pady=(0, 4))
         for _bv, _bl in [("original", "원본"), ("blur", "블러"), ("solid", "단색")]:
             tk.Radiobutton(
@@ -529,7 +600,7 @@ class VideoPanel:
 
         # ONNX 모델 선택 (AnimeGAN용)
         self._anime_model_btn = tk.Button(
-            parent, text="  ONNX 모델 선택",
+            _an_body, text="  ONNX 모델 선택",
             font=("Segoe UI", 9),
             bg="#1e3a5f", fg=TEXT_W,
             activebackground="#2a4f80", activeforeground="white",
@@ -539,7 +610,7 @@ class VideoPanel:
         )
         self._anime_model_btn.pack(fill=tk.X, padx=20, pady=(0, 2))
         self._anime_model_lbl = tk.Label(
-            parent, text="미선택 (OpenCV로 대체)",
+            _an_body, text="미선택 (OpenCV로 대체)",
             font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
             wraplength=160,
         )
@@ -566,12 +637,36 @@ class VideoPanel:
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
-        # ── 얼굴 이미지 오버레이 ──
-        tk.Label(parent, text="얼굴 이미지",
-                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
-                 ).pack(fill=tk.X, padx=14, pady=(0, 4))
+        # ── 얼굴 이미지 (접기/펴기) ──
+        _fi_open = tk.BooleanVar(value=True)
+        _fi_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _fi_hdr.pack(fill=tk.X)
+        _fi_lbl = tk.Label(
+            _fi_hdr, text="▼  얼굴 이미지",
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        )
+        _fi_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _fi_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _fi_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _fi_body = tk.Frame(parent, bg=BG_PANEL)
+        _fi_body.pack(fill=tk.X)
+
+        def _toggle_face_img(_e=None):
+            if _fi_open.get():
+                _fi_body.pack_forget()
+                _fi_lbl.config(text="▶  얼굴 이미지")
+                _fi_open.set(False)
+            else:
+                _fi_body.pack(fill=tk.X, after=_fi_sep)
+                _fi_lbl.config(text="▼  얼굴 이미지")
+                _fi_open.set(True)
+
+        _fi_hdr.bind("<Button-1>", _toggle_face_img)
+        _fi_lbl.bind("<Button-1>", _toggle_face_img)
+
         self._face_img_btn = tk.Button(
-            parent, text="🖼  이미지 로드",
+            _fi_body, text="🖼  이미지 로드",
             font=("Segoe UI", 10, "bold"),
             bg="#1e3a5f", fg=TEXT_W,
             activebackground="#2a4f80", activeforeground="white",
@@ -581,40 +676,39 @@ class VideoPanel:
         )
         self._face_img_btn.pack(fill=tk.X, padx=10, pady=(0, 2))
         self._face_img_lbl = tk.Label(
-            parent, text="미선택",
+            _fi_body, text="미선택",
             font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
             wraplength=178,
         )
         self._face_img_lbl.pack(fill=tk.X, padx=14, pady=(0, 2))
-        # 그림/일러스트 조정 슬라이더
-        tk.Label(parent, text="눈 위치 Y (%)",
+        tk.Label(_fi_body, text="눈 위치 Y (%)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
                  ).pack(fill=tk.X, padx=14)
-        tk.Scale(parent, from_=10, to=90, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=10, to=90, orient=tk.HORIZONTAL,
                  variable=self._eye_y_var, length=160,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
                  highlightthickness=0, showvalue=True,
                  ).pack(padx=10, pady=(0, 2))
-        tk.Label(parent, text="눈 위치 X (%)",
+        tk.Label(_fi_body, text="눈 위치 X (%)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
                  ).pack(fill=tk.X, padx=14)
-        tk.Scale(parent, from_=10, to=90, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=10, to=90, orient=tk.HORIZONTAL,
                  variable=self._eye_x_var, length=160,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
                  highlightthickness=0, showvalue=True,
                  ).pack(padx=10, pady=(0, 2))
-        tk.Label(parent, text="크기 (%)",
+        tk.Label(_fi_body, text="크기 (%)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
                  ).pack(fill=tk.X, padx=14)
-        tk.Scale(parent, from_=30, to=300, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=30, to=300, orient=tk.HORIZONTAL,
                  variable=self._img_size_var, length=160,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
                  highlightthickness=0, showvalue=True,
                  ).pack(padx=10, pady=(0, 2))
-        tk.Label(parent, text="떨림 보정 (0=없음  →  95=최대)",
+        tk.Label(_fi_body, text="떨림 보정 (0=없음  →  95=최대)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
                  ).pack(fill=tk.X, padx=14)
-        tk.Scale(parent, from_=0, to=95, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=0, to=95, orient=tk.HORIZONTAL,
                  variable=self._ema_smooth_var, length=160,
                  bg=BG_PANEL, fg="#88ddff", troughcolor="#0f3460",
                  highlightthickness=0, showvalue=True,

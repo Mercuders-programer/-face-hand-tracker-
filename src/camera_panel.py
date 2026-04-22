@@ -344,15 +344,41 @@ class CameraPanel:
 
         self._separator(right)
 
-        # ── 랜드마크 표시 ──
-        self._section_label(right, "오버레이")
+        # ── 오버레이 (접기/펴기) ──
+        _ov_open = tk.BooleanVar(value=True)
+        _ov_hdr = tk.Frame(right, bg=BG_PANEL, cursor="hand2")
+        _ov_hdr.pack(fill=tk.X)
+        _ov_lbl = tk.Label(
+            _ov_hdr, text="▼  오버레이",
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT_G, bg=BG_PANEL,
+        )
+        _ov_lbl.pack(pady=(14, 4))
+        _ov_sep = ttk.Separator(right, orient="horizontal")
+        _ov_sep.pack(fill=tk.X, pady=(0, 4), padx=12)
+        _ov_body = tk.Frame(right, bg=BG_PANEL)
+        _ov_body.pack(fill=tk.X)
+
+        def _toggle_overlay(_e=None):
+            if _ov_open.get():
+                _ov_body.pack_forget()
+                _ov_lbl.config(text="▶  오버레이")
+                _ov_open.set(False)
+            else:
+                _ov_body.pack(fill=tk.X, after=_ov_sep)
+                _ov_lbl.config(text="▼  오버레이")
+                _ov_open.set(True)
+
+        _ov_hdr.bind("<Button-1>", _toggle_overlay)
+        _ov_lbl.bind("<Button-1>", _toggle_overlay)
+
         for _var, _lbl in [
             (self._show_face,  "얼굴  (눈·코·입)"),
             (self._show_body,  "몸  (몸통·팔·다리)"),
             (self._show_hands, "손  (손가락·손바닥)"),
         ]:
             tk.Checkbutton(
-                right, text=_lbl, variable=_var,
+                _ov_body, text=_lbl, variable=_var,
                 font=("Segoe UI", 10),
                 fg=TEXT_W, bg=BG_PANEL,
                 selectcolor=BG_CTRL,
@@ -360,7 +386,7 @@ class CameraPanel:
                 anchor=tk.W,
             ).pack(fill=tk.X, padx=8, pady=(0, 2))
         tk.Checkbutton(
-            right, text="랜드마크 이름",
+            _ov_body, text="랜드마크 이름",
             variable=self._show_names,
             font=("Segoe UI", 10),
             fg="#ffdd88", bg=BG_PANEL,
@@ -369,7 +395,7 @@ class CameraPanel:
             anchor=tk.W,
         ).pack(fill=tk.X, padx=8, pady=(4, 2))
         tk.Checkbutton(
-            right, text="얼굴 모자이크",
+            _ov_body, text="얼굴 모자이크",
             variable=self._show_mosaic,
             font=("Segoe UI", 10),
             fg="#ff8888", bg=BG_PANEL,
@@ -377,45 +403,71 @@ class CameraPanel:
             activeforeground="#ff8888", activebackground=BG_PANEL,
             anchor=tk.W,
         ).pack(fill=tk.X, padx=8, pady=(2, 2))
+
         self._separator(right)
 
-        # ── 얼굴 이미지 오버레이 ──
-        self._section_label(right, "얼굴 이미지")
+        # ── 얼굴 이미지 (접기/펴기) ──
+        _fi_open = tk.BooleanVar(value=True)
+        _fi_hdr = tk.Frame(right, bg=BG_PANEL, cursor="hand2")
+        _fi_hdr.pack(fill=tk.X)
+        _fi_lbl = tk.Label(
+            _fi_hdr, text="▼  얼굴 이미지",
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT_G, bg=BG_PANEL,
+        )
+        _fi_lbl.pack(pady=(14, 4))
+        _fi_sep = ttk.Separator(right, orient="horizontal")
+        _fi_sep.pack(fill=tk.X, pady=(0, 4), padx=12)
+        _fi_body = tk.Frame(right, bg=BG_PANEL)
+        _fi_body.pack(fill=tk.X)
+
+        def _toggle_face_img(_e=None):
+            if _fi_open.get():
+                _fi_body.pack_forget()
+                _fi_lbl.config(text="▶  얼굴 이미지")
+                _fi_open.set(False)
+            else:
+                _fi_body.pack(fill=tk.X, after=_fi_sep)
+                _fi_lbl.config(text="▼  얼굴 이미지")
+                _fi_open.set(True)
+
+        _fi_hdr.bind("<Button-1>", _toggle_face_img)
+        _fi_lbl.bind("<Button-1>", _toggle_face_img)
+
         self._face_img_btn = self._make_btn(
-            right, "이미지 로드", BG_CTRL,
+            _fi_body, "이미지 로드", BG_CTRL,
             command=self._toggle_face_image,
         )
         self._face_img_lbl = tk.Label(
-            right, text="미선택",
+            _fi_body, text="미선택",
             font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL,
             wraplength=CTRL_W - 20,
         )
         self._face_img_lbl.pack(pady=(0, 2))
-        # 그림/일러스트 조정 슬라이더 (Affine 자동 모드에서 사용)
-        tk.Label(right, text="눈 위치 Y (%)",
+        tk.Label(_fi_body, text="눈 위치 Y (%)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
-        tk.Scale(right, from_=10, to=90, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=10, to=90, orient=tk.HORIZONTAL,
                  variable=self._eye_y_var, length=170,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
                  highlightthickness=0, showvalue=True,
                  ).pack(pady=(0, 2))
-        tk.Label(right, text="눈 위치 X (%)",
+        tk.Label(_fi_body, text="눈 위치 X (%)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
-        tk.Scale(right, from_=10, to=90, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=10, to=90, orient=tk.HORIZONTAL,
                  variable=self._eye_x_var, length=170,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
                  highlightthickness=0, showvalue=True,
                  ).pack(pady=(0, 2))
-        tk.Label(right, text="크기 (%)",
+        tk.Label(_fi_body, text="크기 (%)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
-        tk.Scale(right, from_=30, to=300, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=30, to=300, orient=tk.HORIZONTAL,
                  variable=self._img_size_var, length=170,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
                  highlightthickness=0, showvalue=True,
                  ).pack(pady=(0, 2))
-        tk.Label(right, text="떨림 보정 (0=없음  →  95=최대)",
+        tk.Label(_fi_body, text="떨림 보정 (0=없음  →  95=최대)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
-        tk.Scale(right, from_=0, to=95, orient=tk.HORIZONTAL,
+        tk.Scale(_fi_body, from_=0, to=95, orient=tk.HORIZONTAL,
                  variable=self._ema_smooth_var, length=170,
                  bg=BG_PANEL, fg="#88ddff", troughcolor=BG_CTRL,
                  highlightthickness=0, showvalue=True,
