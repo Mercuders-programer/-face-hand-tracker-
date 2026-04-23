@@ -960,8 +960,16 @@ class VideoPanel:
             ch = 480
 
         img = Image.fromarray(rgb)
-        img = img.resize((cw, ch), Image.BILINEAR)
-        self._photo = ImageTk.PhotoImage(img)
+        # 종횡비 유지 (레터박스/필러박스)
+        vw, vh = img.size
+        scale = min(cw / vw, ch / vh)
+        nw, nh = int(vw * scale), int(vh * scale)
+        img = img.resize((nw, nh), Image.BILINEAR)
+        canvas_img = Image.new("RGB", (cw, ch), (0, 0, 0))
+        ox = (cw - nw) // 2
+        oy = (ch - nh) // 2
+        canvas_img.paste(img, (ox, oy))
+        self._photo = ImageTk.PhotoImage(canvas_img)
         self._canvas.delete("all")
         self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
 
