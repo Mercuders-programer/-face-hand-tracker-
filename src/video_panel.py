@@ -284,6 +284,11 @@ class VideoPanel:
         self._anime_model_path = ""
         self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
+        self._zoom               = 1.0               # 줌 배율 (1.0 = 100%)
+        self._zoom_var           = tk.StringVar(value="100%")
+        self._pan_x              = 0                 # 패닝 오프셋 (확대 이미지 픽셀 기준)
+        self._pan_y              = 0
+        self._pan_start          = None              # 중간 버튼 드래그 시작점
         self._export_status_var  = tk.StringVar(value="")
         self._face_det      = None
         self._hand_det      = None
@@ -362,6 +367,11 @@ class VideoPanel:
             highlightthickness=1, highlightbackground="#333355",
         )
         self._canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
+        self._canvas.bind("<Enter>",            self._canvas_wheel_enter)
+        self._canvas.bind("<Leave>",            self._canvas_wheel_leave)
+        self._canvas.bind("<ButtonPress-2>",    self._pan_start_cb)
+        self._canvas.bind("<B2-Motion>",        self._pan_drag_cb)
+        self._canvas.bind("<ButtonRelease-2>",  self._pan_end_cb)
 
         # 타임라인 캔버스
         self._tl = tk.Canvas(
@@ -394,6 +404,12 @@ class VideoPanel:
             font=("Segoe UI", 11),
             fg=TEXT_W, bg=BG_DARK,
         ).pack(side=tk.LEFT)
+        tk.Label(ctrl, text="  |", font=("Segoe UI", 11), fg=TEXT_G, bg=BG_DARK).pack(side=tk.LEFT)
+        tk.Label(
+            ctrl, textvariable=self._zoom_var,
+            font=("Segoe UI", 11, "bold"),
+            fg=ACCENT, bg=BG_DARK,
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
     # ── 파일 정보 패널 ─────────────────────────────────────────────────────
     def _build_info_panel(self, parent):
@@ -960,18 +976,91 @@ class VideoPanel:
             ch = 480
 
         img = Image.fromarray(rgb)
-        # 종횡비 유지 (레터박스/필러박스)
         vw, vh = img.size
-        scale = min(cw / vw, ch / vh)
-        nw, nh = int(vw * scale), int(vh * scale)
-        img = img.resize((nw, nh), Image.BILINEAR)
-        canvas_img = Image.new("RGB", (cw, ch), (0, 0, 0))
-        ox = (cw - nw) // 2
-        oy = (ch - nh) // 2
-        canvas_img.paste(img, (ox, oy))
+        base_scale = min(cw / vw, ch / vh)
+        zoom = self._zoom
+
+        if zoom <= 1.0:
+            # 레터박스/필러박스 (기존 동작)
+            scale = base_scale * zoom
+            nw, nh = int(vw * scale), int(vh * scale)
+            img = img.resize((nw, nh), Image.BILINEAR)
+            canvas_img = Image.new("RGB", (cw, ch), (0, 0, 0))
+            ox = (cw - nw) // 2
+            oy = (ch - nh) // 2
+            canvas_img.paste(img, (ox, oy))
+        else:
+            # zoom > 100%: 확대 후 pan 오프셋 적용 크롭
+            scale = base_scale * zoom
+            nw, nh = int(vw * scale), int(vh * scale)
+            img = img.resize((nw, nh), Image.BILINEAR)
+            cx = (nw - cw) // 2 - self._pan_x
+            cy = (nh - ch) // 2 - self._pan_y
+            cx = max(0, min(max(0, nw - cw), cx))
+            cy = max(0, min(max(0, nh - ch), cy))
+            x2 = min(nw, cx + cw)
+            y2 = min(nh, cy + ch)
+            img = img.crop((cx, cy, x2, y2))
+            cw_c, ch_c = img.size
+            canvas_img = Image.new("RGB", (cw, ch), (0, 0, 0))
+            canvas_img.paste(img, ((cw - cw_c) // 2, (ch - ch_c) // 2))
         self._photo = ImageTk.PhotoImage(canvas_img)
         self._canvas.delete("all")
         self._canvas.create_image(0, 0, anchor=tk.NW, image=self._photo)
+
+    def _canvas_wheel_enter(self, _event):
+        self._canvas.bind_all("<MouseWheel>", self._on_zoom)
+        self._canvas.bind_all("<Button-4>",   self._on_zoom)
+        self._canvas.bind_all("<Button-5>",   self._on_zoom)
+
+    def _canvas_wheel_leave(self, _event):
+        self._canvas.unbind_all("<MouseWheel>")
+        self._canvas.unbind_all("<Button-4>")
+        self._canvas.unbind_all("<Button-5>")
+
+    def _on_zoom(self, event):
+        if event.num == 4:
+            delta = +1
+        elif event.num == 5:
+            delta = -1
+        else:
+            delta = int(event.delta / 120)
+        new_zoom = round(self._zoom + 0.1 * delta, 2)
+        new_zoom = max(0.1, min(5.0, new_zoom))
+        if new_zoom == self._zoom:
+            return
+        self._zoom = new_zoom
+        if new_zoom <= 1.0:
+            self._pan_x = 0
+            self._pan_y = 0
+        self._zoom_var.set(f"{int(round(new_zoom * 100))}%")
+        self._refresh_frame()
+
+    def _reset_zoom(self):
+        self._zoom = 1.0
+        self._zoom_var.set("100%")
+        self._pan_x = 0
+        self._pan_y = 0
+        self._refresh_frame()
+
+    def _pan_start_cb(self, event):
+        if self._zoom > 1.0:
+            self._pan_start = (event.x, event.y)
+            self._canvas.config(cursor="fleur")
+
+    def _pan_drag_cb(self, event):
+        if self._pan_start is None:
+            return
+        dx = event.x - self._pan_start[0]
+        dy = event.y - self._pan_start[1]
+        self._pan_start = (event.x, event.y)
+        self._pan_x += dx
+        self._pan_y += dy
+        self._refresh_frame()
+
+    def _pan_end_cb(self, _event):
+        self._pan_start = None
+        self._canvas.config(cursor="")
 
     def _apply_overlay(self, bgr, playback=False):
         """오버레이 렌더링."""

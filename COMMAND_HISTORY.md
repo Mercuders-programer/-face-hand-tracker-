@@ -9,6 +9,9 @@
 cd C:\Users\PHS\Desktop\Claude_Code\my_openPose_proj\
 python app.py
 
+// git hub
+https://github.com/Mercuders-programer/-face-hand-tracker-.git 
+
 
 ## 2026-04-06
 
@@ -134,6 +137,8 @@ python app.py
 | # | 명령 / 질문 | 결과 |
 |---|-------------|------|
 | 73 | 얼굴 이미지 오버레이에 "노멀(입 닫힘)" + "입 벌림" 두 장 로드, MAR 기반으로 자동 전환 | `camera_panel.py`, `video_panel.py` — `_compute_mar()` 추가, `_face_img_open`/`_mouth_thr_var` 상태 변수, "입 벌림 이미지 로드" 버튼+라벨+임계값 슬라이더(0.02~0.30) UI, `_toggle_face_image_open`/`_load_face_image_open` 메서드, 렌더링 루프에 MAR 분기 추가 |
+| 74 | 영상 분석 뷰에 마우스 휠 줌 기능 추가, 확대 % 시간 표시 오른쪽에 실시간 표시 | `video_panel.py` — `_zoom`/`_zoom_var` 상태 변수, `_canvas_wheel_enter/leave`/`_on_zoom`/`_reset_zoom` 메서드, Canvas Enter/Leave 바인딩, `_display_frame` zoom 분기(≤1.0 레터박스 / >1.0 중앙 크롭), 컨트롤바에 구분선+퍼센트 라벨 추가 |
+| 75 | 영상 분석 뷰에서 마우스 중간 버튼 드래그로 팬(이동) 기능 추가 | `video_panel.py` — `_pan_x`/`_pan_y`/`_pan_start` 상태 변수, `ButtonPress-2`/`B2-Motion`/`ButtonRelease-2` 바인딩, `_pan_start_cb`/`_pan_drag_cb`/`_pan_end_cb` 메서드, zoom>1.0 크롭에 pan 오프셋 적용, zoom≤1.0 시 pan 자동 리셋 |
 
 ---
 
