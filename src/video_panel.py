@@ -83,6 +83,19 @@ def _adaptive_ema_update(state: dict, key: str, value: float,
     return state[key]
 
 
+def _compute_mar(face_res, w: int, h: int) -> float:
+    """Mouth Aspect Ratio: 윗입술(13)~아랫입술(14) / 눈 간격(33-263)
+    입 닫힘 ~0.04, 입 벌림 ~0.15+"""
+    if not face_res.face_landmarks:
+        return 0.0
+    lf = face_res.face_landmarks[0]
+    if len(lf) < 292:
+        return 0.0
+    mouth_gap = abs(lf[14].y - lf[13].y) * h
+    eye_dist  = abs(lf[263].x - lf[33].x) * w
+    return mouth_gap / eye_dist if eye_dist > 1 else 0.0
+
+
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                              eye_y_pct=55, eye_x_pct=50, size_pct=100,
                              ema_state: dict | None = None):
@@ -281,6 +294,9 @@ class VideoPanel:
         self._det_cache     = None  # 재생 중 감지 결과 캐시
         self._face_img      = None  # BGRA numpy array (얼굴 이미지)
         self._face_img_pts  = None  # 소스 키포인트 (None = Affine 자동 모드)
+        self._face_img_open     = None   # BGRA (입 벌림 이미지)
+        self._face_img_open_pts = None
+        self._mouth_thr_var     = tk.DoubleVar(value=0.12)
         self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
         self._eye_x_var     = tk.IntVar(value=50)   # 눈 위치 X (%)
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
@@ -381,6 +397,9 @@ class VideoPanel:
 
     # ── 파일 정보 패널 ─────────────────────────────────────────────────────
     def _build_info_panel(self, parent):
+        # 접기/펴기 섹션 목록 (- 키 토글용)
+        self._panel_sections: list = []
+
         # 상단 accent 바
         tk.Frame(parent, bg=ACCENT, height=3).pack(fill=tk.X)
 
@@ -414,6 +433,7 @@ class VideoPanel:
 
         hdr.bind("<Button-1>", _toggle)
         hdr_lbl.bind("<Button-1>", _toggle)
+        self._panel_sections.append((_info_open, _toggle))
 
         def row(label: str, value: str, wrap: bool = False):
             tk.Label(
@@ -496,6 +516,7 @@ class VideoPanel:
 
         _ov_hdr.bind("<Button-1>", _toggle_overlay)
         _ov_lbl.bind("<Button-1>", _toggle_overlay)
+        self._panel_sections.append((_ov_open, _toggle_overlay))
 
         for _var, _lbl in [
             (self._show_face,  "얼굴  (눈·코·입)"),
@@ -558,6 +579,7 @@ class VideoPanel:
 
         _an_hdr.bind("<Button-1>", _toggle_anime)
         _an_lbl.bind("<Button-1>", _toggle_anime)
+        self._panel_sections.append((_an_open, _toggle_anime))
 
         tk.Checkbutton(
             _an_body, text="🎨 내보내기 전용",
@@ -664,6 +686,7 @@ class VideoPanel:
 
         _fi_hdr.bind("<Button-1>", _toggle_face_img)
         _fi_lbl.bind("<Button-1>", _toggle_face_img)
+        self._panel_sections.append((_fi_open, _toggle_face_img))
 
         self._face_img_btn = tk.Button(
             _fi_body, text="🖼  이미지 로드",
@@ -715,7 +738,40 @@ class VideoPanel:
                  command=self._on_ema_smooth_change,
                  ).pack(padx=10, pady=(0, 4))
 
+        tk.Frame(_fi_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(2, 6))
+
+        self._face_img_open_btn = tk.Button(
+            _fi_body, text="🖼  입 벌림 이미지 로드",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=6, anchor="w", padx=12,
+            command=self._toggle_face_image_open,
+        )
+        self._face_img_open_btn.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self._face_img_open_lbl = tk.Label(
+            _fi_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+            wraplength=178,
+        )
+        self._face_img_open_lbl.pack(fill=tk.X, padx=14, pady=(0, 2))
+        tk.Label(_fi_body, text="전환 임계값 (MAR)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        self._mouth_thr_scale = tk.Scale(
+            _fi_body, from_=0.02, to=0.30, resolution=0.01, orient=tk.HORIZONTAL,
+            variable=self._mouth_thr_var, length=160,
+            bg=BG_PANEL, fg="#ffcc88", troughcolor="#0f3460",
+            highlightthickness=0, showvalue=True,
+            state=tk.DISABLED,
+        )
+        self._mouth_thr_scale.pack(padx=10, pady=(0, 4))
+
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        self.win.bind('-', self._toggle_all_sections)
+        self.win.bind('<space>', lambda e: self._toggle_play())
 
         # ── 내보내기 ──
         tk.Label(
@@ -1020,6 +1076,11 @@ class VideoPanel:
         _fi = self._face_img
         _fp = self._face_img_pts
         if _fi is not None:
+            if self._face_img_open is not None:
+                _mar = _compute_mar(face_res, _ow, _oh)
+                if _mar >= self._mouth_thr_var.get():
+                    _fi = self._face_img_open
+                    _fp = self._face_img_open_pts
             _apply_face_img_overlay(overlay, face_res, _ow, _oh, _fi, _fp,
                                     eye_y_pct=self._eye_y_var.get(),
                                     eye_x_pct=self._eye_x_var.get(),
@@ -1138,6 +1199,17 @@ class VideoPanel:
         if path:
             self._anime_model_path = path
             self._anime_model_lbl.config(text=os.path.basename(path))
+
+    def _toggle_all_sections(self, _e=None):
+        """- 키: 하나라도 열려 있으면 전체 접기, 모두 닫혀 있으면 전체 펴기."""
+        if any(s.get() for s, _ in self._panel_sections):
+            for s, fn in self._panel_sections:
+                if s.get():
+                    fn()
+        else:
+            for s, fn in self._panel_sections:
+                if not s.get():
+                    fn()
 
     def _on_anime_style_change(self):
         """스타일 라디오 변경 시 모델 버튼 상태 업데이트."""
@@ -1424,6 +1496,76 @@ class VideoPanel:
         self._det_cache = None
         self._face_img_lbl.config(text=os.path.basename(path) + mode_text)
         self._face_img_btn.config(text="× 이미지 제거")
+        self._refresh_frame()
+
+    # ── 입 벌림 이미지 로드/제거 ──────────────────────────────────────────
+    def _toggle_face_image_open(self):
+        if self._face_img_open is not None:
+            self._face_img_open = None
+            self._face_img_open_pts = None
+            self._face_img_open_lbl.config(text="미선택")
+            self._face_img_open_btn.config(text="🖼  입 벌림 이미지 로드")
+            self._mouth_thr_scale.config(state=tk.DISABLED)
+            self._det_cache = None
+            self._refresh_frame()
+        else:
+            self._load_face_image_open()
+
+    def _load_face_image_open(self):
+        if self._face_det is None:
+            messagebox.showerror("오류", "MediaPipe 초기화에 실패했습니다.", parent=self.win)
+            return
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="입 벌림 이미지 선택",
+            filetypes=[("이미지", "*.png *.jpg *.jpeg *.webp *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            from PIL import Image as PilImg
+            pil_img = PilImg.open(path).convert("RGBA")
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGBA2BGRA)
+        except Exception as e:
+            messagebox.showerror("오류", f"이미지 로드 실패:\n{e}", parent=self.win)
+            return
+
+        h, w = img.shape[:2]
+        if w > 1024:
+            scale = 1024 / w
+            img = cv2.resize(img, (1024, int(h * scale)), interpolation=cv2.INTER_AREA)
+            h, w = img.shape[:2]
+
+        mask = img[:, :, 3]
+        if mask.min() == 255:
+            tmp = img.copy()
+            white = (tmp[:, :, 0] > 240) & (tmp[:, :, 1] > 240) & (tmp[:, :, 2] > 240)
+            tmp[white, 3] = 0
+            img = tmp
+
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        try:
+            mp_img_src = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            face_res = self._face_det.detect(mp_img_src)
+        except Exception as e:
+            messagebox.showerror("오류", f"얼굴 감지 실패:\n{e}", parent=self.win)
+            return
+
+        if (face_res.face_landmarks
+                and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT)):
+            lf = face_res.face_landmarks[0]
+            src_pts = np.float32([[lf[i].x * w, lf[i].y * h] for i in _FACE_IMG_KPT])
+            mode_text = " [정밀]"
+        else:
+            src_pts = None
+            mode_text = " [자동]"
+
+        self._face_img_open = img.copy()
+        self._face_img_open_pts = src_pts
+        self._det_cache = None
+        self._face_img_open_lbl.config(text=os.path.basename(path) + mode_text)
+        self._face_img_open_btn.config(text="× 입 벌림 제거")
+        self._mouth_thr_scale.config(state=tk.NORMAL)
         self._refresh_frame()
 
     # ── 종료 ──────────────────────────────────────────────────────────────

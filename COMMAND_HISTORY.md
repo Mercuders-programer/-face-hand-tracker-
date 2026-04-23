@@ -117,4 +117,24 @@ python app.py
 
 ---
 
+## 2026-04-21
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 68 | 얼굴 이미지 오버레이가 가만히 있어도 크기가 떨림 — 떨림 보정해줘 | `camera_panel.py` — `_ema_update()` 헬퍼 추가, `_apply_face_img_overlay`에 `ema_state` 파라미터 적용, `_face_img_ema` dict 추가 (EMA α=0.15) |
+| 69 | 슬라이더로 떨림 보정 강도 조절할 수 있게 해줘 | `camera_panel.py` — 떨림 보정 슬라이더(0~95) 추가, `_on_ema_smooth_change()` 콜백으로 alpha 동적 변경 |
+| 70 | 영상 분석 패널에도 떨림 보정 슬라이더 추가해줘 | `video_panel.py` — 동일 EMA 슬라이더 및 상태 dict 추가 |
+| 71 | 정지 시 강한 보정, 빠른 움직임 시 즉각 추적 — Adaptive EMA로 개선 | `camera_panel.py`, `video_panel.py` — `_ema_update` → `_adaptive_ema_update` 교체, 변화량 비례 alpha 자동 조정 |
+| 72 | 사이드 패널 섹션 접기/펴기 토글 추가해줘 | `camera_panel.py`, `video_panel.py` — 섹션 헤더 클릭 시 body pack/forget, `-` 단축키로 전체 토글, `_panel_sections` 리스트 관리 |
+
+---
+
+## 2026-04-23
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 73 | 얼굴 이미지 오버레이에 "노멀(입 닫힘)" + "입 벌림" 두 장 로드, MAR 기반으로 자동 전환 | `camera_panel.py`, `video_panel.py` — `_compute_mar()` 추가, `_face_img_open`/`_mouth_thr_var` 상태 변수, "입 벌림 이미지 로드" 버튼+라벨+임계값 슬라이더(0.02~0.30) UI, `_toggle_face_image_open`/`_load_face_image_open` 메서드, 렌더링 루프에 MAR 분기 추가 |
+
+---
+
 <!-- 새 명령/질문 발생 시 위 표에 행 추가 -->
