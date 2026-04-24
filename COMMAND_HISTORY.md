@@ -142,4 +142,43 @@ https://github.com/Mercuders-programer/-face-hand-tracker-.git
 
 ---
 
+## 2026-04-24
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 76 | 사이드 패널 "기본" / "이미지" 탭으로 분리해줘 | `video_panel.py`, `camera_panel.py` — ttk.Notebook 추가, 기본 탭(파일정보·오버레이 등) / 이미지 탭(얼굴·팔 이미지) 분리 |
+| 77 | Puppet Pin 팔 이미지 변형 구현 — 어깨→팔꿈치 / 팔꿈치→손목 독립 세그먼트 | `src/puppet_pin.py` 신규 생성 (PuppetPins/SegmentCache/build_segment_cache/apply_puppet_warp). `video_panel.py`, `camera_panel.py` — _apply_arm_img_overlay Puppet Pin/Legacy 분기, 핀 UI(피벗 설정 버튼+상태 레이블), _open_pin_picker 팝업(3점 클릭 마커), 이미지 로드 시 자동 팝업 |
+| 78 | `rtk gain` 결과 command_history.md에 업데이트 | COMMAND_HISTORY.md — RTK 절약 현황 섹션 추가 |
+
+---
+
+## RTK 토큰 절약 현황 (2026-04-24 기준)
+
+```
+Total commands:    21
+Input tokens:      19.6K
+Output tokens:     18.6K
+Tokens saved:      1.0K (5.3%)
+Total exec time:   2.9s (avg 140ms)
+Efficiency meter: █░░░░░░░░░░░░░░░░░░░░░░░ 5.3%
+
+By Command
+───────────────────────────────────────────────────────────────────────
+  #  Command                   Count  Saved    Avg%    Time  Impact
+───────────────────────────────────────────────────────────────────────
+ 1.  rtk ls -la /mnt/c/Use...      2    669   71.5%    64ms  ██████████
+ 2.  rtk ls -la /mnt/c/Use...      1    138   70.1%    27ms  ██░░░░░░░░
+ 3.  rtk git status                1     82   61.2%   287ms  █░░░░░░░░░
+ 4.  rtk wc -l /mnt/c/User...      2     38   95.0%     3ms  █░░░░░░░░░
+ 5.  rtk wc -l /mnt/c/User...      2     38   95.0%     3ms  █░░░░░░░░░
+ 6.  rtk git commit                1     35   97.2%   294ms  █░░░░░░░░░
+ 7.  rtk git push                  1     23   92.0%    1.7s  ░░░░░░░░░░
+ 8.  rtk grep                      7      9    1.7%    41ms  ░░░░░░░░░░
+ 9.  rtk find                      1      3   60.0%    50ms  ░░░░░░░░░░
+10.  rtk read                      1      0    0.0%     1ms  ░░░░░░░░░░
+───────────────────────────────────────────────────────────────────────
+```
+
+---
+
 <!-- 새 명령/질문 발생 시 위 표에 행 추가 -->
