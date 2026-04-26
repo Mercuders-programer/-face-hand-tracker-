@@ -91,6 +91,8 @@ class PoseIdx:
     RIGHT_ELBOW    = 14
     LEFT_WRIST     = 15
     RIGHT_WRIST    = 16
+    LEFT_INDEX     = 19   # 왼손 검지 끝
+    RIGHT_INDEX    = 20   # 오른손 검지 끝
     LEFT_HIP       = 23
     RIGHT_HIP      = 24
     LEFT_KNEE      = 25

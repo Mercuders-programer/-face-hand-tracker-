@@ -183,23 +183,29 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
 def _apply_arm_img_overlay(overlay, pose_res, w, h, arm_img,
                             anchor_y_pct=50, anchor_x_pct=50, size_pct=100,
                             ema_state: dict | None = None,
-                            arm_pins=None, arm_seg_cache=None):
-    """로드된 오른팔 이미지(BGRA)를 오른 팔꿈치(#14) 위에 Affine 합성.
-    arm_pins/arm_seg_cache가 있으면 2-세그먼트 Puppet Pin 모드,
-    없으면 기존 Legacy(단일 Affine) 모드."""
+                            arm_pins=None, arm_seg_cache=None, side='right'):
+    """로드된 팔 이미지(BGRA)를 팔꿈치 위에 Affine 합성.
+    arm_pins/arm_seg_cache가 있으면 Puppet Pin 모드 (2 or 3-세그먼트),
+    없으면 기존 Legacy(단일 Affine) 모드.
+    side='right': 랜드마크 12/14/16/20, 'left': 11/13/15/19"""
     if not pose_res.pose_landmarks:
         if ema_state is not None:
             for _k in ('elbow_x', 'elbow_y', 'angle', 'arm_len',
-                       'shldr_x', 'shldr_y', 'wrist_x', 'wrist_y'):
+                       'shldr_x', 'shldr_y', 'wrist_x', 'wrist_y',
+                       'hand_x', 'hand_y'):
                 ema_state[_k] = None
         return
+    if side == 'right':
+        shldr_idx, elbow_idx, wrist_idx, hand_idx = 12, 14, 16, 20
+    else:
+        shldr_idx, elbow_idx, wrist_idx, hand_idx = 11, 13, 15, 19
     img_h, img_w = arm_img.shape[:2]
     for _pl in pose_res.pose_landmarks:
-        if len(_pl) <= 16:
+        if len(_pl) <= max(shldr_idx, elbow_idx, wrist_idx):
             continue
-        shoulder = _pl[12]   # R.Shoulder
-        elbow    = _pl[14]   # R.Elbow
-        wrist    = _pl[16]   # R.Wrist
+        shoulder = _pl[shldr_idx]
+        elbow    = _pl[elbow_idx]
+        wrist    = _pl[wrist_idx]
         if shoulder.visibility < 0.3 or elbow.visibility < 0.3 or wrist.visibility < 0.3:
             continue
         raw_ex   = elbow.x * w
@@ -228,9 +234,22 @@ def _apply_arm_img_overlay(overlay, pose_res, w, h, arm_img,
             ang, aln = raw_ang, raw_len
 
         if arm_pins is not None and arm_seg_cache is not None and _PUPPET_AVAILABLE:
-            # ── Puppet Pin 모드: 2-세그먼트 Piecewise Affine ──
+            # ── Puppet Pin 모드 (2 or 3-세그먼트) ──
+            vid_hand = None
+            if arm_pins.img_hand is not None and len(_pl) > hand_idx:
+                hand_lm = _pl[hand_idx]
+                if hand_lm.visibility >= 0.2:
+                    raw_hx = hand_lm.x * w
+                    raw_hy = hand_lm.y * h
+                    if ema_state is not None:
+                        hx = _adaptive_ema_update(ema_state, 'hand_x', raw_hx, 40.0)
+                        hy = _adaptive_ema_update(ema_state, 'hand_y', raw_hy, 40.0)
+                    else:
+                        hx, hy = raw_hx, raw_hy
+                    vid_hand = (hx, hy)
             warped = apply_puppet_warp(
-                arm_seg_cache, (sx, sy), (ex, ey), (wx, wy), w, h)
+                arm_seg_cache, (sx, sy), (ex, ey), (wx, wy), w, h,
+                vid_hand=vid_hand, size_pct=float(size_pct))
         else:
             # ── Legacy 모드: 단일 Affine (기존 동작) ──
             scale  = aln * (size_pct / 100.0) / (img_h * 0.8)
@@ -408,14 +427,31 @@ class VideoPanel:
             'elbow_x': None, 'elbow_y': None,
             'shldr_x': None, 'shldr_y': None,
             'wrist_x': None, 'wrist_y': None,
+            'hand_x':  None, 'hand_y':  None,
             'angle': None, 'arm_len': None, 'alpha': 0.15,
         }
-        # Puppet Pin 상태
+        # Puppet Pin 상태 (오른팔)
         self._arm_pins       = None   # PuppetPins | None
         self._arm_seg_cache  = None   # SegmentCache | None
         self._arm_pin_btn    = None   # 피벗 설정 버튼 참조
         self._arm_pin_lbl    = None   # 피벗 상태 레이블 참조
         self._pin_popup      = None   # 중복 팝업 방지
+
+        # ── 왼팔 이미지 오버레이 상태
+        self._arm_img_l       = None   # BGRA numpy array
+        self._arm_img_ema_l   = {
+            'elbow_x': None, 'elbow_y': None,
+            'shldr_x': None, 'shldr_y': None,
+            'wrist_x': None, 'wrist_y': None,
+            'hand_x':  None, 'hand_y':  None,
+            'angle': None, 'arm_len': None, 'alpha': 0.15,
+        }
+        self._arm_pins_l      = None
+        self._arm_seg_cache_l = None
+        self._arm_img_btn_l   = None   # 로드 버튼 참조
+        self._arm_img_lbl_l   = None   # 파일명 레이블 참조
+        self._arm_pin_btn_l   = None   # 피벗 설정 버튼 참조
+        self._arm_pin_lbl_l   = None   # 피벗 상태 레이블 참조
 
         self._build_ui()
         self._on_ema_smooth_change()  # 슬라이더 초기값 → EMA alpha 동기화
@@ -950,7 +986,7 @@ class VideoPanel:
             activebackground="#2a4f80", activeforeground="white",
             relief=tk.FLAT, cursor="hand2",
             pady=6, anchor="w", padx=12,
-            command=self._toggle_arm_image,
+            command=lambda: self._toggle_arm_image(side='right'),
         )
         self._arm_img_btn.pack(fill=tk.X, padx=10, pady=(0, 2))
         self._arm_img_lbl = tk.Label(
@@ -1005,9 +1041,73 @@ class VideoPanel:
             font=("Segoe UI", 9, "bold"), bg="#2a3f5f", fg=TEXT_W,
             activebackground="#3a5a80", activeforeground="white",
             relief=tk.FLAT, cursor="hand2", pady=5, padx=10,
-            command=self._open_pin_picker, state=tk.DISABLED,
+            command=lambda: self._open_pin_picker(side='right'), state=tk.DISABLED,
         )
         self._arm_pin_btn.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        # ── 왼팔 이미지 (접기/펴기) ──
+        _arml_open = tk.BooleanVar(value=True)
+        _arml_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _arml_hdr.pack(fill=tk.X)
+        _arml_lbl = tk.Label(
+            _arml_hdr, text="▼  왼팔 이미지",
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        )
+        _arml_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _arml_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _arml_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _arml_body = tk.Frame(parent, bg=BG_PANEL)
+        _arml_body.pack(fill=tk.X)
+
+        def _toggle_arml_img(_e=None):
+            if _arml_open.get():
+                _arml_body.pack_forget()
+                _arml_lbl.config(text="▶  왼팔 이미지")
+                _arml_open.set(False)
+            else:
+                _arml_body.pack(fill=tk.X, after=_arml_sep)
+                _arml_lbl.config(text="▼  왼팔 이미지")
+                _arml_open.set(True)
+
+        _arml_hdr.bind("<Button-1>", _toggle_arml_img)
+        _arml_lbl.bind("<Button-1>", _toggle_arml_img)
+        self._panel_sections.append((_arml_open, _toggle_arml_img))
+
+        self._arm_img_btn_l = tk.Button(
+            _arml_body, text="🦾  이미지 로드",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=6, anchor="w", padx=12,
+            command=lambda: self._toggle_arm_image(side='left'),
+        )
+        self._arm_img_btn_l.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self._arm_img_lbl_l = tk.Label(
+            _arml_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+            wraplength=178,
+        )
+        self._arm_img_lbl_l.pack(fill=tk.X, padx=14, pady=(0, 2))
+
+        # ── Puppet Pin UI (왼팔) ──
+        tk.Frame(_arml_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
+        self._arm_pin_lbl_l = tk.Label(
+            _arml_body, text="피벗 미설정",
+            font=("Segoe UI", 8), fg="#ffaa44", bg=BG_PANEL, anchor="w",
+        )
+        self._arm_pin_lbl_l.pack(fill=tk.X, padx=14, pady=(0, 2))
+        self._arm_pin_btn_l = tk.Button(
+            _arml_body, text="🎯 피벗 설정",
+            font=("Segoe UI", 9, "bold"), bg="#2a3f5f", fg=TEXT_W,
+            activebackground="#3a5a80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=5, padx=10,
+            command=lambda: self._open_pin_picker(side='left'), state=tk.DISABLED,
+        )
+        self._arm_pin_btn_l.pack(fill=tk.X, padx=10, pady=(0, 4))
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
@@ -1438,7 +1538,19 @@ class VideoPanel:
                                    size_pct=self._arm_size_var.get(),
                                    ema_state=self._arm_img_ema,
                                    arm_pins=self._arm_pins,
-                                   arm_seg_cache=self._arm_seg_cache)
+                                   arm_seg_cache=self._arm_seg_cache,
+                                   side='right')
+
+        # ── 왼팔 이미지 오버레이
+        if self._arm_img_l is not None and pose_res:
+            _apply_arm_img_overlay(overlay, pose_res, _ow, _oh, self._arm_img_l,
+                                   anchor_y_pct=self._arm_y_var.get(),
+                                   anchor_x_pct=self._arm_x_var.get(),
+                                   size_pct=self._arm_size_var.get(),
+                                   ema_state=self._arm_img_ema_l,
+                                   arm_pins=self._arm_pins_l,
+                                   arm_seg_cache=self._arm_seg_cache_l,
+                                   side='left')
 
         return overlay
 
@@ -1787,28 +1899,40 @@ class VideoPanel:
     # ── 오른팔 이미지 EMA 콜백 / 로드/제거 ───────────────────────────────
     def _on_arm_smooth_change(self, _=None):
         v = self._arm_smooth_var.get()
-        self._arm_img_ema['alpha'] = 1.0 - (v / 100.0)
+        alpha = 1.0 - (v / 100.0)
+        self._arm_img_ema['alpha'] = alpha
+        self._arm_img_ema_l['alpha'] = alpha
 
-    def _toggle_arm_image(self):
-        if self._arm_img is not None:
-            self._arm_img = None
-            self._arm_pins = None
-            self._arm_seg_cache = None
+    def _toggle_arm_image(self, side='right'):
+        if side == 'right':
+            img_attr  = '_arm_img';    pins_attr  = '_arm_pins';    cache_attr  = '_arm_seg_cache'
+            ema_attr  = '_arm_img_ema'; lbl = self._arm_img_lbl;   btn = self._arm_img_btn
+            pin_lbl   = self._arm_pin_lbl;  pin_btn = self._arm_pin_btn
+        else:
+            img_attr  = '_arm_img_l';  pins_attr  = '_arm_pins_l';  cache_attr  = '_arm_seg_cache_l'
+            ema_attr  = '_arm_img_ema_l'; lbl = self._arm_img_lbl_l; btn = self._arm_img_btn_l
+            pin_lbl   = self._arm_pin_lbl_l; pin_btn = self._arm_pin_btn_l
+
+        if getattr(self, img_attr) is not None:
+            setattr(self, img_attr, None)
+            setattr(self, pins_attr, None)
+            setattr(self, cache_attr, None)
             for _k in ('elbow_x', 'elbow_y', 'angle', 'arm_len',
                        'shldr_x', 'shldr_y', 'wrist_x', 'wrist_y'):
-                self._arm_img_ema[_k] = None
-            self._arm_img_lbl.config(text="미선택")
-            self._arm_img_btn.config(text="🦾  이미지 로드")
-            self._arm_pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
-            self._arm_pin_btn.config(text="🎯 피벗 설정", state=tk.DISABLED)
+                getattr(self, ema_attr)[_k] = None
+            lbl.config(text="미선택")
+            btn.config(text="🦾  이미지 로드")
+            pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
+            pin_btn.config(text="🎯 피벗 설정", state=tk.DISABLED)
             self._det_cache = None
             self._refresh_frame()
         else:
-            self._load_arm_image()
+            self._load_arm_image(side=side)
 
-    def _load_arm_image(self):
+    def _load_arm_image(self, side='right'):
+        title = "오른팔 이미지 선택" if side == 'right' else "왼팔 이미지 선택"
         path = filedialog.askopenfilename(
-            parent=self.win, title="오른팔 이미지 선택",
+            parent=self.win, title=title,
             filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
         )
         if not path:
@@ -1825,23 +1949,37 @@ class VideoPanel:
             tmp[:, :, :3] = img
             tmp[:, :, 3] = 255
             img = tmp
-        self._arm_img = img.copy()
-        self._arm_pins = None
-        self._arm_seg_cache = None
-        self._arm_img_lbl.config(text=os.path.basename(path))
-        self._arm_img_btn.config(text="× 이미지 제거")
-        self._arm_pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
-        self._arm_pin_btn.config(text="🎯 피벗 설정", state=tk.NORMAL)
+
+        if side == 'right':
+            self._arm_img = img.copy()
+            self._arm_pins = None
+            self._arm_seg_cache = None
+            self._arm_img_lbl.config(text=os.path.basename(path))
+            self._arm_img_btn.config(text="× 이미지 제거")
+            self._arm_pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
+            self._arm_pin_btn.config(text="🎯 피벗 설정", state=tk.NORMAL)
+        else:
+            self._arm_img_l = img.copy()
+            self._arm_pins_l = None
+            self._arm_seg_cache_l = None
+            self._arm_img_lbl_l.config(text=os.path.basename(path))
+            self._arm_img_btn_l.config(text="× 이미지 제거")
+            self._arm_pin_lbl_l.config(text="피벗 미설정", fg="#ffaa44")
+            self._arm_pin_btn_l.config(text="🎯 피벗 설정", state=tk.NORMAL)
         self._det_cache = None
         self._refresh_frame()
-        self.win.after(100, self._open_pin_picker)
+        self.win.after(100, lambda: self._open_pin_picker(side=side))
 
     # ── Puppet Pin 피벗 설정 팝업 ─────────────────────────────────────────
-    def _open_pin_picker(self):
+    def _open_pin_picker(self, side='right'):
         if not _PUPPET_AVAILABLE:
             messagebox.showwarning("미지원", "puppet_pin 모듈을 불러올 수 없습니다.", parent=self.win)
             return
-        if self._arm_img is None:
+        arm_img  = self._arm_img  if side == 'right' else self._arm_img_l
+        arm_pins = self._arm_pins if side == 'right' else self._arm_pins_l
+        pin_lbl  = self._arm_pin_lbl  if side == 'right' else self._arm_pin_lbl_l
+        pin_btn  = self._arm_pin_btn  if side == 'right' else self._arm_pin_btn_l
+        if arm_img is None:
             return
         # 중복 방지
         if self._pin_popup is not None:
@@ -1852,7 +1990,7 @@ class VideoPanel:
                 self._pin_popup = None
 
         popup = tk.Toplevel(self.win)
-        popup.title("피벗 핀 설정")
+        popup.title(f"피벗 핀 설정 ({'오른팔' if side == 'right' else '왼팔'})")
         popup.resizable(False, False)
         popup.grab_set()
         self._pin_popup = popup
@@ -1863,19 +2001,19 @@ class VideoPanel:
         popup.protocol("WM_DELETE_WINDOW", _on_close)
 
         # 팝업 내부 상태
-        _clicks = []      # [(x_img, y_img), ...]  최대 3개
-        _COLORS = ["#ff4444", "#ffdd00", "#44ff88"]
-        _LABELS = ["어깨 (Shoulder)", "팔꿈치 (Elbow)", "손목 (Wrist)"]
+        _clicks = []      # [(x_img, y_img), ...]  최대 4개
+        _COLORS = ["#ff4444", "#ffdd00", "#44ff88", "#4488ff"]
+        _LABELS = ["어깨 (Shoulder)", "팔꿈치 (Elbow)", "손목 (Wrist)", "손가락 끝 (Hand)"]
         _MARKER_R = 6
 
         # 상태 레이블
-        status_lbl = tk.Label(popup, text=f"[1/3] {_LABELS[0]} 위치를 클릭하세요",
+        status_lbl = tk.Label(popup, text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요",
                                font=("Segoe UI", 9), fg="#aaccff",
                                bg="#1a1a2e", anchor="w", padx=8, pady=4)
         status_lbl.pack(fill=tk.X)
 
         # 이미지 캔버스
-        img_bgra = self._arm_img
+        img_bgra = arm_img
         ih, iw = img_bgra.shape[:2]
         MAX_SIZE = 420
         scale_f = min(MAX_SIZE / iw, MAX_SIZE / ih, 1.0)
@@ -1895,8 +2033,8 @@ class VideoPanel:
         canvas._tk_img_ref = _tk_img   # GC 방지
 
         # 기존 핀 미리 표시
-        if self._arm_pins is not None:
-            pts_img = list(self._arm_pins.arrays())
+        if arm_pins is not None:
+            pts_img = list(arm_pins.arrays())
             for _pi, (px, py) in enumerate(pts_img):
                 cx = px * scale_f; cy = py * scale_f
                 _clicks.append((px, py))
@@ -1907,14 +2045,20 @@ class VideoPanel:
         def _update_status():
             n = len(_clicks)
             if n < 3:
-                status_lbl.config(text=f"[{n+1}/3] {_LABELS[n]} 위치를 클릭하세요")
+                status_lbl.config(text=f"[{n+1}/4] {_LABELS[n]} 위치를 클릭하세요",
+                                  fg="#aaccff")
                 ok_btn.config(state=tk.DISABLED)
+            elif n == 3:
+                status_lbl.config(
+                    text=f"3점 완료 (4번째: {_LABELS[3]} 선택 가능) — [확인]으로 저장",
+                    fg="#ffdd88")
+                ok_btn.config(state=tk.NORMAL)
             else:
-                status_lbl.config(text="3점 완료 — [확인]으로 저장하세요", fg="#44ff88")
+                status_lbl.config(text="4점 완료 — [확인]으로 저장하세요", fg="#44ff88")
                 ok_btn.config(state=tk.NORMAL)
 
         def _on_canvas_click(event):
-            if len(_clicks) >= 3:
+            if len(_clicks) >= 4:
                 return
             img_x = event.x / scale_f
             img_y = event.y / scale_f
@@ -1937,7 +2081,7 @@ class VideoPanel:
             _clicks = []
             canvas.delete("all")
             canvas.create_image(0, 0, anchor="nw", image=_tk_img)
-            status_lbl.config(text=f"[1/3] {_LABELS[0]} 위치를 클릭하세요", fg="#aaccff")
+            status_lbl.config(text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요", fg="#aaccff")
             ok_btn.config(state=tk.DISABLED)
 
         def _confirm():
@@ -1947,16 +2091,24 @@ class VideoPanel:
                 img_shldr=_clicks[0],
                 img_elbow=_clicks[1],
                 img_wrist=_clicks[2],
+                img_hand=_clicks[3] if len(_clicks) >= 4 else None,
             )
             if pins_degenerate(pins, min_dist=6.0):
                 messagebox.showwarning("경고",
                     "핀 간격이 너무 좁습니다. 더 멀리 클릭해주세요.",
                     parent=popup)
                 return
-            self._arm_pins = pins
-            self._arm_seg_cache = build_segment_cache(self._arm_img, pins)
-            self._arm_pin_lbl.config(text="어깨 ○  팔꿈치 ○  손목 ○", fg="#44ff88")
-            self._arm_pin_btn.config(text="🎯 피벗 재설정")
+            if side == 'right':
+                self._arm_pins     = pins
+                self._arm_seg_cache = build_segment_cache(self._arm_img, pins)
+            else:
+                self._arm_pins_l      = pins
+                self._arm_seg_cache_l = build_segment_cache(self._arm_img_l, pins)
+            if pins.img_hand is not None:
+                pin_lbl.config(text="어깨 ○  팔꿈치 ○  손목 ○  손 ○", fg="#44ff88")
+            else:
+                pin_lbl.config(text="어깨 ○  팔꿈치 ○  손목 ○", fg="#44ff88")
+            pin_btn.config(text="🎯 피벗 재설정")
             self._det_cache = None
             self._refresh_frame()
             _on_close()
