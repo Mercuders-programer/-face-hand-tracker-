@@ -41,11 +41,13 @@ try:
                           _extract_face, _extract_hand, _extract_pose,
                           _build_persons, MAX_PERSONS, PERSON_COLORS)
     from .exporter import export_json, export_ae_keyframes
+    from . import insightface_detector as _if_det_mod
 except ImportError:
     from tracker import (Tracker, FrameData, VideoInfo, PersonData,
                          _extract_face, _extract_hand, _extract_pose,
                          _build_persons, MAX_PERSONS, PERSON_COLORS)
     from exporter import export_json, export_ae_keyframes
+    import insightface_detector as _if_det_mod
 
 try:
     try:
@@ -146,8 +148,12 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
         else:
             # ── Affine 자동 모드 (일러스트) ──────────────────────────────
             # 얼굴 바운딩박스 높이 → 스케일 (이미지의 80%가 얼굴 영역이라 가정)
-            ys = [_lf[i].y * h for i in range(len(_lf))]
-            raw_face_h = max(ys) - min(ys)
+            if hasattr(_lf, 'bbox'):
+                # InsightFace: bbox로 얼굴 높이 계산
+                raw_face_h = float(_lf.bbox[3] - _lf.bbox[1])
+            else:
+                ys = [_lf[i].y * h for i in range(len(_lf))]
+                raw_face_h = max(ys) - min(ys)
             raw_eye_cx, raw_eye_cy = float(eye_center[0]), float(eye_center[1])
             raw_angle = angle
 
@@ -161,6 +167,8 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             else:
                 face_h_px = raw_face_h
 
+            if face_h_px <= 0:
+                continue
             scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
             # 소스 이미지에서 눈 중심 위치
             src_cx = img_w * (eye_x_pct / 100.0)
@@ -278,12 +286,19 @@ def _apply_face_mosaic(frame, face_res, w, h, block=20):
     if not face_res.face_landmarks:
         return
     for _lf in face_res.face_landmarks:
-        xs = [_lf[i].x * w for i in range(len(_lf))]
-        ys = [_lf[i].y * h for i in range(len(_lf))]
-        x1 = max(0,  int(min(xs)) - 15)
-        y1 = max(0,  int(min(ys)) - 15)
-        x2 = min(w,  int(max(xs)) + 15)
-        y2 = min(h,  int(max(ys)) + 15)
+        if hasattr(_lf, 'bbox'):
+            # InsightFace: bbox 직접 사용 (픽셀 좌표)
+            x1 = max(0, _lf.bbox[0] - 15)
+            y1 = max(0, _lf.bbox[1] - 15)
+            x2 = min(w, _lf.bbox[2] + 15)
+            y2 = min(h, _lf.bbox[3] + 15)
+        else:
+            xs = [_lf[i].x * w for i in range(len(_lf))]
+            ys = [_lf[i].y * h for i in range(len(_lf))]
+            x1 = max(0,  int(min(xs)) - 15)
+            y1 = max(0,  int(min(ys)) - 15)
+            x2 = min(w,  int(max(xs)) + 15)
+            y2 = min(h,  int(max(ys)) + 15)
         if x2 - x1 < 4 or y2 - y1 < 4:
             continue
         roi = frame[y1:y2, x1:x2]
@@ -1394,25 +1409,17 @@ class CameraPanel:
             tmp[:, :, 3] = 255
             img = tmp
 
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-        face_opts = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-            running_mode=RunningMode.IMAGE,
-            num_faces=1,
-        )
+        # InsightFace로 얼굴 감지 (BGR 직접 사용)
+        bgr_src = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         try:
-            _det = mp_vision.FaceLandmarker.create_from_options(face_opts)
-            mp_img_src = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            face_res = _det.detect(mp_img_src)
-            _det.close()
+            face_res = _if_det_mod.detect(bgr_src, w=w, h=h)
         except Exception as e:
             messagebox.showerror("오류", f"얼굴 감지 실패:\n{e}", parent=self.win)
             return
 
         # 얼굴 감지 성공 → 정밀 모드 (Homography)
         # 감지 실패 (그림/일러스트) → 자동 모드 (Affine)
-        if (face_res.face_landmarks
-                and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT)):
+        if face_res.face_landmarks and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT):
             lf = face_res.face_landmarks[0]
             src_pts = np.float32([[lf[i].x * w, lf[i].y * h] for i in _FACE_IMG_KPT])
             mode_text = " [정밀]"
@@ -1465,23 +1472,15 @@ class CameraPanel:
             tmp[white, 3] = 0
             img = tmp
 
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
-        face_opts = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-            running_mode=RunningMode.IMAGE,
-            num_faces=1,
-        )
+        # InsightFace로 얼굴 감지 (BGR 직접 사용)
+        bgr_src = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         try:
-            _det = mp_vision.FaceLandmarker.create_from_options(face_opts)
-            mp_img_src = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            face_res = _det.detect(mp_img_src)
-            _det.close()
+            face_res = _if_det_mod.detect(bgr_src, w=w, h=h)
         except Exception as e:
             messagebox.showerror("오류", f"얼굴 감지 실패:\n{e}", parent=self.win)
             return
 
-        if (face_res.face_landmarks
-                and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT)):
+        if face_res.face_landmarks and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT):
             lf = face_res.face_landmarks[0]
             src_pts = np.float32([[lf[i].x * w, lf[i].y * h] for i in _FACE_IMG_KPT])
             mode_text = " [정밀]"
@@ -1497,14 +1496,7 @@ class CameraPanel:
 
     # ── 캡처 루프 (백그라운드 스레드) ────────────────────────────────────
     def _capture_loop(self):
-        face_opts = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-            running_mode=RunningMode.IMAGE,
-            num_faces=MAX_PERSONS,
-            min_face_detection_confidence=self._face_conf_var.get(),
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+        # 얼굴 감지: InsightFace 싱글턴 (별도 초기화 불필요)
         hand_opts = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL),
             running_mode=RunningMode.IMAGE,
@@ -1523,7 +1515,6 @@ class CameraPanel:
         )
 
         try:
-            face_det = mp_vision.FaceLandmarker.create_from_options(face_opts)
             hand_det = mp_vision.HandLandmarker.create_from_options(hand_opts)
             pose_det = mp_vision.PoseLandmarker.create_from_options(pose_opts)
         except Exception as e:
@@ -1558,7 +1549,7 @@ class CameraPanel:
                 _need_det = (_det_tick % 2 == 1) or self._recording
 
                 if _need_det and (_overlay_on or self._recording or _fi_on or _arm_on or _mosaic_on):
-                    # 추론 해상도 축소 (최대 640px 너비)
+                    # 추론 해상도 축소 (최대 640px 너비, 손/포즈용 mp.Image)
                     _sc = min(1.0, 640 / max(w_px, 1))
                     if _sc < 0.99:
                         _iw, _ih = int(w_px * _sc), int(h_px * _sc)
@@ -1568,7 +1559,8 @@ class CameraPanel:
                         _inf = mp_img
                     try:
                         if self._show_face.get() or self._recording or _fi_on or _mosaic_on:
-                            _last_f = face_det.detect(_inf)
+                            # InsightFace: BGR 원본 프레임 직접 사용
+                            _last_f = _if_det_mod.detect(frame, min_conf=self._face_conf_var.get())
                         if self._show_hands.get() or self._recording:
                             _last_h = hand_det.detect(_inf)
                         if self._show_body.get() or self._recording or _arm_on:
@@ -1613,24 +1605,35 @@ class CameraPanel:
                 if (self._show_face.get() or self._show_body.get()) and face_res.face_landmarks:
                     _nc = (0, 230, 180)
                     for _lf in face_res.face_landmarks:
-                        mp_draw.draw_landmarks(
-                            overlay, _lf,
-                            FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                            landmark_drawing_spec=None,
-                            connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
-                        )
-                        for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
-                                       (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
-                            if _s < len(_lf) and _e < len(_lf):
-                                cv2.line(overlay,
-                                         (int(_lf[_s].x*w_px), int(_lf[_s].y*h_px)),
-                                         (int(_lf[_e].x*w_px), int(_lf[_e].y*h_px)),
-                                         _nc, 1)
-                        for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
-                            if _i < len(_lf):
+                        if hasattr(_lf, 'bbox'):
+                            # InsightFace: 5개 키포인트 원 + bbox 사각형
+                            for _i in [33, 263, 4, 61, 291]:
                                 cv2.circle(overlay,
-                                           (int(_lf[_i].x*w_px), int(_lf[_i].y*h_px)),
-                                           2, _nc, -1)
+                                           (int(_lf[_i].x * w_px), int(_lf[_i].y * h_px)),
+                                           5, _nc, -1)
+                            cv2.rectangle(overlay,
+                                          (_lf.bbox[0], _lf.bbox[1]),
+                                          (_lf.bbox[2], _lf.bbox[3]),
+                                          _nc, 1)
+                        else:
+                            mp_draw.draw_landmarks(
+                                overlay, _lf,
+                                FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+                                landmark_drawing_spec=None,
+                                connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
+                            )
+                            for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
+                                           (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
+                                if _s < len(_lf) and _e < len(_lf):
+                                    cv2.line(overlay,
+                                             (int(_lf[_s].x*w_px), int(_lf[_s].y*h_px)),
+                                             (int(_lf[_e].x*w_px), int(_lf[_e].y*h_px)),
+                                             _nc, 1)
+                            for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
+                                if _i < len(_lf):
+                                    cv2.circle(overlay,
+                                               (int(_lf[_i].x*w_px), int(_lf[_i].y*h_px)),
+                                               2, _nc, -1)
                 # ── 손
                 if hand_res.hand_landmarks and self._show_hands.get():
                     for hlms in hand_res.hand_landmarks:
@@ -1697,7 +1700,6 @@ class CameraPanel:
                 except queue.Full:
                     pass
         finally:
-            face_det.close()
             hand_det.close()
             pose_det.close()
 

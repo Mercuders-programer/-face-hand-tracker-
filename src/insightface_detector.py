@@ -1,0 +1,120 @@
+"""insightface_detector.py — InsightFace RetinaFace 기반 얼굴 감지 싱글턴
+
+MediaPipe FaceLandmarker 대체:
+  - 정면/측면 모두 강인한 RetinaFace (buffalo_sc 모델, ~6MB)
+  - MediaPipe face_landmarks 포맷 호환 mock 반환
+  - 5개 키포인트: 오른눈, 왼눈, 코, 오른입꼬리, 왼입꼬리
+
+InsightFace kps[5×2] → MediaPipe 인덱스 매핑:
+  kps[0] (오른눈)     → idx 33, 133, 473
+  kps[1] (왼눈)       → idx 263, 362, 468
+  kps[2] (코)         → idx 4, 168
+  kps[3] (오른입꼬리) → idx 61
+  kps[4] (왼입꼬리)   → idx 291, 13, 14
+  나머지              → bbox 중심점 (mosaic bbox 계산용)
+"""
+
+import threading
+import numpy as np
+
+_lock = threading.Lock()
+_app = None
+
+
+class _IFLandmark:
+    """정규화된 x, y 좌표를 가진 mock 랜드마크."""
+    __slots__ = ('x', 'y')
+
+    def __init__(self, x=0.0, y=0.0):
+        self.x = float(x)
+        self.y = float(y)
+
+
+class _IFFaceLandmarkList(list):
+    """MediaPipe face_landmarks[i] 포맷 호환 mock 리스트 (478 원소).
+
+    bbox 속성: (x1, y1, x2, y2) 픽셀 좌표 (입력 프레임 기준).
+    hasattr(_lf, 'bbox')로 InsightFace 결과 여부 확인 가능.
+    """
+
+    def __init__(self, kps, bbox, w, h):
+        # 기본값: bbox 중심 (모든 478 원소 — mosaic 순회 대응)
+        cx = (bbox[0] + bbox[2]) / 2.0 / w
+        cy = (bbox[1] + bbox[3]) / 2.0 / h
+        lms = [_IFLandmark(cx, cy) for _ in range(478)]
+
+        # kps를 정규화 좌표로 변환 (픽셀 → 0..1)
+        kps_n = [(float(kp[0]) / w, float(kp[1]) / h) for kp in kps]
+
+        # kps[0]: 오른눈 → 33, 133, 473
+        for idx in (33, 133, 473):
+            lms[idx] = _IFLandmark(*kps_n[0])
+        # kps[1]: 왼눈 → 263, 362, 468
+        for idx in (263, 362, 468):
+            lms[idx] = _IFLandmark(*kps_n[1])
+        # kps[2]: 코 → 4, 168
+        for idx in (4, 168):
+            lms[idx] = _IFLandmark(*kps_n[2])
+        # kps[3]: 오른입꼬리 → 61
+        lms[61] = _IFLandmark(*kps_n[3])
+        # kps[4]: 왼입꼬리 → 291, 13, 14
+        for idx in (291, 13, 14):
+            lms[idx] = _IFLandmark(*kps_n[4])
+
+        super().__init__(lms)
+        # bbox는 원본 픽셀 좌표 (mosaic, 드로잉에 직접 사용)
+        self.bbox = (int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]))
+
+
+class InsightFaceResult:
+    """MediaPipe FaceLandmarker 결과 포맷 호환 mock."""
+    __slots__ = ('face_landmarks',)
+
+    def __init__(self, face_landmarks):
+        self.face_landmarks = face_landmarks
+
+
+def _get_app():
+    global _app
+    if _app is None:
+        with _lock:
+            if _app is None:
+                try:
+                    from insightface.app import FaceAnalysis
+                    app = FaceAnalysis(
+                        name='buffalo_sc',
+                        providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                    )
+                    app.prepare(ctx_id=0, det_size=(640, 640))
+                    _app = app
+                    print("[InsightFace] buffalo_sc 모델 로드 완료")
+                except Exception as e:
+                    print(f"[InsightFace init error] {e}")
+                    raise
+    return _app
+
+
+def detect(frame_bgr, w=None, h=None, min_conf=0.3):
+    """BGR 프레임에서 얼굴 감지 → InsightFaceResult 반환.
+
+    frame_bgr: BGR numpy array (원본 프레임 권장, InsightFace가 내부 리사이즈)
+    w, h: 프레임 크기 (None이면 frame_bgr.shape[:2] 사용)
+    min_conf: 최소 감지 신뢰도 (det_score 기준)
+    """
+    if w is None or h is None:
+        h, w = frame_bgr.shape[:2]
+    try:
+        app = _get_app()
+        faces = app.get(frame_bgr)
+        landmarks = []
+        for face in faces:
+            if face.kps is None or face.bbox is None:
+                continue
+            if hasattr(face, 'det_score') and face.det_score < min_conf:
+                continue
+            lm_list = _IFFaceLandmarkList(face.kps, face.bbox, w, h)
+            landmarks.append(lm_list)
+        return InsightFaceResult(landmarks)
+    except Exception as e:
+        print(f"[InsightFace detect error] {e}")
+        return InsightFaceResult([])

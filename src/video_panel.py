@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import os
+from dataclasses import dataclass
 
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
@@ -33,11 +34,13 @@ try:
                           _extract_face, _extract_hand, _extract_pose,
                           _build_persons, MAX_PERSONS, PERSON_COLORS)
     from .exporter import export_json, export_ae_keyframes
+    from . import insightface_detector as _if_det_mod
 except ImportError:
     from tracker import (FrameData, VideoInfo, PersonData,
                          _extract_face, _extract_hand, _extract_pose,
                          _build_persons, MAX_PERSONS, PERSON_COLORS)
     from exporter import export_json, export_ae_keyframes
+    import insightface_detector as _if_det_mod
 
 try:
     from PIL import Image, ImageTk
@@ -81,6 +84,43 @@ TL_H     = 30
 
 # 얼굴 이미지 워핑에 사용할 랜드마크 인덱스 (6점)
 _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, Mouth.R, Mouth.L
+
+
+@dataclass
+class BodyPins:
+    """앞모습 몸통 핀 4점 (이미지 좌표계): L.Shoulder / R.Shoulder / R.Hip / L.Hip."""
+    img_l_shldr: tuple
+    img_r_shldr: tuple
+    img_r_hip:   tuple
+    img_l_hip:   tuple
+
+    def arrays(self):
+        return [np.array(p, np.float64)
+                for p in [self.img_l_shldr, self.img_r_shldr, self.img_r_hip, self.img_l_hip]]
+
+    def is_valid(self, min_dist=8.0):
+        pts = self.arrays()
+        return all(np.linalg.norm(pts[i] - pts[j]) >= min_dist
+                   for i, j in [(0, 1), (1, 2), (2, 3), (3, 0)])
+
+
+@dataclass
+class BodySidePins:
+    """옆모습 몸통 핀 4점 (이미지 좌표계): 어깨 / 앞가슴 / 앞엉덩이 / 뒤허리."""
+    img_shldr:       tuple
+    img_front_chest: tuple
+    img_front_hip:   tuple
+    img_back_waist:  tuple
+
+    def arrays(self):
+        return [np.array(p, np.float64)
+                for p in [self.img_shldr, self.img_front_chest,
+                          self.img_front_hip, self.img_back_waist]]
+
+    def is_valid(self, min_dist=8.0):
+        pts = self.arrays()
+        return all(np.linalg.norm(pts[i] - pts[j]) >= min_dist
+                   for i, j in [(0, 1), (1, 2), (2, 3), (3, 0)])
 
 def _adaptive_ema_update(state: dict, key: str, value: float,
                           catch_scale: float = 30.0) -> float:
@@ -146,8 +186,12 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                                          borderValue=(0, 0, 0, 0))
         else:
             # ── Affine 자동 모드 (일러스트) ──────────────────────────────
-            ys = [_lf[i].y * h for i in range(len(_lf))]
-            raw_face_h = max(ys) - min(ys)
+            if hasattr(_lf, 'bbox'):
+                # InsightFace: bbox로 얼굴 높이 계산
+                raw_face_h = float(_lf.bbox[3] - _lf.bbox[1])
+            else:
+                ys = [_lf[i].y * h for i in range(len(_lf))]
+                raw_face_h = max(ys) - min(ys)
             raw_eye_cx, raw_eye_cy = float(eye_center[0]), float(eye_center[1])
             raw_angle = angle
 
@@ -161,6 +205,8 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             else:
                 face_h_px = raw_face_h
 
+            if face_h_px <= 0:
+                continue
             scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
             src_cx = img_w * (eye_x_pct / 100.0)
             src_cy = img_h * (eye_y_pct / 100.0)
@@ -271,17 +317,235 @@ def _apply_arm_img_overlay(overlay, pose_res, w, h, arm_img,
         ).astype(np.uint8)
 
 
+def _apply_leg_img_overlay(overlay, pose_res, w, h, leg_img,
+                            size_pct=100,
+                            ema_state: dict | None = None,
+                            leg_pins=None, leg_seg_cache=None, side='right'):
+    """로드된 다리 이미지(BGRA)를 무릎 위에 Puppet Pin 합성.
+    side='right': 랜드마크 24/26/28/32, 'left': 23/25/27/31
+    PuppetPins 재사용: img_shldr=엉덩이, img_elbow=무릎, img_wrist=발목, img_hand=발끝"""
+    if not pose_res.pose_landmarks:
+        if ema_state is not None:
+            for _k in ('knee_x', 'knee_y', 'angle', 'leg_len',
+                       'hip_x', 'hip_y', 'ankle_x', 'ankle_y',
+                       'foot_x', 'foot_y'):
+                ema_state[_k] = None
+        return
+    if side == 'right':
+        hip_idx, knee_idx, ankle_idx, foot_idx = 24, 26, 28, 32
+    else:
+        hip_idx, knee_idx, ankle_idx, foot_idx = 23, 25, 27, 31
+    img_h, img_w = leg_img.shape[:2]
+    for _pl in pose_res.pose_landmarks:
+        if len(_pl) <= max(hip_idx, knee_idx, ankle_idx):
+            continue
+        hip   = _pl[hip_idx]
+        knee  = _pl[knee_idx]
+        ankle = _pl[ankle_idx]
+        if hip.visibility < 0.3 or knee.visibility < 0.3 or ankle.visibility < 0.3:
+            continue
+        raw_kx  = knee.x * w
+        raw_ky  = knee.y * h
+        raw_hx  = hip.x * w
+        raw_hy  = hip.y * h
+        raw_ax  = ankle.x * w
+        raw_ay  = ankle.y * h
+        raw_ang = float(np.degrees(np.arctan2(
+            ankle.y - hip.y, ankle.x - hip.x)))
+        raw_len = float(np.hypot(
+            (knee.x - hip.x) * w, (knee.y - hip.y) * h))
+        if ema_state is not None:
+            kx  = _adaptive_ema_update(ema_state, 'knee_x',  raw_kx,  40.0)
+            ky  = _adaptive_ema_update(ema_state, 'knee_y',  raw_ky,  40.0)
+            hx  = _adaptive_ema_update(ema_state, 'hip_x',   raw_hx,  40.0)
+            hy  = _adaptive_ema_update(ema_state, 'hip_y',   raw_hy,  40.0)
+            ax  = _adaptive_ema_update(ema_state, 'ankle_x', raw_ax,  40.0)
+            ay  = _adaptive_ema_update(ema_state, 'ankle_y', raw_ay,  40.0)
+            ang = _adaptive_ema_update(ema_state, 'angle',   raw_ang, 10.0)
+            lln = _adaptive_ema_update(ema_state, 'leg_len', raw_len, 30.0)
+        else:
+            kx, ky = raw_kx, raw_ky
+            hx, hy = raw_hx, raw_hy
+            ax, ay = raw_ax, raw_ay
+            ang, lln = raw_ang, raw_len
+
+        if leg_pins is not None and leg_seg_cache is not None and _PUPPET_AVAILABLE:
+            # ── Puppet Pin 모드 ──
+            vid_foot = None
+            if leg_pins.img_hand is not None and len(_pl) > foot_idx:
+                foot_lm = _pl[foot_idx]
+                if foot_lm.visibility >= 0.2:
+                    raw_fx = foot_lm.x * w
+                    raw_fy = foot_lm.y * h
+                    if ema_state is not None:
+                        fx = _adaptive_ema_update(ema_state, 'foot_x', raw_fx, 40.0)
+                        fy = _adaptive_ema_update(ema_state, 'foot_y', raw_fy, 40.0)
+                    else:
+                        fx, fy = raw_fx, raw_fy
+                    vid_foot = (fx, fy)
+            warped = apply_puppet_warp(
+                leg_seg_cache, (hx, hy), (kx, ky), (ax, ay), w, h,
+                vid_hand=vid_foot, size_pct=float(size_pct))
+        else:
+            # ── Legacy 모드: 단일 Affine ──
+            scale  = lln * (size_pct / 100.0) / (img_h * 0.8)
+            src_cx = img_w * 0.5
+            src_cy = img_h * 0.2
+            M = cv2.getRotationMatrix2D((src_cx, src_cy), -ang, scale)
+            M[0, 2] += kx - src_cx
+            M[1, 2] += ky - src_cy
+            warped = cv2.warpAffine(leg_img, M, (w, h),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT,
+                                    borderValue=(0, 0, 0, 0))
+
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        overlay[:] = np.clip(
+            warped[:, :, :3].astype(np.float32) * alpha
+            + overlay.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+
+
+def _apply_body_front_overlay(overlay, pose_res, w, h, body_img,
+                               size_pct=100, ema_state=None, body_pins=None):
+    """앞모습 몸통 이미지(BGRA)를 L.Shldr/R.Shldr/R.Hip/L.Hip 4점으로 Perspective 합성.
+    body_pins 미설정 시 이미지 4코너를 랜드마크에 맞춤."""
+    if not pose_res.pose_landmarks:
+        return
+    for _pl in pose_res.pose_landmarks:
+        if len(_pl) <= 24:
+            continue
+        l_sh = _pl[11]; r_sh = _pl[12]
+        l_hp = _pl[23]; r_hp = _pl[24]
+        if min(l_sh.visibility, r_sh.visibility,
+               l_hp.visibility, r_hp.visibility) < 0.3:
+            continue
+        raw_vals = [l_sh.x*w, l_sh.y*h, r_sh.x*w, r_sh.y*h,
+                    r_hp.x*w, r_hp.y*h, l_hp.x*w, l_hp.y*h]
+        _KEYS = ['b_lsx','b_lsy','b_rsx','b_rsy','b_rhx','b_rhy','b_lhx','b_lhy']
+        if ema_state is not None:
+            sv = [_adaptive_ema_update(ema_state, k, v, 40.0)
+                  for k, v in zip(_KEYS, raw_vals)]
+        else:
+            sv = raw_vals
+        vid_pts = np.float32([[sv[0],sv[1]],[sv[2],sv[3]],[sv[4],sv[5]],[sv[6],sv[7]]])
+        if size_pct != 100:
+            c = vid_pts.mean(axis=0)
+            vid_pts = (c + (vid_pts - c) * (size_pct / 100.0)).astype(np.float32)
+        if body_pins is not None:
+            src_pts = np.float32([body_pins.img_l_shldr, body_pins.img_r_shldr,
+                                   body_pins.img_r_hip,   body_pins.img_l_hip])
+        else:
+            ih, iw = body_img.shape[:2]
+            src_pts = np.float32([[0,0],[iw,0],[iw,ih],[0,ih]])
+        M, _ = cv2.findHomography(src_pts, vid_pts)
+        if M is None:
+            continue
+        warped = cv2.warpPerspective(body_img, M, (w, h),
+                                     flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=(0, 0, 0, 0))
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        overlay[:] = np.clip(
+            warped[:, :, :3].astype(np.float32) * alpha
+            + overlay.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+
+
+def _apply_body_side_overlay(overlay, pose_res, w, h, body_img,
+                              size_pct=100, depth_pct=40,
+                              offset_x=0, offset_y=0,
+                              ema_state=None, body_pins=None):
+    """옆모습 몸통 이미지(BGRA)를 척추+수직방향 자동계산 4점으로 Perspective 합성.
+    body_pins (BodySidePins): 어깨/앞가슴/앞엉덩이/뒤허리 이미지 핀.
+    depth_pct: 몸 두께를 어깨너비 대비 % (기본 40).
+    offset_x/y: 픽셀 단위 위치 보정.
+    코 위치로 앞방향 자동 판별."""
+    if not pose_res.pose_landmarks:
+        return
+    for _pl in pose_res.pose_landmarks:
+        if len(_pl) <= 24:
+            continue
+        l_sh = _pl[11]; r_sh = _pl[12]
+        l_hp = _pl[23]; r_hp = _pl[24]
+        if (l_sh.visibility + r_sh.visibility) / 2 < 0.2:
+            continue
+        if (l_hp.visibility + r_hp.visibility) / 2 < 0.2:
+            continue
+        # 가중 평균으로 어깨/엉덩이 중심
+        sw = l_sh.visibility + r_sh.visibility
+        scx = (l_sh.x*l_sh.visibility + r_sh.x*r_sh.visibility) / sw * w
+        scy = (l_sh.y*l_sh.visibility + r_sh.y*r_sh.visibility) / sw * h
+        hw = l_hp.visibility + r_hp.visibility
+        hcx = (l_hp.x*l_hp.visibility + r_hp.x*r_hp.visibility) / hw * w
+        hcy = (l_hp.y*l_hp.visibility + r_hp.y*r_hp.visibility) / hw * h
+        if ema_state is not None:
+            scx = _adaptive_ema_update(ema_state, 'b_scx', scx, 40.0)
+            scy = _adaptive_ema_update(ema_state, 'b_scy', scy, 40.0)
+            hcx = _adaptive_ema_update(ema_state, 'b_hcx', hcx, 40.0)
+            hcy = _adaptive_ema_update(ema_state, 'b_hcy', hcy, 40.0)
+        spine_dx = hcx - scx; spine_dy = hcy - scy
+        spine_len = float(np.hypot(spine_dx, spine_dy))
+        if spine_len < 5:
+            continue
+        # 척추 수직 방향 (CW 회전 → 아래 척추 기준 오른쪽)
+        perp_x = spine_dy / spine_len
+        perp_y = -spine_dx / spine_len
+        # 코 위치로 앞방향 판별
+        nose_x = _pl[0].x * w if len(_pl) > 0 and _pl[0].visibility > 0.2 else scx
+        avg_shld_x = (l_sh.x*l_sh.visibility + r_sh.x*r_sh.visibility) / sw * w
+        facing = 1.0 if nose_x > avg_shld_x else -1.0
+        # 몸 두께
+        shoulder_width = abs(r_sh.x - l_sh.x) * w
+        body_depth = max(shoulder_width, spine_len * 0.2) * (depth_pct / 100.0) * (size_pct / 100.0)
+        # 4 비디오 코너: 어깨(뒤), 앞가슴, 앞엉덩이, 뒤허리
+        vid_pts = np.float32([
+            [scx + offset_x, scy + offset_y],
+            [scx + facing*perp_x*body_depth + offset_x, scy + facing*perp_y*body_depth + offset_y],
+            [hcx + facing*perp_x*body_depth + offset_x, hcy + facing*perp_y*body_depth + offset_y],
+            [hcx + offset_x, hcy + offset_y],
+        ])
+        if body_pins is not None:
+            src_pts = np.float32([body_pins.img_shldr, body_pins.img_front_chest,
+                                   body_pins.img_front_hip, body_pins.img_back_waist])
+        else:
+            ih, iw = body_img.shape[:2]
+            src_pts = np.float32([[0,0],[iw,0],[iw,ih],[0,ih]])
+        M, _ = cv2.findHomography(src_pts, vid_pts)
+        if M is None:
+            continue
+        warped = cv2.warpPerspective(body_img, M, (w, h),
+                                     flags=cv2.INTER_LINEAR,
+                                     borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=(0, 0, 0, 0))
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        overlay[:] = np.clip(
+            warped[:, :, :3].astype(np.float32) * alpha
+            + overlay.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+
+
 def _apply_face_mosaic(frame, face_res, w, h, block=20):
     """감지된 얼굴 영역에 모자이크(픽셀화) 효과를 적용한다."""
     if not face_res.face_landmarks:
         return
     for _lf in face_res.face_landmarks:
-        xs = [_lf[i].x * w for i in range(len(_lf))]
-        ys = [_lf[i].y * h for i in range(len(_lf))]
-        x1 = max(0,  int(min(xs)) - 15)
-        y1 = max(0,  int(min(ys)) - 15)
-        x2 = min(w,  int(max(xs)) + 15)
-        y2 = min(h,  int(max(ys)) + 15)
+        if hasattr(_lf, 'bbox'):
+            # InsightFace: bbox 직접 사용 (픽셀 좌표)
+            x1 = max(0, _lf.bbox[0] - 15)
+            y1 = max(0, _lf.bbox[1] - 15)
+            x2 = min(w, _lf.bbox[2] + 15)
+            y2 = min(h, _lf.bbox[3] + 15)
+        else:
+            xs = [_lf[i].x * w for i in range(len(_lf))]
+            ys = [_lf[i].y * h for i in range(len(_lf))]
+            x1 = max(0,  int(min(xs)) - 15)
+            y1 = max(0,  int(min(ys)) - 15)
+            x2 = min(w,  int(max(xs)) + 15)
+            y2 = min(h,  int(max(ys)) + 15)
         if x2 - x1 < 4 or y2 - y1 < 4:
             continue
         roi = frame[y1:y2, x1:x2]
@@ -383,6 +647,7 @@ class VideoPanel:
         self._show_hands  = tk.BooleanVar(value=False)
         self._show_names  = tk.BooleanVar(value=False)
         self._show_mosaic         = tk.BooleanVar(value=False)
+        self._img_only_var        = tk.BooleanVar(value=False)
         self._show_anime_var   = tk.BooleanVar(value=False)
         self._anime_style_var  = tk.StringVar(value="animegan")
         self._anime_bg_var     = tk.StringVar(value="original")
@@ -416,6 +681,7 @@ class VideoPanel:
             'face_h': None, 'eye_cx': None, 'eye_cy': None,
             'angle': None, 'alpha': 0.15,
         }
+        self._face_img_z_var = tk.IntVar(value=6)   # Z 순서 (낮을수록 뒤)
 
         # ── 오른팔 이미지 오버레이 상태
         self._arm_img        = None   # BGRA numpy array
@@ -435,6 +701,7 @@ class VideoPanel:
         self._arm_seg_cache  = None   # SegmentCache | None
         self._arm_pin_btn    = None   # 피벗 설정 버튼 참조
         self._arm_pin_lbl    = None   # 피벗 상태 레이블 참조
+        self._arm_z_var      = tk.IntVar(value=5)   # Z 순서
         self._pin_popup      = None   # 중복 팝업 방지
 
         # ── 왼팔 이미지 오버레이 상태
@@ -452,13 +719,86 @@ class VideoPanel:
         self._arm_img_lbl_l   = None   # 파일명 레이블 참조
         self._arm_pin_btn_l   = None   # 피벗 설정 버튼 참조
         self._arm_pin_lbl_l   = None   # 피벗 상태 레이블 참조
+        self._arm_l_z_var     = tk.IntVar(value=4)  # Z 순서
+
+        # ── 오른다리 이미지 오버레이 상태
+        self._leg_img_r       = None   # BGRA numpy array
+        self._leg_size_var    = tk.IntVar(value=100)  # 크기 배율 (%)
+        self._leg_smooth_var  = tk.IntVar(value=85)   # 떨림 보정 (0~95)
+        self._leg_img_ema_r   = {
+            'knee_x': None, 'knee_y': None,
+            'hip_x':  None, 'hip_y':  None,
+            'ankle_x': None, 'ankle_y': None,
+            'foot_x':  None, 'foot_y':  None,
+            'angle': None, 'leg_len': None, 'alpha': 0.15,
+        }
+        self._leg_pins_r      = None
+        self._leg_seg_cache_r = None
+        self._leg_img_btn_r   = None
+        self._leg_img_lbl_r   = None
+        self._leg_pin_btn_r   = None
+        self._leg_pin_lbl_r   = None
+        self._leg_r_z_var     = tk.IntVar(value=3)  # Z 순서
+
+        # ── 왼다리 이미지 오버레이 상태
+        self._leg_img_l       = None
+        self._leg_img_ema_l   = {
+            'knee_x': None, 'knee_y': None,
+            'hip_x':  None, 'hip_y':  None,
+            'ankle_x': None, 'ankle_y': None,
+            'foot_x':  None, 'foot_y':  None,
+            'angle': None, 'leg_len': None, 'alpha': 0.15,
+        }
+        self._leg_pins_l      = None
+        self._leg_seg_cache_l = None
+        self._leg_img_btn_l   = None
+        self._leg_img_lbl_l   = None
+        self._leg_pin_btn_l   = None
+        self._leg_pin_lbl_l   = None
+        self._leg_l_z_var     = tk.IntVar(value=2)  # Z 순서
+
+        # ── 앞모습 몸통 이미지 오버레이 상태
+        self._body_front_img      = None   # BGRA numpy array
+        self._body_front_size_var = tk.IntVar(value=100)
+        self._body_front_smooth_var = tk.IntVar(value=85)
+        self._body_front_ema      = {
+            'b_lsx': None, 'b_lsy': None, 'b_rsx': None, 'b_rsy': None,
+            'b_rhx': None, 'b_rhy': None, 'b_lhx': None, 'b_lhy': None,
+            'alpha': 0.15,
+        }
+        self._body_front_pins     = None   # BodyPins | None
+        self._body_front_img_btn  = None
+        self._body_front_img_lbl  = None
+        self._body_front_pin_btn  = None
+        self._body_front_pin_lbl  = None
+        self._body_front_z_var    = tk.IntVar(value=1)  # Z 순서
+
+        # ── 옆모습 몸통 이미지 오버레이 상태
+        self._body_side_img       = None
+        self._body_side_size_var  = tk.IntVar(value=100)
+        self._body_side_depth_var = tk.IntVar(value=40)   # 몸 두께 %
+        self._body_side_x_var     = tk.IntVar(value=0)    # X 오프셋 (px)
+        self._body_side_y_var     = tk.IntVar(value=0)    # Y 오프셋 (px)
+        self._body_side_smooth_var = tk.IntVar(value=85)
+        self._body_side_ema       = {
+            'b_scx': None, 'b_scy': None, 'b_hcx': None, 'b_hcy': None,
+            'alpha': 0.15,
+        }
+        self._body_side_pins      = None   # BodySidePins | None
+        self._body_side_img_btn   = None
+        self._body_side_img_lbl   = None
+        self._body_side_pin_btn   = None
+        self._body_side_pin_lbl   = None
+        self._body_side_z_var     = tk.IntVar(value=0)  # Z 순서
 
         self._build_ui()
-        self._on_ema_smooth_change()  # 슬라이더 초기값 → EMA alpha 동기화
-        self._on_arm_smooth_change()  # arm EMA alpha 동기화
+        self._on_ema_smooth_change()   # 슬라이더 초기값 → EMA alpha 동기화
+        self._on_arm_smooth_change()   # arm EMA alpha 동기화
+        self._on_leg_smooth_change()   # leg EMA alpha 동기화
+        self._on_body_smooth_change()  # body EMA alpha 동기화
         self._init_mediapipe()
         for _v in (self._show_face, self._show_body, self._show_hands, self._show_names,
-                   self._show_mosaic):
+                   self._show_mosaic, self._img_only_var):
             _v.trace_add("write", lambda *_: self._refresh_frame())
         # 첫 프레임 표시 (레이아웃 완료 후)
         self.win.after(100, lambda: self._seek_to(0))
@@ -839,6 +1179,18 @@ class VideoPanel:
 
         parent = tab2  # 이미지 탭
 
+        # ── 이미지만 렌더 ──
+        tk.Checkbutton(
+            parent, text="이미지만 렌더",
+            variable=self._img_only_var,
+            font=("Segoe UI", 10, "bold"),
+            fg="#ffcc44", bg=BG_PANEL,
+            selectcolor="#0f3460",
+            activeforeground="#ffcc44", activebackground=BG_PANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(4, 2))
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(2, 6))
+
         # ── 얼굴 이미지 (접기/펴기) ──
         _fi_open = tk.BooleanVar(value=True)
         _fi_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
@@ -916,6 +1268,14 @@ class VideoPanel:
                  bg=BG_PANEL, fg="#88ddff", troughcolor="#0f3460",
                  highlightthickness=0, showvalue=True,
                  command=self._on_ema_smooth_change,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Label(_fi_body, text="Z 순서 (낮을수록 뒤에 렌더)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_fi_body, from_=0, to=10, orient=tk.HORIZONTAL,
+                 variable=self._face_img_z_var, length=160,
+                 bg=BG_PANEL, fg="#aaaacc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
                  ).pack(padx=10, pady=(0, 4))
 
         tk.Frame(_fi_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(2, 6))
@@ -1029,6 +1389,14 @@ class VideoPanel:
                  command=self._on_arm_smooth_change,
                  ).pack(padx=10, pady=(0, 4))
 
+        tk.Label(_arm_body, text="Z 순서 (낮을수록 뒤에 렌더)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_arm_body, from_=0, to=10, orient=tk.HORIZONTAL,
+                 variable=self._arm_z_var, length=160,
+                 bg=BG_PANEL, fg="#aaaacc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 4))
         # ── Puppet Pin UI ──
         tk.Frame(_arm_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
         self._arm_pin_lbl = tk.Label(
@@ -1093,6 +1461,14 @@ class VideoPanel:
         )
         self._arm_img_lbl_l.pack(fill=tk.X, padx=14, pady=(0, 2))
 
+        tk.Label(_arml_body, text="Z 순서 (낮을수록 뒤에 렌더)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_arml_body, from_=0, to=10, orient=tk.HORIZONTAL,
+                 variable=self._arm_l_z_var, length=160,
+                 bg=BG_PANEL, fg="#aaaacc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 4))
         # ── Puppet Pin UI (왼팔) ──
         tk.Frame(_arml_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
         self._arm_pin_lbl_l = tk.Label(
@@ -1108,6 +1484,355 @@ class VideoPanel:
             command=lambda: self._open_pin_picker(side='left'), state=tk.DISABLED,
         )
         self._arm_pin_btn_l.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        # ── 오른다리 이미지 (접기/펴기) ──
+        _legr_open = tk.BooleanVar(value=True)
+        _legr_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _legr_hdr.pack(fill=tk.X)
+        _legr_lbl = tk.Label(
+            _legr_hdr, text="▼  오른발 이미지",
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        )
+        _legr_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _legr_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _legr_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _legr_body = tk.Frame(parent, bg=BG_PANEL)
+        _legr_body.pack(fill=tk.X)
+
+        def _toggle_legr_img(_e=None):
+            if _legr_open.get():
+                _legr_body.pack_forget()
+                _legr_lbl.config(text="▶  오른발 이미지")
+                _legr_open.set(False)
+            else:
+                _legr_body.pack(fill=tk.X, after=_legr_sep)
+                _legr_lbl.config(text="▼  오른발 이미지")
+                _legr_open.set(True)
+
+        _legr_hdr.bind("<Button-1>", _toggle_legr_img)
+        _legr_lbl.bind("<Button-1>", _toggle_legr_img)
+        self._panel_sections.append((_legr_open, _toggle_legr_img))
+
+        self._leg_img_btn_r = tk.Button(
+            _legr_body, text="🦵  이미지 로드",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=6, anchor="w", padx=12,
+            command=lambda: self._toggle_leg_image(side='right'),
+        )
+        self._leg_img_btn_r.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self._leg_img_lbl_r = tk.Label(
+            _legr_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+            wraplength=178,
+        )
+        self._leg_img_lbl_r.pack(fill=tk.X, padx=14, pady=(0, 2))
+        tk.Label(_legr_body, text="크기 (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_legr_body, from_=30, to=300, orient=tk.HORIZONTAL,
+                 variable=self._leg_size_var, length=160,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(_legr_body, text="떨림 보정 (0=없음  →  95=최대)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_legr_body, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._leg_smooth_var, length=160,
+                 bg=BG_PANEL, fg="#88bbff", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_leg_smooth_change,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Label(_legr_body, text="Z 순서 (낮을수록 뒤에 렌더)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_legr_body, from_=0, to=10, orient=tk.HORIZONTAL,
+                 variable=self._leg_r_z_var, length=160,
+                 bg=BG_PANEL, fg="#aaaacc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Frame(_legr_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
+        self._leg_pin_lbl_r = tk.Label(
+            _legr_body, text="피벗 미설정",
+            font=("Segoe UI", 8), fg="#ffaa44", bg=BG_PANEL, anchor="w",
+        )
+        self._leg_pin_lbl_r.pack(fill=tk.X, padx=14, pady=(0, 2))
+        self._leg_pin_btn_r = tk.Button(
+            _legr_body, text="🎯 피벗 설정",
+            font=("Segoe UI", 9, "bold"), bg="#2a3f5f", fg=TEXT_W,
+            activebackground="#3a5a80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=5, padx=10,
+            command=lambda: self._open_leg_pin_picker(side='right'), state=tk.DISABLED,
+        )
+        self._leg_pin_btn_r.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        # ── 왼다리 이미지 (접기/펴기) ──
+        _legl_open = tk.BooleanVar(value=True)
+        _legl_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _legl_hdr.pack(fill=tk.X)
+        _legl_lbl = tk.Label(
+            _legl_hdr, text="▼  왼발 이미지",
+            font=("Segoe UI", 10, "bold"),
+            fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        )
+        _legl_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _legl_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _legl_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _legl_body = tk.Frame(parent, bg=BG_PANEL)
+        _legl_body.pack(fill=tk.X)
+
+        def _toggle_legl_img(_e=None):
+            if _legl_open.get():
+                _legl_body.pack_forget()
+                _legl_lbl.config(text="▶  왼발 이미지")
+                _legl_open.set(False)
+            else:
+                _legl_body.pack(fill=tk.X, after=_legl_sep)
+                _legl_lbl.config(text="▼  왼발 이미지")
+                _legl_open.set(True)
+
+        _legl_hdr.bind("<Button-1>", _toggle_legl_img)
+        _legl_lbl.bind("<Button-1>", _toggle_legl_img)
+        self._panel_sections.append((_legl_open, _toggle_legl_img))
+
+        self._leg_img_btn_l = tk.Button(
+            _legl_body, text="🦵  이미지 로드",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=6, anchor="w", padx=12,
+            command=lambda: self._toggle_leg_image(side='left'),
+        )
+        self._leg_img_btn_l.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self._leg_img_lbl_l = tk.Label(
+            _legl_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+            wraplength=178,
+        )
+        self._leg_img_lbl_l.pack(fill=tk.X, padx=14, pady=(0, 2))
+
+        tk.Label(_legl_body, text="Z 순서 (낮을수록 뒤에 렌더)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_legl_body, from_=0, to=10, orient=tk.HORIZONTAL,
+                 variable=self._leg_l_z_var, length=160,
+                 bg=BG_PANEL, fg="#aaaacc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 4))
+        # ── Puppet Pin UI (왼다리) ──
+        tk.Frame(_legl_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
+        self._leg_pin_lbl_l = tk.Label(
+            _legl_body, text="피벗 미설정",
+            font=("Segoe UI", 8), fg="#ffaa44", bg=BG_PANEL, anchor="w",
+        )
+        self._leg_pin_lbl_l.pack(fill=tk.X, padx=14, pady=(0, 2))
+        self._leg_pin_btn_l = tk.Button(
+            _legl_body, text="🎯 피벗 설정",
+            font=("Segoe UI", 9, "bold"), bg="#2a3f5f", fg=TEXT_W,
+            activebackground="#3a5a80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=5, padx=10,
+            command=lambda: self._open_leg_pin_picker(side='left'), state=tk.DISABLED,
+        )
+        self._leg_pin_btn_l.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        # ── 앞모습 몸통 이미지 (접기/펴기) ──
+        _bodyf_open = tk.BooleanVar(value=True)
+        _bodyf_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _bodyf_hdr.pack(fill=tk.X)
+        _bodyf_lbl = tk.Label(
+            _bodyf_hdr, text="▼  몸통 앞모습 이미지",
+            font=("Segoe UI", 10, "bold"), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        )
+        _bodyf_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _bodyf_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _bodyf_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _bodyf_body = tk.Frame(parent, bg=BG_PANEL)
+        _bodyf_body.pack(fill=tk.X)
+
+        def _toggle_bodyf_img(_e=None):
+            if _bodyf_open.get():
+                _bodyf_body.pack_forget()
+                _bodyf_lbl.config(text="▶  몸통 앞모습 이미지")
+                _bodyf_open.set(False)
+            else:
+                _bodyf_body.pack(fill=tk.X, after=_bodyf_sep)
+                _bodyf_lbl.config(text="▼  몸통 앞모습 이미지")
+                _bodyf_open.set(True)
+
+        _bodyf_hdr.bind("<Button-1>", _toggle_bodyf_img)
+        _bodyf_lbl.bind("<Button-1>", _toggle_bodyf_img)
+        self._panel_sections.append((_bodyf_open, _toggle_bodyf_img))
+
+        self._body_front_img_btn = tk.Button(
+            _bodyf_body, text="👕  이미지 로드",
+            font=("Segoe UI", 10, "bold"), bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=6, anchor="w", padx=12,
+            command=self._toggle_body_front_image,
+        )
+        self._body_front_img_btn.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self._body_front_img_lbl = tk.Label(
+            _bodyf_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w", wraplength=178,
+        )
+        self._body_front_img_lbl.pack(fill=tk.X, padx=14, pady=(0, 2))
+        tk.Label(_bodyf_body, text="크기 (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodyf_body, from_=30, to=300, orient=tk.HORIZONTAL,
+                 variable=self._body_front_size_var, length=160,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(_bodyf_body, text="떨림 보정 (0=없음  →  95=최대)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodyf_body, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._body_front_smooth_var, length=160,
+                 bg=BG_PANEL, fg="#88bbff", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_body_smooth_change,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Label(_bodyf_body, text="Z 순서 (낮을수록 뒤에 렌더)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodyf_body, from_=0, to=10, orient=tk.HORIZONTAL,
+                 variable=self._body_front_z_var, length=160,
+                 bg=BG_PANEL, fg="#aaaacc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Frame(_bodyf_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
+        self._body_front_pin_lbl = tk.Label(
+            _bodyf_body, text="피벗 미설정",
+            font=("Segoe UI", 8), fg="#ffaa44", bg=BG_PANEL, anchor="w",
+        )
+        self._body_front_pin_lbl.pack(fill=tk.X, padx=14, pady=(0, 2))
+        self._body_front_pin_btn = tk.Button(
+            _bodyf_body, text="🎯 피벗 설정",
+            font=("Segoe UI", 9, "bold"), bg="#2a3f5f", fg=TEXT_W,
+            activebackground="#3a5a80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=5, padx=10,
+            command=self._open_body_front_pin_picker, state=tk.DISABLED,
+        )
+        self._body_front_pin_btn.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
+
+        # ── 옆모습 몸통 이미지 (접기/펴기) ──
+        _bodys_open = tk.BooleanVar(value=True)
+        _bodys_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _bodys_hdr.pack(fill=tk.X)
+        _bodys_lbl = tk.Label(
+            _bodys_hdr, text="▼  몸통 옆모습 이미지",
+            font=("Segoe UI", 10, "bold"), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        )
+        _bodys_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _bodys_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _bodys_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _bodys_body = tk.Frame(parent, bg=BG_PANEL)
+        _bodys_body.pack(fill=tk.X)
+
+        def _toggle_bodys_img(_e=None):
+            if _bodys_open.get():
+                _bodys_body.pack_forget()
+                _bodys_lbl.config(text="▶  몸통 옆모습 이미지")
+                _bodys_open.set(False)
+            else:
+                _bodys_body.pack(fill=tk.X, after=_bodys_sep)
+                _bodys_lbl.config(text="▼  몸통 옆모습 이미지")
+                _bodys_open.set(True)
+
+        _bodys_hdr.bind("<Button-1>", _toggle_bodys_img)
+        _bodys_lbl.bind("<Button-1>", _toggle_bodys_img)
+        self._panel_sections.append((_bodys_open, _toggle_bodys_img))
+
+        self._body_side_img_btn = tk.Button(
+            _bodys_body, text="👘  이미지 로드",
+            font=("Segoe UI", 10, "bold"), bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=6, anchor="w", padx=12,
+            command=self._toggle_body_side_image,
+        )
+        self._body_side_img_btn.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self._body_side_img_lbl = tk.Label(
+            _bodys_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w", wraplength=178,
+        )
+        self._body_side_img_lbl.pack(fill=tk.X, padx=14, pady=(0, 2))
+        tk.Label(_bodys_body, text="크기 (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodys_body, from_=30, to=300, orient=tk.HORIZONTAL,
+                 variable=self._body_side_size_var, length=160,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(_bodys_body, text="몸 두께 (어깨너비 대비 %)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodys_body, from_=10, to=120, orient=tk.HORIZONTAL,
+                 variable=self._body_side_depth_var, length=160,
+                 bg=BG_PANEL, fg="#ffcc88", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(_bodys_body, text="위치 Y (px)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodys_body, from_=-300, to=300, orient=tk.HORIZONTAL,
+                 variable=self._body_side_y_var, length=160,
+                 bg=BG_PANEL, fg="#ff88cc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(_bodys_body, text="위치 X (px)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodys_body, from_=-300, to=300, orient=tk.HORIZONTAL,
+                 variable=self._body_side_x_var, length=160,
+                 bg=BG_PANEL, fg="#ff88cc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 2))
+        tk.Label(_bodys_body, text="떨림 보정 (0=없음  →  95=최대)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodys_body, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._body_side_smooth_var, length=160,
+                 bg=BG_PANEL, fg="#88bbff", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_body_smooth_change,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Label(_bodys_body, text="Z 순서 (낮을수록 뒤에 렌더)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(_bodys_body, from_=0, to=10, orient=tk.HORIZONTAL,
+                 variable=self._body_side_z_var, length=160,
+                 bg=BG_PANEL, fg="#aaaacc", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Frame(_bodys_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 4))
+        self._body_side_pin_lbl = tk.Label(
+            _bodys_body, text="피벗 미설정",
+            font=("Segoe UI", 8), fg="#ffaa44", bg=BG_PANEL, anchor="w",
+        )
+        self._body_side_pin_lbl.pack(fill=tk.X, padx=14, pady=(0, 2))
+        self._body_side_pin_btn = tk.Button(
+            _bodys_body, text="🎯 피벗 설정",
+            font=("Segoe UI", 9, "bold"), bg="#2a3f5f", fg=TEXT_W,
+            activebackground="#3a5a80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=5, padx=10,
+            command=self._open_body_side_pin_picker, state=tk.DISABLED,
+        )
+        self._body_side_pin_btn.pack(fill=tk.X, padx=10, pady=(0, 4))
 
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(4, 8))
 
@@ -1160,17 +1885,11 @@ class VideoPanel:
             wraplength=178, justify=tk.CENTER,
         ).pack(fill=tk.X, padx=10, pady=(4, 0))
 
-    # ── MediaPipe 초기화 ───────────────────────────────────────────────────
+    # ── MediaPipe 초기화 (손/포즈) + InsightFace (얼굴) ───────────────────
     def _init_mediapipe(self):
+        # 얼굴 감지: InsightFace 싱글턴 (별도 초기화 불필요 — 첫 detect 호출 시 자동 로드)
+        self._face_det = None  # InsightFace 사용 — MediaPipe FaceLandmarker 제거
         try:
-            face_opts = mp_vision.FaceLandmarkerOptions(
-                base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-                running_mode=RunningMode.IMAGE,
-                num_faces=MAX_PERSONS,
-                min_face_detection_confidence=self._face_conf_var.get(),
-                min_face_presence_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
             hand_opts = mp_vision.HandLandmarkerOptions(
                 base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL),
                 running_mode=RunningMode.IMAGE,
@@ -1187,12 +1906,10 @@ class VideoPanel:
                 min_pose_presence_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
-            self._face_det = mp_vision.FaceLandmarker.create_from_options(face_opts)
             self._hand_det = mp_vision.HandLandmarker.create_from_options(hand_opts)
             self._pose_det = mp_vision.PoseLandmarker.create_from_options(pose_opts)
         except Exception as e:
             print(f"[MediaPipe init error] {e}")
-            self._face_det = None
             self._hand_det = None
             self._pose_det = None
 
@@ -1309,8 +2026,10 @@ class VideoPanel:
     def _display_frame(self, bgr, playback=False):
         if (self._show_face.get() or self._show_body.get() or self._show_hands.get()
                 or self._face_img is not None or self._show_mosaic.get()
-                or self._arm_img is not None):
-            bgr = self._apply_overlay(bgr, playback=playback)
+                or self._arm_img is not None or self._img_only_var.get()
+                or self._leg_img_r is not None or self._leg_img_l is not None
+                or self._body_front_img is not None or self._body_side_img is not None):
+            bgr = self._apply_overlay(bgr, playback=playback, img_only=self._img_only_var.get())
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         self._canvas.update_idletasks()
@@ -1408,9 +2127,9 @@ class VideoPanel:
         self._pan_start = None
         self._canvas.config(cursor="")
 
-    def _apply_overlay(self, bgr, playback=False):
+    def _apply_overlay(self, bgr, playback=False, img_only=False):
         """오버레이 렌더링."""
-        if self._face_det is None or self._hand_det is None:
+        if self._hand_det is None:
             return bgr
         overlay = bgr.copy()
 
@@ -1430,7 +2149,7 @@ class VideoPanel:
             else:
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             try:
-                face_res = self._face_det.detect(mp_img)
+                face_res = _if_det_mod.detect(bgr, min_conf=self._face_conf_var.get())
                 hand_res = self._hand_det.detect(mp_img)
                 pose_res = self._pose_det.detect(mp_img) if self._pose_det else None
             except Exception as e:
@@ -1443,6 +2162,9 @@ class VideoPanel:
 
         _oh, _ow = overlay.shape[:2]
 
+        if img_only:
+            overlay[:] = 0
+
         # ── 얼굴 모자이크 (가장 먼저 적용)
         if self._show_mosaic.get():
             _apply_face_mosaic(overlay, face_res, _ow, _oh)
@@ -1451,7 +2173,8 @@ class VideoPanel:
         if self._show_body.get() and pose_res and pose_res.pose_landmarks:
             _SKEL = [(11,12),(11,23),(12,24),(23,24),
                      (11,13),(13,15),(12,14),(14,16),
-                     (23,25),(25,27),(24,26),(26,28)]
+                     (23,25),(25,27),(24,26),(26,28),
+                     (27,31),(28,32)]  # ankle → tiptoe
             for _pidx, _pl in enumerate(pose_res.pose_landmarks):
                 _pc = PERSON_COLORS[_pidx % len(PERSON_COLORS)]
                 for _s, _e in _SKEL:
@@ -1462,7 +2185,7 @@ class VideoPanel:
                                  (int(_pl[_s].x*_ow), int(_pl[_s].y*_oh)),
                                  (int(_pl[_e].x*_ow), int(_pl[_e].y*_oh)),
                                  _pc, 2)
-                for _i in [11,12,13,14,15,16,23,24,25,26,27,28]:
+                for _i in [11,12,13,14,15,16,23,24,25,26,27,28,31,32]:
                     if _i < len(_pl) and _pl[_i].visibility > 0.3:
                         cv2.circle(overlay,
                                    (int(_pl[_i].x*_ow), int(_pl[_i].y*_oh)),
@@ -1478,24 +2201,35 @@ class VideoPanel:
         if (self._show_face.get() or self._show_body.get()) and face_res.face_landmarks:
             _nc = (0, 230, 180)
             for _lf in face_res.face_landmarks:
-                mp_draw.draw_landmarks(
-                    overlay, _lf,
-                    FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
-                )
-                for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
-                               (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
-                    if _s < len(_lf) and _e < len(_lf):
-                        cv2.line(overlay,
-                                 (int(_lf[_s].x*_ow), int(_lf[_s].y*_oh)),
-                                 (int(_lf[_e].x*_ow), int(_lf[_e].y*_oh)),
-                                 _nc, 1)
-                for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
-                    if _i < len(_lf):
+                if hasattr(_lf, 'bbox'):
+                    # InsightFace: 5개 키포인트 원 + bbox 사각형
+                    for _i in [33, 263, 4, 61, 291]:
                         cv2.circle(overlay,
-                                   (int(_lf[_i].x*_ow), int(_lf[_i].y*_oh)),
-                                   2, _nc, -1)
+                                   (int(_lf[_i].x * _ow), int(_lf[_i].y * _oh)),
+                                   5, _nc, -1)
+                    cv2.rectangle(overlay,
+                                  (_lf.bbox[0], _lf.bbox[1]),
+                                  (_lf.bbox[2], _lf.bbox[3]),
+                                  _nc, 1)
+                else:
+                    mp_draw.draw_landmarks(
+                        overlay, _lf,
+                        FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
+                    )
+                    for _s, _e in [(168,6),(6,197),(197,195),(195,5),(5,4),
+                                   (4,1),(1,19),(98,97),(97,2),(2,326),(326,327)]:
+                        if _s < len(_lf) and _e < len(_lf):
+                            cv2.line(overlay,
+                                     (int(_lf[_s].x*_ow), int(_lf[_s].y*_oh)),
+                                     (int(_lf[_e].x*_ow), int(_lf[_e].y*_oh)),
+                                     _nc, 1)
+                    for _i in [1,2,4,5,6,19,97,98,168,195,197,326,327]:
+                        if _i < len(_lf):
+                            cv2.circle(overlay,
+                                       (int(_lf[_i].x*_ow), int(_lf[_i].y*_oh)),
+                                       2, _nc, -1)
 
         # ── 손 랜드마크 / 만화 손
         if hand_res.hand_landmarks:
@@ -1515,42 +2249,84 @@ class VideoPanel:
                                  self._show_body.get(),
                                  self._show_hands.get())
 
-        # ── 얼굴 이미지 오버레이
+        # ── 이미지 오버레이 — Z 순서 정렬 후 렌더링 ───────────────────────
         _fi = self._face_img
         _fp = self._face_img_pts
+        if _fi is not None and self._face_img_open is not None:
+            _mar = _compute_mar(face_res, _ow, _oh)
+            if _mar >= self._mouth_thr_var.get():
+                _fi = self._face_img_open
+                _fp = self._face_img_open_pts
+
+        _img_jobs = []  # (z, callable)
+
         if _fi is not None:
-            if self._face_img_open is not None:
-                _mar = _compute_mar(face_res, _ow, _oh)
-                if _mar >= self._mouth_thr_var.get():
-                    _fi = self._face_img_open
-                    _fp = self._face_img_open_pts
-            _apply_face_img_overlay(overlay, face_res, _ow, _oh, _fi, _fp,
-                                    eye_y_pct=self._eye_y_var.get(),
-                                    eye_x_pct=self._eye_x_var.get(),
-                                    size_pct=self._img_size_var.get(),
-                                    ema_state=self._face_img_ema)
+            _img_jobs.append((self._face_img_z_var.get(), lambda: _apply_face_img_overlay(
+                overlay, face_res, _ow, _oh, _fi, _fp,
+                eye_y_pct=self._eye_y_var.get(),
+                eye_x_pct=self._eye_x_var.get(),
+                size_pct=self._img_size_var.get(),
+                ema_state=self._face_img_ema)))
 
-        # ── 오른팔 이미지 오버레이
         if self._arm_img is not None and pose_res:
-            _apply_arm_img_overlay(overlay, pose_res, _ow, _oh, self._arm_img,
-                                   anchor_y_pct=self._arm_y_var.get(),
-                                   anchor_x_pct=self._arm_x_var.get(),
-                                   size_pct=self._arm_size_var.get(),
-                                   ema_state=self._arm_img_ema,
-                                   arm_pins=self._arm_pins,
-                                   arm_seg_cache=self._arm_seg_cache,
-                                   side='right')
+            _img_jobs.append((self._arm_z_var.get(), lambda: _apply_arm_img_overlay(
+                overlay, pose_res, _ow, _oh, self._arm_img,
+                anchor_y_pct=self._arm_y_var.get(),
+                anchor_x_pct=self._arm_x_var.get(),
+                size_pct=self._arm_size_var.get(),
+                ema_state=self._arm_img_ema,
+                arm_pins=self._arm_pins,
+                arm_seg_cache=self._arm_seg_cache,
+                side='right')))
 
-        # ── 왼팔 이미지 오버레이
         if self._arm_img_l is not None and pose_res:
-            _apply_arm_img_overlay(overlay, pose_res, _ow, _oh, self._arm_img_l,
-                                   anchor_y_pct=self._arm_y_var.get(),
-                                   anchor_x_pct=self._arm_x_var.get(),
-                                   size_pct=self._arm_size_var.get(),
-                                   ema_state=self._arm_img_ema_l,
-                                   arm_pins=self._arm_pins_l,
-                                   arm_seg_cache=self._arm_seg_cache_l,
-                                   side='left')
+            _img_jobs.append((self._arm_l_z_var.get(), lambda: _apply_arm_img_overlay(
+                overlay, pose_res, _ow, _oh, self._arm_img_l,
+                anchor_y_pct=self._arm_y_var.get(),
+                anchor_x_pct=self._arm_x_var.get(),
+                size_pct=self._arm_size_var.get(),
+                ema_state=self._arm_img_ema_l,
+                arm_pins=self._arm_pins_l,
+                arm_seg_cache=self._arm_seg_cache_l,
+                side='left')))
+
+        if self._leg_img_r is not None and pose_res:
+            _img_jobs.append((self._leg_r_z_var.get(), lambda: _apply_leg_img_overlay(
+                overlay, pose_res, _ow, _oh, self._leg_img_r,
+                size_pct=self._leg_size_var.get(),
+                ema_state=self._leg_img_ema_r,
+                leg_pins=self._leg_pins_r,
+                leg_seg_cache=self._leg_seg_cache_r,
+                side='right')))
+
+        if self._leg_img_l is not None and pose_res:
+            _img_jobs.append((self._leg_l_z_var.get(), lambda: _apply_leg_img_overlay(
+                overlay, pose_res, _ow, _oh, self._leg_img_l,
+                size_pct=self._leg_size_var.get(),
+                ema_state=self._leg_img_ema_l,
+                leg_pins=self._leg_pins_l,
+                leg_seg_cache=self._leg_seg_cache_l,
+                side='left')))
+
+        if self._body_front_img is not None and pose_res:
+            _img_jobs.append((self._body_front_z_var.get(), lambda: _apply_body_front_overlay(
+                overlay, pose_res, _ow, _oh, self._body_front_img,
+                size_pct=self._body_front_size_var.get(),
+                ema_state=self._body_front_ema,
+                body_pins=self._body_front_pins)))
+
+        if self._body_side_img is not None and pose_res:
+            _img_jobs.append((self._body_side_z_var.get(), lambda: _apply_body_side_overlay(
+                overlay, pose_res, _ow, _oh, self._body_side_img,
+                size_pct=self._body_side_size_var.get(),
+                depth_pct=self._body_side_depth_var.get(),
+                offset_x=self._body_side_x_var.get(),
+                offset_y=self._body_side_y_var.get(),
+                ema_state=self._body_side_ema,
+                body_pins=self._body_side_pins)))
+
+        for _, _fn in sorted(_img_jobs, key=lambda x: x[0]):
+            _fn()
 
         return overlay
 
@@ -1695,7 +2471,9 @@ class VideoPanel:
 
         with_overlay = (self._show_face.get() or self._show_body.get()
                         or self._show_hands.get()
-                        or self._show_mosaic.get() or self._face_img is not None)
+                        or self._show_mosaic.get() or self._face_img is not None
+                        or self._arm_img is not None or self._arm_img_l is not None
+                        or self._img_only_var.get())
         with_anime   = self._show_anime_var.get() and _ANIME_AVAILABLE
 
         # 오버레이/애니화 모드인데 MediaPipe 없으면 경고
@@ -1829,7 +2607,7 @@ class VideoPanel:
 
                 # ── 오버레이 (랜드마크/모자이크 등) ─────────────────────────
                 if with_overlay:
-                    frame = self._apply_overlay(frame)
+                    frame = self._apply_overlay(frame, img_only=self._img_only_var.get())
 
                 writer.write(frame)
                 idx += 1
@@ -1902,6 +2680,521 @@ class VideoPanel:
         alpha = 1.0 - (v / 100.0)
         self._arm_img_ema['alpha'] = alpha
         self._arm_img_ema_l['alpha'] = alpha
+
+    def _on_leg_smooth_change(self, _=None):
+        v = self._leg_smooth_var.get()
+        alpha = 1.0 - (v / 100.0)
+        self._leg_img_ema_r['alpha'] = alpha
+        self._leg_img_ema_l['alpha'] = alpha
+
+    def _on_body_smooth_change(self, _=None):
+        # 앞모습/옆모습 각자 슬라이더가 있지만 공통 alpha 사용
+        vf = self._body_front_smooth_var.get()
+        vs = self._body_side_smooth_var.get()
+        self._body_front_ema['alpha'] = 1.0 - (vf / 100.0)
+        self._body_side_ema['alpha']  = 1.0 - (vs / 100.0)
+
+    # ── 앞모습 몸통 ──────────────────────────────────────────────────────────
+    def _toggle_body_front_image(self):
+        if self._body_front_img is not None:
+            self._body_front_img = None
+            self._body_front_pins = None
+            for k in ('b_lsx','b_lsy','b_rsx','b_rsy','b_rhx','b_rhy','b_lhx','b_lhy'):
+                self._body_front_ema[k] = None
+            self._body_front_img_lbl.config(text="미선택")
+            self._body_front_img_btn.config(text="👕  이미지 로드")
+            self._body_front_pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
+            self._body_front_pin_btn.config(text="🎯 피벗 설정", state=tk.DISABLED)
+            self._det_cache = None
+            self._refresh_frame()
+        else:
+            self._load_body_image(mode='front')
+
+    def _toggle_body_side_image(self):
+        if self._body_side_img is not None:
+            self._body_side_img = None
+            self._body_side_pins = None
+            for k in ('b_scx','b_scy','b_hcx','b_hcy'):
+                self._body_side_ema[k] = None
+            self._body_side_img_lbl.config(text="미선택")
+            self._body_side_img_btn.config(text="👘  이미지 로드")
+            self._body_side_pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
+            self._body_side_pin_btn.config(text="🎯 피벗 설정", state=tk.DISABLED)
+            self._det_cache = None
+            self._refresh_frame()
+        else:
+            self._load_body_image(mode='side')
+
+    def _load_body_image(self, mode='front'):
+        title = "몸통 앞모습 이미지 선택" if mode == 'front' else "몸통 옆모습 이미지 선택"
+        path = filedialog.askopenfilename(
+            parent=self.win, title=title,
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{path}", parent=self.win)
+            return
+        h, w = img.shape[:2]
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 3:
+            tmp = np.zeros((h, w, 4), dtype=np.uint8)
+            tmp[:, :, :3] = img
+            tmp[:, :, 3] = 255
+            img = tmp
+        if mode == 'front':
+            self._body_front_img = img.copy()
+            self._body_front_pins = None
+            self._body_front_img_lbl.config(text=os.path.basename(path))
+            self._body_front_img_btn.config(text="× 이미지 제거")
+            self._body_front_pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
+            self._body_front_pin_btn.config(text="🎯 피벗 설정", state=tk.NORMAL)
+        else:
+            self._body_side_img = img.copy()
+            self._body_side_pins = None
+            self._body_side_img_lbl.config(text=os.path.basename(path))
+            self._body_side_img_btn.config(text="× 이미지 제거")
+            self._body_side_pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
+            self._body_side_pin_btn.config(text="🎯 피벗 설정", state=tk.NORMAL)
+        self._det_cache = None
+        self._refresh_frame()
+        if mode == 'front':
+            self.win.after(100, self._open_body_front_pin_picker)
+        else:
+            self.win.after(100, self._open_body_side_pin_picker)
+
+    # ── 앞모습 핀 피커 ────────────────────────────────────────────────────────
+    def _open_body_front_pin_picker(self):
+        if self._body_front_img is None:
+            return
+        if self._pin_popup is not None:
+            try:
+                self._pin_popup.lift(); return
+            except Exception:
+                self._pin_popup = None
+        popup = tk.Toplevel(self.win)
+        popup.title("피벗 핀 설정 (몸통 앞모습)")
+        popup.resizable(False, False)
+        popup.grab_set()
+        self._pin_popup = popup
+
+        def _on_close():
+            self._pin_popup = None
+            popup.destroy()
+        popup.protocol("WM_DELETE_WINDOW", _on_close)
+
+        _clicks = []
+        _COLORS = ["#ff4444", "#ffdd00", "#44ff88", "#4488ff"]
+        _LABELS = ["왼어깨 (L.Shoulder)", "오른어깨 (R.Shoulder)",
+                   "오른엉덩이 (R.Hip)",  "왼엉덩이 (L.Hip)"]
+        _MARKER_R = 6
+
+        status_lbl = tk.Label(popup, text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요",
+                               font=("Segoe UI", 9), fg="#aaccff",
+                               bg="#1a1a2e", anchor="w", padx=8, pady=4)
+        status_lbl.pack(fill=tk.X)
+
+        img_bgra = self._body_front_img
+        ih, iw = img_bgra.shape[:2]
+        scale_f = min(420 / iw, 420 / ih, 1.0)
+        disp_w, disp_h = max(1, int(iw*scale_f)), max(1, int(ih*scale_f))
+        img_rgb = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2RGB)
+        pil_img = __import__('PIL').Image.fromarray(img_rgb).resize(
+            (disp_w, disp_h), __import__('PIL').Image.LANCZOS)
+        _tk_img = ImageTk.PhotoImage(pil_img)
+        canvas = tk.Canvas(popup, width=disp_w, height=disp_h,
+                            bg="#000011", highlightthickness=1, highlightbackground="#333355")
+        canvas.pack(padx=10, pady=6)
+        canvas.create_image(0, 0, anchor="nw", image=_tk_img)
+        canvas._tk_img_ref = _tk_img
+
+        if self._body_front_pins is not None:
+            for _pi, pt in enumerate(self._body_front_pins.arrays()):
+                cx, cy = pt[0]*scale_f, pt[1]*scale_f
+                _clicks.append(tuple(pt))
+                canvas.create_oval(cx-_MARKER_R, cy-_MARKER_R, cx+_MARKER_R, cy+_MARKER_R,
+                                    fill=_COLORS[_pi], outline="white", width=1)
+
+        def _update_status():
+            n = len(_clicks)
+            if n < 4:
+                status_lbl.config(text=f"[{n+1}/4] {_LABELS[n]} 위치를 클릭하세요", fg="#aaccff")
+                ok_btn.config(state=tk.DISABLED)
+            else:
+                status_lbl.config(text="4점 완료 — [확인]으로 저장하세요", fg="#44ff88")
+                ok_btn.config(state=tk.NORMAL)
+
+        def _on_canvas_click(event):
+            if len(_clicks) >= 4:
+                return
+            ix, iy = event.x / scale_f, event.y / scale_f
+            _clicks.append((ix, iy))
+            idx = len(_clicks) - 1
+            canvas.create_oval(event.x-_MARKER_R, event.y-_MARKER_R,
+                                event.x+_MARKER_R, event.y+_MARKER_R,
+                                fill=_COLORS[idx], outline="white", width=1)
+            _update_status()
+
+        canvas.bind("<Button-1>", _on_canvas_click)
+
+        btn_row = tk.Frame(popup, bg="#1a1a2e")
+        btn_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        def _reset():
+            nonlocal _clicks; _clicks = []
+            canvas.delete("all"); canvas.create_image(0, 0, anchor="nw", image=_tk_img)
+            status_lbl.config(text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요", fg="#aaccff")
+            ok_btn.config(state=tk.DISABLED)
+
+        def _confirm():
+            if len(_clicks) < 4:
+                return
+            pins = BodyPins(img_l_shldr=_clicks[0], img_r_shldr=_clicks[1],
+                            img_r_hip=_clicks[2],   img_l_hip=_clicks[3])
+            if not pins.is_valid(min_dist=6.0):
+                messagebox.showwarning("경고", "핀 간격이 너무 좁습니다.", parent=popup); return
+            self._body_front_pins = pins
+            self._body_front_pin_lbl.config(
+                text="왼어깨 ○  오른어깨 ○  오른엉덩이 ○  왼엉덩이 ○", fg="#44ff88")
+            self._body_front_pin_btn.config(text="🎯 피벗 재설정")
+            self._det_cache = None; self._refresh_frame(); _on_close()
+
+        tk.Button(btn_row, text="초기화", font=("Segoe UI", 9), bg="#3a2a2a", fg=TEXT_W,
+                  relief=tk.FLAT, cursor="hand2", command=_reset).pack(side=tk.LEFT, padx=(0,6))
+        tk.Button(btn_row, text="취소", font=("Segoe UI", 9), bg="#2a2a3a", fg=TEXT_W,
+                  relief=tk.FLAT, cursor="hand2", command=_on_close).pack(side=tk.LEFT, padx=(0,6))
+        ok_btn = tk.Button(btn_row, text="확인", font=("Segoe UI", 9, "bold"), bg="#1e5f3a",
+                           fg=TEXT_W, relief=tk.FLAT, cursor="hand2",
+                           state=tk.DISABLED, command=_confirm)
+        ok_btn.pack(side=tk.LEFT)
+        _update_status()
+
+    # ── 옆모습 핀 피커 ────────────────────────────────────────────────────────
+    def _open_body_side_pin_picker(self):
+        if self._body_side_img is None:
+            return
+        if self._pin_popup is not None:
+            try:
+                self._pin_popup.lift(); return
+            except Exception:
+                self._pin_popup = None
+        popup = tk.Toplevel(self.win)
+        popup.title("피벗 핀 설정 (몸통 옆모습)")
+        popup.resizable(False, False)
+        popup.grab_set()
+        self._pin_popup = popup
+
+        def _on_close():
+            self._pin_popup = None
+            popup.destroy()
+        popup.protocol("WM_DELETE_WINDOW", _on_close)
+
+        _clicks = []
+        _COLORS = ["#ff4444", "#ffdd00", "#44ff88", "#4488ff"]
+        _LABELS = ["어깨 (뒤)", "앞가슴 (Front Chest)",
+                   "앞엉덩이 (Front Hip)", "뒤허리 (Back Waist)"]
+        _MARKER_R = 6
+
+        status_lbl = tk.Label(popup, text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요",
+                               font=("Segoe UI", 9), fg="#aaccff",
+                               bg="#1a1a2e", anchor="w", padx=8, pady=4)
+        status_lbl.pack(fill=tk.X)
+
+        img_bgra = self._body_side_img
+        ih, iw = img_bgra.shape[:2]
+        scale_f = min(420 / iw, 420 / ih, 1.0)
+        disp_w, disp_h = max(1, int(iw*scale_f)), max(1, int(ih*scale_f))
+        img_rgb = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2RGB)
+        pil_img = __import__('PIL').Image.fromarray(img_rgb).resize(
+            (disp_w, disp_h), __import__('PIL').Image.LANCZOS)
+        _tk_img = ImageTk.PhotoImage(pil_img)
+        canvas = tk.Canvas(popup, width=disp_w, height=disp_h,
+                            bg="#000011", highlightthickness=1, highlightbackground="#333355")
+        canvas.pack(padx=10, pady=6)
+        canvas.create_image(0, 0, anchor="nw", image=_tk_img)
+        canvas._tk_img_ref = _tk_img
+
+        if self._body_side_pins is not None:
+            for _pi, pt in enumerate(self._body_side_pins.arrays()):
+                cx, cy = pt[0]*scale_f, pt[1]*scale_f
+                _clicks.append(tuple(pt))
+                canvas.create_oval(cx-_MARKER_R, cy-_MARKER_R, cx+_MARKER_R, cy+_MARKER_R,
+                                    fill=_COLORS[_pi], outline="white", width=1)
+
+        def _update_status():
+            n = len(_clicks)
+            if n < 4:
+                status_lbl.config(text=f"[{n+1}/4] {_LABELS[n]} 위치를 클릭하세요", fg="#aaccff")
+                ok_btn.config(state=tk.DISABLED)
+            else:
+                status_lbl.config(text="4점 완료 — [확인]으로 저장하세요", fg="#44ff88")
+                ok_btn.config(state=tk.NORMAL)
+
+        def _on_canvas_click(event):
+            if len(_clicks) >= 4:
+                return
+            ix, iy = event.x / scale_f, event.y / scale_f
+            _clicks.append((ix, iy))
+            idx = len(_clicks) - 1
+            canvas.create_oval(event.x-_MARKER_R, event.y-_MARKER_R,
+                                event.x+_MARKER_R, event.y+_MARKER_R,
+                                fill=_COLORS[idx], outline="white", width=1)
+            _update_status()
+
+        canvas.bind("<Button-1>", _on_canvas_click)
+
+        btn_row = tk.Frame(popup, bg="#1a1a2e")
+        btn_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        def _reset():
+            nonlocal _clicks; _clicks = []
+            canvas.delete("all"); canvas.create_image(0, 0, anchor="nw", image=_tk_img)
+            status_lbl.config(text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요", fg="#aaccff")
+            ok_btn.config(state=tk.DISABLED)
+
+        def _confirm():
+            if len(_clicks) < 4:
+                return
+            pins = BodySidePins(img_shldr=_clicks[0],       img_front_chest=_clicks[1],
+                                img_front_hip=_clicks[2],   img_back_waist=_clicks[3])
+            if not pins.is_valid(min_dist=6.0):
+                messagebox.showwarning("경고", "핀 간격이 너무 좁습니다.", parent=popup); return
+            self._body_side_pins = pins
+            self._body_side_pin_lbl.config(
+                text="어깨(뒤) ○  앞가슴 ○  앞엉덩이 ○  뒤허리 ○", fg="#44ff88")
+            self._body_side_pin_btn.config(text="🎯 피벗 재설정")
+            self._det_cache = None; self._refresh_frame(); _on_close()
+
+        tk.Button(btn_row, text="초기화", font=("Segoe UI", 9), bg="#3a2a2a", fg=TEXT_W,
+                  relief=tk.FLAT, cursor="hand2", command=_reset).pack(side=tk.LEFT, padx=(0,6))
+        tk.Button(btn_row, text="취소", font=("Segoe UI", 9), bg="#2a2a3a", fg=TEXT_W,
+                  relief=tk.FLAT, cursor="hand2", command=_on_close).pack(side=tk.LEFT, padx=(0,6))
+        ok_btn = tk.Button(btn_row, text="확인", font=("Segoe UI", 9, "bold"), bg="#1e5f3a",
+                           fg=TEXT_W, relief=tk.FLAT, cursor="hand2",
+                           state=tk.DISABLED, command=_confirm)
+        ok_btn.pack(side=tk.LEFT)
+        _update_status()
+
+    def _toggle_leg_image(self, side='right'):
+        if side == 'right':
+            img_attr  = '_leg_img_r';   pins_attr  = '_leg_pins_r';   cache_attr  = '_leg_seg_cache_r'
+            ema_attr  = '_leg_img_ema_r'; lbl = self._leg_img_lbl_r;  btn = self._leg_img_btn_r
+            pin_lbl   = self._leg_pin_lbl_r;  pin_btn = self._leg_pin_btn_r
+        else:
+            img_attr  = '_leg_img_l';   pins_attr  = '_leg_pins_l';   cache_attr  = '_leg_seg_cache_l'
+            ema_attr  = '_leg_img_ema_l'; lbl = self._leg_img_lbl_l;  btn = self._leg_img_btn_l
+            pin_lbl   = self._leg_pin_lbl_l;  pin_btn = self._leg_pin_btn_l
+
+        if getattr(self, img_attr) is not None:
+            setattr(self, img_attr, None)
+            setattr(self, pins_attr, None)
+            setattr(self, cache_attr, None)
+            for _k in ('knee_x', 'knee_y', 'angle', 'leg_len',
+                       'hip_x', 'hip_y', 'ankle_x', 'ankle_y',
+                       'foot_x', 'foot_y'):
+                getattr(self, ema_attr)[_k] = None
+            lbl.config(text="미선택")
+            btn.config(text="🦵  이미지 로드")
+            pin_lbl.config(text="피벗 미설정", fg="#ffaa44")
+            pin_btn.config(text="🎯 피벗 설정", state=tk.DISABLED)
+            self._det_cache = None
+            self._refresh_frame()
+        else:
+            self._load_leg_image(side=side)
+
+    def _load_leg_image(self, side='right'):
+        title = "오른발 이미지 선택" if side == 'right' else "왼발 이미지 선택"
+        path = filedialog.askopenfilename(
+            parent=self.win, title=title,
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{path}", parent=self.win)
+            return
+        h, w = img.shape[:2]
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 3:
+            tmp = np.zeros((h, w, 4), dtype=np.uint8)
+            tmp[:, :, :3] = img
+            tmp[:, :, 3] = 255
+            img = tmp
+
+        if side == 'right':
+            self._leg_img_r = img.copy()
+            self._leg_pins_r = None
+            self._leg_seg_cache_r = None
+            self._leg_img_lbl_r.config(text=os.path.basename(path))
+            self._leg_img_btn_r.config(text="× 이미지 제거")
+            self._leg_pin_lbl_r.config(text="피벗 미설정", fg="#ffaa44")
+            self._leg_pin_btn_r.config(text="🎯 피벗 설정", state=tk.NORMAL)
+        else:
+            self._leg_img_l = img.copy()
+            self._leg_pins_l = None
+            self._leg_seg_cache_l = None
+            self._leg_img_lbl_l.config(text=os.path.basename(path))
+            self._leg_img_btn_l.config(text="× 이미지 제거")
+            self._leg_pin_lbl_l.config(text="피벗 미설정", fg="#ffaa44")
+            self._leg_pin_btn_l.config(text="🎯 피벗 설정", state=tk.NORMAL)
+        self._det_cache = None
+        self._refresh_frame()
+        self.win.after(100, lambda: self._open_leg_pin_picker(side=side))
+
+    # ── 다리 Puppet Pin 피벗 설정 팝업 ────────────────────────────────────
+    def _open_leg_pin_picker(self, side='right'):
+        if not _PUPPET_AVAILABLE:
+            messagebox.showwarning("미지원", "puppet_pin 모듈을 불러올 수 없습니다.", parent=self.win)
+            return
+        leg_img  = self._leg_img_r  if side == 'right' else self._leg_img_l
+        leg_pins = self._leg_pins_r if side == 'right' else self._leg_pins_l
+        pin_lbl  = self._leg_pin_lbl_r  if side == 'right' else self._leg_pin_lbl_l
+        pin_btn  = self._leg_pin_btn_r  if side == 'right' else self._leg_pin_btn_l
+        if leg_img is None:
+            return
+        if self._pin_popup is not None:
+            try:
+                self._pin_popup.lift()
+                return
+            except Exception:
+                self._pin_popup = None
+
+        popup = tk.Toplevel(self.win)
+        popup.title(f"피벗 핀 설정 ({'오른발' if side == 'right' else '왼발'})")
+        popup.resizable(False, False)
+        popup.grab_set()
+        self._pin_popup = popup
+
+        def _on_close():
+            self._pin_popup = None
+            popup.destroy()
+        popup.protocol("WM_DELETE_WINDOW", _on_close)
+
+        _clicks = []
+        _COLORS = ["#ff4444", "#ffdd00", "#44ff88", "#4488ff"]
+        _LABELS = ["엉덩이 (Hip)", "무릎 (Knee)", "발목 (Ankle)", "발끝 (Tiptoe)"]
+        _MARKER_R = 6
+
+        status_lbl = tk.Label(popup, text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요",
+                               font=("Segoe UI", 9), fg="#aaccff",
+                               bg="#1a1a2e", anchor="w", padx=8, pady=4)
+        status_lbl.pack(fill=tk.X)
+
+        img_bgra = leg_img
+        ih, iw = img_bgra.shape[:2]
+        MAX_SIZE = 420
+        scale_f = min(MAX_SIZE / iw, MAX_SIZE / ih, 1.0)
+        disp_w = max(1, int(iw * scale_f))
+        disp_h = max(1, int(ih * scale_f))
+
+        img_rgb = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2RGB)
+        pil_img = __import__('PIL').Image.fromarray(img_rgb).resize(
+            (disp_w, disp_h), __import__('PIL').Image.LANCZOS)
+        _tk_img = ImageTk.PhotoImage(pil_img)
+
+        canvas = tk.Canvas(popup, width=disp_w, height=disp_h,
+                            bg="#000011", highlightthickness=1,
+                            highlightbackground="#333355")
+        canvas.pack(padx=10, pady=6)
+        canvas.create_image(0, 0, anchor="nw", image=_tk_img)
+        canvas._tk_img_ref = _tk_img
+
+        if leg_pins is not None:
+            pts_img = list(leg_pins.arrays())
+            for _pi, (px, py) in enumerate(pts_img):
+                cx = px * scale_f; cy = py * scale_f
+                _clicks.append((px, py))
+                canvas.create_oval(cx - _MARKER_R, cy - _MARKER_R,
+                                    cx + _MARKER_R, cy + _MARKER_R,
+                                    fill=_COLORS[_pi], outline="white", width=1)
+
+        def _update_status():
+            n = len(_clicks)
+            if n < 3:
+                status_lbl.config(text=f"[{n+1}/4] {_LABELS[n]} 위치를 클릭하세요",
+                                  fg="#aaccff")
+                ok_btn.config(state=tk.DISABLED)
+            elif n == 3:
+                status_lbl.config(
+                    text=f"3점 완료 (4번째: {_LABELS[3]} 선택 가능) — [확인]으로 저장",
+                    fg="#ffdd88")
+                ok_btn.config(state=tk.NORMAL)
+            else:
+                status_lbl.config(text="4점 완료 — [확인]으로 저장하세요", fg="#44ff88")
+                ok_btn.config(state=tk.NORMAL)
+
+        def _on_canvas_click(event):
+            if len(_clicks) >= 4:
+                return
+            img_x = event.x / scale_f
+            img_y = event.y / scale_f
+            _clicks.append((img_x, img_y))
+            idx = len(_clicks) - 1
+            cx, cy = event.x, event.y
+            canvas.create_oval(cx - _MARKER_R, cy - _MARKER_R,
+                                cx + _MARKER_R, cy + _MARKER_R,
+                                fill=_COLORS[idx], outline="white", width=1)
+            _update_status()
+
+        canvas.bind("<Button-1>", _on_canvas_click)
+
+        btn_row = tk.Frame(popup, bg="#1a1a2e")
+        btn_row.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+        def _reset():
+            nonlocal _clicks
+            _clicks = []
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=_tk_img)
+            status_lbl.config(text=f"[1/4] {_LABELS[0]} 위치를 클릭하세요", fg="#aaccff")
+            ok_btn.config(state=tk.DISABLED)
+
+        def _confirm():
+            if len(_clicks) < 3:
+                return
+            pins = PuppetPins(
+                img_shldr=_clicks[0],  # 엉덩이 (Hip)
+                img_elbow=_clicks[1],  # 무릎 (Knee)
+                img_wrist=_clicks[2],  # 발목 (Ankle)
+                img_hand=_clicks[3] if len(_clicks) >= 4 else None,  # 발끝 (Tiptoe)
+            )
+            if pins_degenerate(pins, min_dist=6.0):
+                messagebox.showwarning("경고",
+                    "핀 간격이 너무 좁습니다. 더 멀리 클릭해주세요.",
+                    parent=popup)
+                return
+            if side == 'right':
+                self._leg_pins_r      = pins
+                self._leg_seg_cache_r = build_segment_cache(self._leg_img_r, pins)
+            else:
+                self._leg_pins_l      = pins
+                self._leg_seg_cache_l = build_segment_cache(self._leg_img_l, pins)
+            if pins.img_hand is not None:
+                pin_lbl.config(text="엉덩이 ○  무릎 ○  발목 ○  발끝 ○", fg="#44ff88")
+            else:
+                pin_lbl.config(text="엉덩이 ○  무릎 ○  발목 ○", fg="#44ff88")
+            pin_btn.config(text="🎯 피벗 재설정")
+            self._det_cache = None
+            self._refresh_frame()
+            _on_close()
+
+        tk.Button(btn_row, text="초기화", font=("Segoe UI", 9),
+                  bg="#3a2a2a", fg=TEXT_W, relief=tk.FLAT, cursor="hand2",
+                  command=_reset).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(btn_row, text="취소", font=("Segoe UI", 9),
+                  bg="#2a2a3a", fg=TEXT_W, relief=tk.FLAT, cursor="hand2",
+                  command=_on_close).pack(side=tk.LEFT, padx=(0, 6))
+        ok_btn = tk.Button(btn_row, text="확인", font=("Segoe UI", 9, "bold"),
+                           bg="#1e5f3a", fg=TEXT_W, relief=tk.FLAT, cursor="hand2",
+                           state=tk.DISABLED, command=_confirm)
+        ok_btn.pack(side=tk.LEFT)
+
+        _update_status()
 
     def _toggle_arm_image(self, side='right'):
         if side == 'right':
@@ -2141,10 +3434,6 @@ class VideoPanel:
             self._load_face_image()
 
     def _load_face_image(self):
-        if self._face_det is None:
-            messagebox.showerror("오류", "MediaPipe 초기화에 실패했습니다.", parent=self.win)
-            return
-
         path = filedialog.askopenfilename(
             parent=self.win,
             title="얼굴 이미지 선택",
@@ -2167,18 +3456,17 @@ class VideoPanel:
             tmp[:, :, 3] = 255
             img = tmp
 
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        # InsightFace로 얼굴 감지 (BGR 직접 사용)
+        bgr_src = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         try:
-            mp_img_src = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            face_res = self._face_det.detect(mp_img_src)
+            face_res = _if_det_mod.detect(bgr_src, w=w, h=h)
         except Exception as e:
             messagebox.showerror("오류", f"얼굴 감지 실패:\n{e}", parent=self.win)
             return
 
         # 얼굴 감지 성공 → 정밀 모드 (Homography)
         # 감지 실패 (그림/일러스트) → 자동 모드 (Affine)
-        if (face_res.face_landmarks
-                and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT)):
+        if face_res.face_landmarks and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT):
             lf = face_res.face_landmarks[0]
             src_pts = np.float32([[lf[i].x * w, lf[i].y * h] for i in _FACE_IMG_KPT])
             mode_text = " [정밀]"
@@ -2207,9 +3495,6 @@ class VideoPanel:
             self._load_face_image_open()
 
     def _load_face_image_open(self):
-        if self._face_det is None:
-            messagebox.showerror("오류", "MediaPipe 초기화에 실패했습니다.", parent=self.win)
-            return
         path = filedialog.askopenfilename(
             parent=self.win,
             title="입 벌림 이미지 선택",
@@ -2238,16 +3523,15 @@ class VideoPanel:
             tmp[white, 3] = 0
             img = tmp
 
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
+        # InsightFace로 얼굴 감지 (BGR 직접 사용)
+        bgr_src = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         try:
-            mp_img_src = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            face_res = self._face_det.detect(mp_img_src)
+            face_res = _if_det_mod.detect(bgr_src, w=w, h=h)
         except Exception as e:
             messagebox.showerror("오류", f"얼굴 감지 실패:\n{e}", parent=self.win)
             return
 
-        if (face_res.face_landmarks
-                and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT)):
+        if face_res.face_landmarks and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT):
             lf = face_res.face_landmarks[0]
             src_pts = np.float32([[lf[i].x * w, lf[i].y * h] for i in _FACE_IMG_KPT])
             mode_text = " [정밀]"
@@ -2272,9 +3556,6 @@ class VideoPanel:
         if self._cap:
             self._cap.release()
             self._cap = None
-        if self._face_det:
-            self._face_det.close()
-            self._face_det = None
         if self._hand_det:
             self._hand_det.close()
             self._hand_det = None

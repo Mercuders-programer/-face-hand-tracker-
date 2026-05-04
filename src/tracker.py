@@ -23,6 +23,17 @@ FACE_MODEL  = os.path.join(_BASE, "models", "face_landmarker.task")
 HAND_MODEL  = os.path.join(_BASE, "models", "hand_landmarker.task")
 POSE_MODEL  = os.path.join(_BASE, "models", "pose_landmarker_full.task")
 
+# InsightFace 얼굴 감지 (FaceLandmarker 대체)
+try:
+    try:
+        from .insightface_detector import detect as _if_detect
+    except ImportError:
+        from insightface_detector import detect as _if_detect
+    _IF_AVAILABLE = True
+except Exception:
+    _if_detect = None
+    _IF_AVAILABLE = False
+
 # ──────────────────────────────────────────────────────────────────────────
 # 데이터 구조체
 # ──────────────────────────────────────────────────────────────────────────
@@ -360,14 +371,6 @@ class Tracker:
         print(f"[Tracker] 영상: {info.width}×{info.height} @ {info.fps:.2f} fps, "
               f"총 {info.total_frames} 프레임")
 
-        face_opts = mp_vision.FaceLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL),
-            running_mode=RunningMode.IMAGE,
-            num_faces=MAX_PERSONS,
-            min_face_detection_confidence=self._face_conf,
-            min_face_presence_confidence=self._face_conf,
-            min_tracking_confidence=0.5,
-        )
         hand_opts = mp_vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=HAND_MODEL),
             running_mode=RunningMode.IMAGE,
@@ -387,13 +390,11 @@ class Tracker:
 
         from mediapipe.tasks.python.vision import drawing_utils as du
         from mediapipe.tasks.python.vision import drawing_styles as ds
-        from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarksConnections
         from mediapipe.tasks.python.vision.hand_landmarker import HandLandmarksConnections
 
         frames: List[FrameData] = []
 
-        with mp_vision.FaceLandmarker.create_from_options(face_opts) as face_det, \
-             mp_vision.HandLandmarker.create_from_options(hand_opts) as hand_det, \
+        with mp_vision.HandLandmarker.create_from_options(hand_opts) as hand_det, \
              mp_vision.PoseLandmarker.create_from_options(pose_opts) as pose_det:
 
             idx = 0
@@ -406,7 +407,11 @@ class Tracker:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-                face_res = face_det.detect(mp_img)
+                # InsightFace로 얼굴 감지 (BGR 직접, 정면/측면 강인)
+                if _IF_AVAILABLE and _if_detect is not None:
+                    face_res = _if_detect(frame, min_conf=self._face_conf)
+                else:
+                    face_res = type('R', (), {'face_landmarks': []})()
                 hand_res = hand_det.detect(mp_img)
                 pose_res = pose_det.detect(mp_img)
 
@@ -418,13 +423,17 @@ class Tracker:
                 if show_preview:
                     preview = frame.copy()
                     if face_res.face_landmarks:
-                        for _fl in face_res.face_landmarks:
-                            du.draw_landmarks(
-                                preview, _fl,
-                                FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS,
-                                landmark_drawing_spec=None,
-                                connection_drawing_spec=ds.get_default_face_mesh_contours_style(),
-                            )
+                        _nc = (0, 230, 180)
+                        for _lf in face_res.face_landmarks:
+                            for _i in [33, 263, 4, 61, 291]:
+                                cv2.circle(preview,
+                                           (int(_lf[_i].x * w_px), int(_lf[_i].y * h_px)),
+                                           5, _nc, -1)
+                            if hasattr(_lf, 'bbox'):
+                                cv2.rectangle(preview,
+                                              (_lf.bbox[0], _lf.bbox[1]),
+                                              (_lf.bbox[2], _lf.bbox[3]),
+                                              _nc, 1)
                     if hand_res.hand_landmarks:
                         for hlms in hand_res.hand_landmarks:
                             du.draw_landmarks(
