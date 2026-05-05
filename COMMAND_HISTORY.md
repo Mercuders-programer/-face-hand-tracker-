@@ -152,6 +152,47 @@ https://github.com/Mercuders-programer/-face-hand-tracker-.git
 
 ---
 
+## 2026-04-27
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 79 | Puppet Pin 세그먼트 폭 균일화 — elbow 접합부 폭 불연속 문제 수정 | `puppet_pin.py` — `_seg_affine`에 `global_scale` 파라미터 추가, `_deform_mesh`에서 전체 호 길이 비율로 global_scale 계산 후 모든 세그먼트에 동일 적용 |
+| 80 | Puppet Pin 크기 슬라이더(30~300%) 적용 안 되는 버그 수정 | `puppet_pin.py` — `apply_puppet_warp`/`_deform_mesh`에 `size_pct` 파라미터 추가, `global_scale *= size_pct/100.0` 적용. `video_panel.py`/`camera_panel.py` — `apply_puppet_warp` 호출에 `size_pct=float(size_pct)` 추가 |
+| 81 | git에 올려줘 | push 완료 |
+| 82 | command_history.md에 업데이트 해줘 | COMMAND_HISTORY.md — 2026-04-27 섹션 추가 |
+
+---
+
+## 2026-04-27
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 79 | Puppet Pin 세그먼트 폭 균일화 — elbow 접합부 폭 불연속 문제 수정 | `puppet_pin.py` — `_seg_affine`에 `global_scale` 파라미터 추가, `_deform_mesh`에서 전체 호 길이 비율로 global_scale 계산 후 모든 세그먼트에 동일 적용 |
+| 80 | Puppet Pin 크기 슬라이더(30~300%) 적용 안 되는 버그 수정 | `puppet_pin.py` — `apply_puppet_warp`/`_deform_mesh`에 `size_pct` 파라미터 추가, `global_scale *= size_pct/100.0` 적용. `video_panel.py`/`camera_panel.py` — `apply_puppet_warp` 호출에 `size_pct=float(size_pct)` 추가 |
+| 81 | git에 올려줘 | push 완료 |
+| 82 | command_history.md에 업데이트 해줘 | COMMAND_HISTORY.md — 2026-04-27 섹션 추가 |
+
+---
+
+## 2026-05-04
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 83 | MediaPipe FaceLandmarker를 InsightFace RetinaFace(buffalo_sc)로 교체 — 측면 얼굴 감지 강인화 | `src/insightface_detector.py` 신규 생성 (5-kps → mock 478-pt 어댑터). `video_panel.py`, `camera_panel.py`, `tracker.py` InsightFace 연동. WSL2 테스트: 87프레임 중 43 감지 ✅ |
+| 84 | push 해줘 | push 완료 (c5c871c) |
+
+---
+
+## 2026-05-05
+
+| # | 명령 / 질문 | 결과 |
+|---|-------------|------|
+| 85 | Windows Python에 insightface 설치 (pip install insightface onnxruntime) | Windows 3.14.3에 설치 완료, buffalo_sc 자동 다운로드. picture_Face.mp4 43 감지 ✅ |
+| 86 | 입벌림(MAR) 감지 복원 계획 구현 — MediaPipe를 MAR 전용 병렬 실행 | `src/insightface_detector.py` — `_get_mp_face()` 싱글턴, `_get_mp_lm()` 헬퍼 추가. `detect()` 끝에서 lm[13]/lm[14]를 MediaPipe 값으로 교체. WSL2 테스트: 43 감지 중 34프레임 MAR>0 ✅ (이전: 항상 0) |
+| 87 | command_history.md에 업데이트 해줘 | COMMAND_HISTORY.md — 2026-05-04/05 섹션 추가 |
+
+---
+
 ## RTK 토큰 절약 현황 (2026-04-24 기준)
 
 ```

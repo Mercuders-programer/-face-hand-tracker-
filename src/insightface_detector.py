@@ -14,11 +14,56 @@ InsightFace kps[5×2] → MediaPipe 인덱스 매핑:
   나머지              → bbox 중심점 (mosaic bbox 계산용)
 """
 
+import os
 import threading
 import numpy as np
 
 _lock = threading.Lock()
 _app = None
+
+# MediaPipe FaceLandmarker (MAR 보정 전용)
+_mp_lock = threading.Lock()
+_mp_face_det = None
+_MODEL_PATH = os.path.join(os.path.dirname(__file__), '..', 'models', 'face_landmarker.task')
+
+
+def _get_mp_face():
+    """MediaPipe FaceLandmarker 싱글턴 반환 (최초 호출 시 초기화)."""
+    global _mp_face_det
+    if _mp_face_det is None:
+        with _mp_lock:
+            if _mp_face_det is None:
+                try:
+                    import mediapipe as mp
+                    from mediapipe.tasks import python as mp_python
+                    from mediapipe.tasks.python import vision as mp_vision
+                    opts = mp_vision.FaceLandmarkerOptions(
+                        base_options=mp_python.BaseOptions(model_asset_path=_MODEL_PATH),
+                        running_mode=mp_vision.RunningMode.IMAGE,
+                        num_faces=4,
+                    )
+                    _mp_face_det = mp_vision.FaceLandmarker.create_from_options(opts)
+                    print("[MediaPipe] FaceLandmarker (MAR용) 로드 완료")
+                except Exception as e:
+                    print(f"[MediaPipe init error] {e}")
+                    _mp_face_det = False  # 실패 표시 (재시도 방지)
+    return _mp_face_det if _mp_face_det else None
+
+
+def _get_mp_lm(frame_bgr):
+    """BGR 프레임 → MediaPipe face_landmarks 리스트 반환 (실패 시 빈 리스트)."""
+    try:
+        import cv2
+        import mediapipe as mp
+        detector = _get_mp_face()
+        if detector is None:
+            return []
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = detector.detect(mp_img)
+        return result.face_landmarks  # 각 원소: 랜드마크 478개 리스트
+    except Exception:
+        return []
 
 
 class _IFLandmark:
@@ -114,6 +159,17 @@ def detect(frame_bgr, w=None, h=None, min_conf=0.3):
                 continue
             lm_list = _IFFaceLandmarkList(face.kps, face.bbox, w, h)
             landmarks.append(lm_list)
+
+        # MAR 보정: MediaPipe로 입 위(13)/아래(14) 좌표 덮어쓰기
+        if landmarks:
+            try:
+                mp_lms = _get_mp_lm(frame_bgr)
+                for if_lm, mp_lm in zip(landmarks, mp_lms):
+                    if_lm[13] = _IFLandmark(mp_lm[13].x, mp_lm[13].y)
+                    if_lm[14] = _IFLandmark(mp_lm[14].x, mp_lm[14].y)
+            except Exception:
+                pass  # MediaPipe 실패 시 MAR=0 그대로
+
         return InsightFaceResult(landmarks)
     except Exception as e:
         print(f"[InsightFace detect error] {e}")
