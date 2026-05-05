@@ -190,6 +190,10 @@ https://github.com/Mercuders-programer/-face-hand-tracker-.git
 | 85 | Windows Python에 insightface 설치 (pip install insightface onnxruntime) | Windows 3.14.3에 설치 완료, buffalo_sc 자동 다운로드. picture_Face.mp4 43 감지 ✅ |
 | 86 | 입벌림(MAR) 감지 복원 계획 구현 — MediaPipe를 MAR 전용 병렬 실행 | `src/insightface_detector.py` — `_get_mp_face()` 싱글턴, `_get_mp_lm()` 헬퍼 추가. `detect()` 끝에서 lm[13]/lm[14]를 MediaPipe 값으로 교체. WSL2 테스트: 43 감지 중 34프레임 MAR>0 ✅ (이전: 항상 0) |
 | 87 | command_history.md에 업데이트 해줘 | COMMAND_HISTORY.md — 2026-05-04/05 섹션 추가 |
+| 88 | rtk gain 확인 | 토큰 절약 17.5%, 7.2K 확인 |
+| 89 | 영상 저장 시 "MediaPipe 초기화 실패" 오류 수정 | `video_panel.py` — `_face_det is None` → `_hand_det is None` 2곳 수정 |
+| 90 | 얼굴 이미지 로드 시 피벗 포인트 클릭 설정 + 회전 슬라이더 추가 | `video_panel.py`, `camera_panel.py` — `_apply_face_img_overlay`에 `pivot`/`rotation_offset` 파라미터, "⊕ 피벗 설정" 버튼, "추가 회전(°)" 슬라이더(-180~180), `_open_face_pivot_picker()` 팝업 추가 |
+| 91 | 모든 슬라이더바 사용 후 렌더링 업데이트 | `video_panel.py` — `__init__` 끝에 슬라이더 변수 25개 `trace_add("write", _refresh_frame)` 일괄 추가. `camera_panel.py`는 루프가 자동 반영하므로 변경 불필요 |
 
 ---
 

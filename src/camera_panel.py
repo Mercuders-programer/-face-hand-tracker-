@@ -112,11 +112,14 @@ def _compute_mar(face_res, w: int, h: int) -> float:
 
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                              eye_y_pct=55, eye_x_pct=50, size_pct=100,
-                             ema_state: dict | None = None):
+                             ema_state: dict | None = None,
+                             pivot=None, rotation_offset=0):
     """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
     face_img_pts is not None → Homography 정밀 모드 (실제 얼굴 사진)
     face_img_pts is None     → Affine 자동 모드  (일러스트/그림)
     ema_state: {'face_h', 'eye_cx', 'eye_cy', 'angle', 'alpha'} — EMA 상태 dict
+    pivot: (norm_x, norm_y) 소스 이미지 기준 정규화 피벗 좌표 (None=눈 위치 슬라이더 사용)
+    rotation_offset: 추가 회전 오프셋 (도, °)
     """
     if not face_res.face_landmarks:
         # 얼굴 없으면 EMA 상태 리셋 (다음 감지 때 cold-start)
@@ -145,6 +148,15 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                                          flags=cv2.INTER_LINEAR,
                                          borderMode=cv2.BORDER_CONSTANT,
                                          borderValue=(0, 0, 0, 0))
+            # Homography 모드: rotation_offset을 눈 중심 기준으로 추가 적용
+            if rotation_offset != 0:
+                rot_cx = float(eye_center[0])
+                rot_cy = float(eye_center[1])
+                R = cv2.getRotationMatrix2D((rot_cx, rot_cy), -rotation_offset, 1.0)
+                warped = cv2.warpAffine(warped, R, (w, h),
+                                        flags=cv2.INTER_LINEAR,
+                                        borderMode=cv2.BORDER_CONSTANT,
+                                        borderValue=(0, 0, 0, 0))
         else:
             # ── Affine 자동 모드 (일러스트) ──────────────────────────────
             # 얼굴 바운딩박스 높이 → 스케일 (이미지의 80%가 얼굴 영역이라 가정)
@@ -170,11 +182,15 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             if face_h_px <= 0:
                 continue
             scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
-            # 소스 이미지에서 눈 중심 위치
-            src_cx = img_w * (eye_x_pct / 100.0)
-            src_cy = img_h * (eye_y_pct / 100.0)
-            # Affine: 소스 눈 중심 → 화면 눈 중심, 회전 + 스케일
-            M = cv2.getRotationMatrix2D((src_cx, src_cy), -angle, scale)
+            # 피벗이 설정된 경우 피벗 좌표 사용, 없으면 눈 위치 슬라이더 사용
+            if pivot is not None:
+                src_cx = img_w * pivot[0]
+                src_cy = img_h * pivot[1]
+            else:
+                src_cx = img_w * (eye_x_pct / 100.0)
+                src_cy = img_h * (eye_y_pct / 100.0)
+            # Affine: 소스 피벗 → 화면 눈 중심, 회전 + 스케일 + 오프셋 회전
+            M = cv2.getRotationMatrix2D((src_cx, src_cy), -(angle + rotation_offset), scale)
             M[0, 2] += eye_center[0] - src_cx
             M[1, 2] += eye_center[1] - src_cy
             warped = cv2.warpAffine(face_img, M, (w, h),
@@ -415,6 +431,8 @@ class CameraPanel:
         self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
         self._eye_x_var     = tk.IntVar(value=50)   # 눈 위치 X (%)
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
+        self._face_pivot     = None                  # (norm_x, norm_y) 피벗, None = 슬라이더 사용
+        self._face_rot_var   = tk.IntVar(value=0)    # 추가 회전 오프셋 (°)
 
         # ── 오른팔 이미지 오버레이 상태
         self._arm_img        = None   # BGRA numpy array
@@ -644,6 +662,17 @@ class CameraPanel:
             wraplength=CTRL_W - 20,
         )
         self._face_img_lbl.pack(pady=(0, 2))
+        self._face_pivot_btn = tk.Button(
+            _fi_body, text="⊕ 피벗 설정",
+            font=("Segoe UI", 9),
+            bg=BG_CTRL, fg="#88ddff",
+            activebackground="#3a3a6a", activeforeground="#88ddff",
+            relief=tk.FLAT, cursor="hand2",
+            pady=3,
+            state=tk.DISABLED,
+            command=self._open_face_pivot_picker,
+        )
+        self._face_pivot_btn.pack(fill=tk.X, padx=6, pady=(0, 4))
         tk.Label(_fi_body, text="눈 위치 Y (%)",
                  font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
         tk.Scale(_fi_body, from_=10, to=90, orient=tk.HORIZONTAL,
@@ -656,6 +685,13 @@ class CameraPanel:
         tk.Scale(_fi_body, from_=10, to=90, orient=tk.HORIZONTAL,
                  variable=self._eye_x_var, length=170,
                  bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 2))
+        tk.Label(_fi_body, text="추가 회전 (°)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(_fi_body, from_=-180, to=180, orient=tk.HORIZONTAL,
+                 variable=self._face_rot_var, length=170,
+                 bg=BG_PANEL, fg="#ff9955", troughcolor=BG_CTRL,
                  highlightthickness=0, showvalue=True,
                  ).pack(pady=(0, 2))
         tk.Label(_fi_body, text="크기 (%)",
@@ -1379,10 +1415,13 @@ class CameraPanel:
         if self._face_img is not None:
             self._face_img = None
             self._face_img_pts = None
+            self._face_pivot = None
+            self._face_rot_var.set(0)
             for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
                 self._face_img_ema[_k] = None
             self._face_img_lbl.config(text="미선택")
             self._face_img_btn.config(text="이미지 로드")
+            self._face_pivot_btn.config(text="⊕ 피벗 설정", state=tk.DISABLED)
         else:
             self._load_face_image()
 
@@ -1429,8 +1468,88 @@ class CameraPanel:
 
         self._face_img = img.copy()
         self._face_img_pts = src_pts
+        self._face_pivot = None  # 새 이미지 로드 시 피벗 초기화
         self._face_img_lbl.config(text=os.path.basename(path) + mode_text)
         self._face_img_btn.config(text="× 이미지 제거")
+        self._face_pivot_btn.config(state=tk.NORMAL, text="⊕ 피벗 설정")
+
+    def _open_face_pivot_picker(self):
+        """얼굴 이미지 위에서 클릭하여 피벗 포인트를 설정하는 팝업."""
+        if self._face_img is None:
+            return
+        img_bgra = self._face_img
+        img_h, img_w = img_bgra.shape[:2]
+
+        # 팝업 내 표시 크기 (최대 420px)
+        max_side = 420
+        scale = min(max_side / img_w, max_side / img_h, 1.0)
+        dw, dh = max(1, int(img_w * scale)), max(1, int(img_h * scale))
+
+        top = tk.Toplevel(self.win)
+        top.title("피벗 포인트 설정")
+        top.resizable(False, False)
+        top.grab_set()
+
+        tk.Label(top, text="피벗으로 사용할 포인트를 클릭하세요.",
+                 font=("Segoe UI", 9)).pack(padx=10, pady=(8, 4))
+
+        canvas = tk.Canvas(top, width=dw, height=dh, cursor="crosshair",
+                            highlightthickness=1, highlightbackground="#555")
+        canvas.pack(padx=10, pady=(0, 4))
+
+        rgb = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2RGB)
+        photo = ImageTk.PhotoImage(Image.fromarray(rgb).resize((dw, dh), Image.LANCZOS))
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas._photo = photo  # 참조 유지
+
+        pivot_ref = [self._face_pivot]
+
+        def _draw_marker(nx, ny):
+            canvas.delete("pivot_marker")
+            x, y = int(nx * dw), int(ny * dh)
+            r = 9
+            canvas.create_oval(x-r, y-r, x+r, y+r,
+                                outline="#ff4444", width=2, tags="pivot_marker")
+            canvas.create_line(x-r-4, y, x+r+4, y,
+                                fill="#ff4444", width=2, tags="pivot_marker")
+            canvas.create_line(x, y-r-4, x, y+r+4,
+                                fill="#ff4444", width=2, tags="pivot_marker")
+
+        if pivot_ref[0] is not None:
+            _draw_marker(*pivot_ref[0])
+
+        def _on_click(event):
+            nx = max(0.0, min(1.0, event.x / dw))
+            ny = max(0.0, min(1.0, event.y / dh))
+            pivot_ref[0] = (nx, ny)
+            _draw_marker(nx, ny)
+
+        canvas.bind("<Button-1>", _on_click)
+
+        def _ok():
+            self._face_pivot = pivot_ref[0]
+            pct_text = ""
+            if self._face_pivot is not None:
+                px = int(self._face_pivot[0] * 100)
+                py = int(self._face_pivot[1] * 100)
+                pct_text = f" ({px}%, {py}%)"
+            self._face_pivot_btn.config(
+                text=f"⊕ 피벗 설정{pct_text}" if self._face_pivot else "⊕ 피벗 설정"
+            )
+            top.destroy()
+
+        def _reset():
+            pivot_ref[0] = None
+            canvas.delete("pivot_marker")
+
+        btn_row = tk.Frame(top)
+        btn_row.pack(pady=(0, 8))
+        tk.Button(btn_row, text="리셋", width=7,
+                  command=_reset).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="취소", width=7,
+                  command=top.destroy).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="확인", width=7,
+                  command=_ok).pack(side=tk.LEFT, padx=4)
 
     # ── 입 벌림 이미지 로드/제거 ──────────────────────────────────────────
     def _toggle_face_image_open(self):
@@ -1664,7 +1783,9 @@ class CameraPanel:
                                             eye_y_pct=self._eye_y_var.get(),
                                             eye_x_pct=self._eye_x_var.get(),
                                             size_pct=self._img_size_var.get(),
-                                            ema_state=self._face_img_ema)
+                                            ema_state=self._face_img_ema,
+                                            pivot=self._face_pivot,
+                                            rotation_offset=self._face_rot_var.get())
 
                 # ── 오른팔 이미지 오버레이
                 if self._arm_img is not None:
