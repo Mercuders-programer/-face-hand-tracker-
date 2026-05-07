@@ -110,25 +110,56 @@ def _compute_mar(face_res, w: int, h: int) -> float:
     return mouth_gap / eye_dist if eye_dist > 1 else 0.0
 
 
+def _similarity_2pt(src1, src2, dst1, dst2):
+    """두 대응점으로 유사 변환(scale+rotation+translate) 2×3 행렬 반환."""
+    sv = np.asarray(src2, dtype=np.float64) - np.asarray(src1, dtype=np.float64)
+    dv = np.asarray(dst2, dtype=np.float64) - np.asarray(dst1, dtype=np.float64)
+    sd = np.linalg.norm(sv)
+    if sd < 1e-6:
+        return None
+    scale = np.linalg.norm(dv) / sd
+    rot = np.arctan2(float(dv[1]), float(dv[0])) - np.arctan2(float(sv[1]), float(sv[0]))
+    cr, sr = np.cos(rot) * scale, np.sin(rot) * scale
+    M = np.float32([[cr, -sr, 0.0], [sr, cr, 0.0]])
+    s1 = np.asarray(src1, dtype=np.float64)
+    d1 = np.asarray(dst1, dtype=np.float64)
+    M[0, 2] = float(d1[0]) - (M[0, 0] * float(s1[0]) + M[0, 1] * float(s1[1]))
+    M[1, 2] = float(d1[1]) - (M[1, 0] * float(s1[0]) + M[1, 1] * float(s1[1]))
+    return M
+
+
 def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                              eye_y_pct=55, eye_x_pct=50, size_pct=100,
                              ema_state: dict | None = None,
-                             pivot=None, rotation_offset=0):
+                             pivot=None, rotation_offset=0,
+                             side_img=None, side_pts=None, side_threshold=45.0,
+                             side_anchors=None,
+                             side_eye_y_pct=55, side_eye_x_pct=50, side_size_pct=100,
+                             side_ema_state: dict | None = None):
     """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
-    face_img_pts is not None → Homography 정밀 모드 (실제 얼굴 사진)
-    face_img_pts is None     → Affine 자동 모드  (일러스트/그림)
-    ema_state: {'face_h', 'eye_cx', 'eye_cy', 'angle', 'alpha'} — EMA 상태 dict
-    pivot: (norm_x, norm_y) 소스 이미지 기준 정규화 피벗 좌표 (None=눈 위치 슬라이더 사용)
-    rotation_offset: 추가 회전 오프셋 (도, °)
+    side_anchors: {'eye':(nx,ny), 'nose':(nx,ny)} — 옆모습 2-point 유사변환
     """
     if not face_res.face_landmarks:
-        # 얼굴 없으면 EMA 상태 리셋 (다음 감지 때 cold-start)
         if ema_state is not None:
             for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
                 ema_state[_k] = None
+        if side_ema_state is not None:
+            for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle',
+                       's_eye_x', 's_eye_y', 's_nose_x', 's_nose_y'):
+                side_ema_state[_k] = None
         return
-    img_h, img_w = face_img.shape[:2]
     for _lf in face_res.face_landmarks:
+        yaw = getattr(_lf, 'yaw', 0.0)
+        is_side = (side_img is not None and abs(yaw) > side_threshold)
+        if is_side:
+            _fi, _fp = side_img, side_pts
+            _piv = None
+        else:
+            _fi, _fp = face_img, face_img_pts
+            _piv = pivot
+        if _fi is None:
+            continue
+        img_h, img_w = _fi.shape[:2]
         if len(_lf) < 264:
             continue
         r_eye = np.array([_lf[33].x * w, _lf[33].y * h], dtype=np.float64)
@@ -136,19 +167,53 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
         eye_center = (r_eye + l_eye) / 2.0
         angle = float(np.degrees(np.arctan2(l_eye[1] - r_eye[1], l_eye[0] - r_eye[0])))
 
-        if face_img_pts is not None:
+        # ── 옆모습 2-point 유사 변환 (눈+코 앵커 설정 시 우선 적용) ────────
+        if is_side and side_anchors and side_anchors.get('eye') and side_anchors.get('nose'):
+            _ae, _an = side_anchors['eye'], side_anchors['nose']
+            src_eye_px  = np.array([img_w * _ae[0], img_h * _ae[1]], dtype=np.float64)
+            src_nose_px = np.array([img_w * _an[0], img_h * _an[1]], dtype=np.float64)
+            raw_dst_eye  = (l_eye if yaw >= 0 else r_eye)
+            raw_dst_nose = np.array([_lf[4].x * w, _lf[4].y * h], dtype=np.float64)
+            _se = side_ema_state if side_ema_state is not None else ema_state
+            if _se is not None:
+                _ex = _adaptive_ema_update(_se, 's_eye_x',  float(raw_dst_eye[0]),  catch_scale=40.0)
+                _ey = _adaptive_ema_update(_se, 's_eye_y',  float(raw_dst_eye[1]),  catch_scale=40.0)
+                _nx = _adaptive_ema_update(_se, 's_nose_x', float(raw_dst_nose[0]), catch_scale=40.0)
+                _ny = _adaptive_ema_update(_se, 's_nose_y', float(raw_dst_nose[1]), catch_scale=40.0)
+                dst_eye  = np.array([_ex, _ey], dtype=np.float64)
+                dst_nose = np.array([_nx, _ny], dtype=np.float64)
+            else:
+                dst_eye, dst_nose = raw_dst_eye, raw_dst_nose
+            M2 = _similarity_2pt(src_eye_px, src_nose_px, dst_eye, dst_nose)
+            if M2 is None:
+                continue
+            warped = cv2.warpAffine(_fi, M2, (w, h),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT,
+                                    borderValue=(0, 0, 0, 0))
+
+        elif _fp is not None:
             # ── Homography 정밀 모드 ─────────────────────────────────────
             if len(_lf) <= max(_FACE_IMG_KPT):
                 continue
-            dst_pts = np.float32([[_lf[i].x * w, _lf[i].y * h] for i in _FACE_IMG_KPT])
-            M, _ = cv2.findHomography(face_img_pts, dst_pts)
+            raw_dst = np.float32([[_lf[i].x * w, _lf[i].y * h] for i in _FACE_IMG_KPT])
+            _ema_h = (side_ema_state if (is_side and side_ema_state is not None)
+                      else ema_state)
+            if _ema_h is not None:
+                raw_cx = float(eye_center[0])
+                raw_cy = float(eye_center[1])
+                s_cx = _adaptive_ema_update(_ema_h, 'eye_cx', raw_cx, catch_scale=40.0)
+                s_cy = _adaptive_ema_update(_ema_h, 'eye_cy', raw_cy, catch_scale=40.0)
+                dst_pts = raw_dst + np.float32([s_cx - raw_cx, s_cy - raw_cy])
+            else:
+                dst_pts = raw_dst
+            M, _ = cv2.findHomography(_fp, dst_pts)
             if M is None:
                 continue
-            warped = cv2.warpPerspective(face_img, M, (w, h),
+            warped = cv2.warpPerspective(_fi, M, (w, h),
                                          flags=cv2.INTER_LINEAR,
                                          borderMode=cv2.BORDER_CONSTANT,
                                          borderValue=(0, 0, 0, 0))
-            # Homography 모드: rotation_offset을 눈 중심 기준으로 추가 적용
             if rotation_offset != 0:
                 rot_cx = float(eye_center[0])
                 rot_cy = float(eye_center[1])
@@ -159,9 +224,12 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                                         borderValue=(0, 0, 0, 0))
         else:
             # ── Affine 자동 모드 (일러스트) ──────────────────────────────
-            # 얼굴 바운딩박스 높이 → 스케일 (이미지의 80%가 얼굴 영역이라 가정)
+            _ey_pct  = side_eye_y_pct if is_side else eye_y_pct
+            _ex_pct  = side_eye_x_pct if is_side else eye_x_pct
+            _sz_pct  = side_size_pct  if is_side else size_pct
+            _ema     = (side_ema_state if (is_side and side_ema_state is not None)
+                        else ema_state)
             if hasattr(_lf, 'bbox'):
-                # InsightFace: bbox로 얼굴 높이 계산
                 raw_face_h = float(_lf.bbox[3] - _lf.bbox[1])
             else:
                 ys = [_lf[i].y * h for i in range(len(_lf))]
@@ -169,31 +237,28 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             raw_eye_cx, raw_eye_cy = float(eye_center[0]), float(eye_center[1])
             raw_angle = angle
 
-            # ── EMA 평활화 적용 (떨림 제거) ──
-            if ema_state is not None:
-                face_h_px  = _adaptive_ema_update(ema_state, 'face_h', raw_face_h, catch_scale=30.0)
-                _ec_x      = _adaptive_ema_update(ema_state, 'eye_cx', raw_eye_cx, catch_scale=40.0)
-                _ec_y      = _adaptive_ema_update(ema_state, 'eye_cy', raw_eye_cy, catch_scale=40.0)
-                angle      = _adaptive_ema_update(ema_state, 'angle',  raw_angle,  catch_scale=10.0)
+            if _ema is not None:
+                face_h_px  = _adaptive_ema_update(_ema, 'face_h', raw_face_h, catch_scale=30.0)
+                _ec_x      = _adaptive_ema_update(_ema, 'eye_cx', raw_eye_cx, catch_scale=40.0)
+                _ec_y      = _adaptive_ema_update(_ema, 'eye_cy', raw_eye_cy, catch_scale=40.0)
+                angle      = _adaptive_ema_update(_ema, 'angle',  raw_angle,  catch_scale=10.0)
                 eye_center = (_ec_x, _ec_y)
             else:
                 face_h_px = raw_face_h
 
             if face_h_px <= 0:
                 continue
-            scale = face_h_px * (size_pct / 100.0) / (img_h * 0.8)
-            # 피벗이 설정된 경우 피벗 좌표 사용, 없으면 눈 위치 슬라이더 사용
-            if pivot is not None:
-                src_cx = img_w * pivot[0]
-                src_cy = img_h * pivot[1]
+            scale = face_h_px * (_sz_pct / 100.0) / (img_h * 0.8)
+            if _piv is not None:
+                src_cx = img_w * _piv[0]
+                src_cy = img_h * _piv[1]
             else:
-                src_cx = img_w * (eye_x_pct / 100.0)
-                src_cy = img_h * (eye_y_pct / 100.0)
-            # Affine: 소스 피벗 → 화면 눈 중심, 회전 + 스케일 + 오프셋 회전
+                src_cx = img_w * (_ex_pct / 100.0)
+                src_cy = img_h * (_ey_pct / 100.0)
             M = cv2.getRotationMatrix2D((src_cx, src_cy), -(angle + rotation_offset), scale)
             M[0, 2] += eye_center[0] - src_cx
             M[1, 2] += eye_center[1] - src_cy
-            warped = cv2.warpAffine(face_img, M, (w, h),
+            warped = cv2.warpAffine(_fi, M, (w, h),
                                     flags=cv2.INTER_LINEAR,
                                     borderMode=cv2.BORDER_CONSTANT,
                                     borderValue=(0, 0, 0, 0))
@@ -295,6 +360,177 @@ def _apply_arm_img_overlay(overlay, pose_res, w, h, arm_img,
             + overlay.astype(np.float32) * (1.0 - alpha),
             0, 255,
         ).astype(np.uint8)
+
+
+def _apply_shoe_img_overlay(overlay, pose_res, w, h, shoe_img,
+                             size_pct=100, ema_state=None, side='right'):
+    """발목(ankle) 위치에 신발 이미지 합성.
+    side='right': 26(knee)/28(ankle)/32(foot), 'left': 25/27/31"""
+    if not pose_res.pose_landmarks:
+        if ema_state is not None:
+            for _k in ('ankle_x', 'ankle_y', 'angle', 'shin_len'):
+                ema_state[_k] = None
+        return
+    if side == 'right':
+        knee_idx, ankle_idx, foot_idx = 26, 28, 32
+    else:
+        knee_idx, ankle_idx, foot_idx = 25, 27, 31
+    img_h, img_w = shoe_img.shape[:2]
+    for _pl in pose_res.pose_landmarks:
+        if len(_pl) <= max(knee_idx, ankle_idx):
+            continue
+        ankle = _pl[ankle_idx]
+        knee  = _pl[knee_idx]
+        if ankle.visibility < 0.3:
+            continue
+        raw_ax   = ankle.x * w
+        raw_ay   = ankle.y * h
+        raw_kx   = knee.x * w
+        raw_ky   = knee.y * h
+        raw_shin = float(np.hypot((ankle.x - knee.x) * w, (ankle.y - knee.y) * h))
+        if len(_pl) > foot_idx and _pl[foot_idx].visibility >= 0.2:
+            raw_fx = _pl[foot_idx].x * w
+            raw_fy = _pl[foot_idx].y * h
+        else:
+            raw_fx = raw_ax + (raw_ax - raw_kx) * 0.4
+            raw_fy = raw_ay + (raw_ay - raw_ky) * 0.4
+        raw_ang = float(np.degrees(np.arctan2(raw_fy - raw_ay, raw_fx - raw_ax)))
+        if ema_state is not None:
+            ax   = _adaptive_ema_update(ema_state, 'ankle_x',  raw_ax,   40.0)
+            ay   = _adaptive_ema_update(ema_state, 'ankle_y',  raw_ay,   40.0)
+            ang  = _adaptive_ema_update(ema_state, 'angle',    raw_ang,  10.0)
+            shin = _adaptive_ema_update(ema_state, 'shin_len', raw_shin, 30.0)
+        else:
+            ax, ay = raw_ax, raw_ay
+            ang, shin = raw_ang, raw_shin
+        scale  = shin * (size_pct / 100.0) / img_h
+        src_cx = img_w * 0.5
+        src_cy = img_h * 0.2
+        M = cv2.getRotationMatrix2D((src_cx, src_cy), -ang, scale)
+        M[0, 2] += ax - src_cx
+        M[1, 2] += ay - src_cy
+        warped = cv2.warpAffine(shoe_img, M, (w, h),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(0, 0, 0, 0))
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        overlay[:] = np.clip(
+            warped[:, :, :3].astype(np.float32) * alpha
+            + overlay.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+        break
+
+
+def _apply_glove_img_overlay(overlay, hand_res, w, h, glove_img,
+                              size_pct=100, ema_state=None, side='right'):
+    """손목(lm[0]) + 중지MCP(lm[9]) 방향으로 장갑 이미지 합성."""
+    if not hand_res.hand_landmarks:
+        if ema_state is not None:
+            for _k in ('wrist_x', 'wrist_y', 'angle', 'palm_len'):
+                ema_state[_k] = None
+        return
+    img_h, img_w = glove_img.shape[:2]
+    for i, _hl in enumerate(hand_res.hand_landmarks):
+        if len(_hl) < 10:
+            continue
+        hand_label = 'Right'
+        if hand_res.handedness and i < len(hand_res.handedness) and hand_res.handedness[i]:
+            hand_label = hand_res.handedness[i][0].category_name
+        if side == 'right' and hand_label != 'Right':
+            continue
+        if side == 'left' and hand_label != 'Left':
+            continue
+        wrist = _hl[0]
+        mcp   = _hl[9]
+        raw_wx  = wrist.x * w
+        raw_wy  = wrist.y * h
+        raw_mx  = mcp.x * w
+        raw_my  = mcp.y * h
+        raw_ang = float(np.degrees(np.arctan2(raw_my - raw_wy, raw_mx - raw_wx)))
+        raw_pln = float(np.hypot(raw_mx - raw_wx, raw_my - raw_wy))
+        if raw_pln < 5:
+            continue
+        if ema_state is not None:
+            wx  = _adaptive_ema_update(ema_state, 'wrist_x',  raw_wx,  40.0)
+            wy  = _adaptive_ema_update(ema_state, 'wrist_y',  raw_wy,  40.0)
+            ang = _adaptive_ema_update(ema_state, 'angle',    raw_ang, 10.0)
+            pln = _adaptive_ema_update(ema_state, 'palm_len', raw_pln, 30.0)
+        else:
+            wx, wy = raw_wx, raw_wy
+            ang, pln = raw_ang, raw_pln
+        scale  = pln * (size_pct / 100.0) / (img_h * 0.4)
+        src_cx = img_w * 0.5
+        src_cy = img_h * 0.8
+        M = cv2.getRotationMatrix2D((src_cx, src_cy), -ang, scale)
+        M[0, 2] += wx - src_cx
+        M[1, 2] += wy - src_cy
+        warped = cv2.warpAffine(glove_img, M, (w, h),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(0, 0, 0, 0))
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        overlay[:] = np.clip(
+            warped[:, :, :3].astype(np.float32) * alpha
+            + overlay.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+
+
+def _apply_weapon_img_overlay(overlay, hand_res, w, h, weapon_img,
+                               size_pct=100, ema_state=None, hand_side='right'):
+    """손목(lm[0]) + 중지MCP(lm[9]) 방향으로 무기 이미지 합성. 피벗=손잡이(90%)."""
+    if not hand_res.hand_landmarks:
+        if ema_state is not None:
+            for _k in ('wrist_x', 'wrist_y', 'angle', 'palm_len'):
+                ema_state[_k] = None
+        return
+    img_h, img_w = weapon_img.shape[:2]
+    for i, _hl in enumerate(hand_res.hand_landmarks):
+        if len(_hl) < 10:
+            continue
+        hand_label = 'Right'
+        if hand_res.handedness and i < len(hand_res.handedness) and hand_res.handedness[i]:
+            hand_label = hand_res.handedness[i][0].category_name
+        if hand_side == 'right' and hand_label != 'Right':
+            continue
+        if hand_side == 'left' and hand_label != 'Left':
+            continue
+        wrist = _hl[0]
+        mcp   = _hl[9]
+        raw_wx  = wrist.x * w
+        raw_wy  = wrist.y * h
+        raw_mx  = mcp.x * w
+        raw_my  = mcp.y * h
+        raw_ang = float(np.degrees(np.arctan2(raw_my - raw_wy, raw_mx - raw_wx)))
+        raw_pln = float(np.hypot(raw_mx - raw_wx, raw_my - raw_wy))
+        if raw_pln < 5:
+            continue
+        if ema_state is not None:
+            wx  = _adaptive_ema_update(ema_state, 'wrist_x',  raw_wx,  40.0)
+            wy  = _adaptive_ema_update(ema_state, 'wrist_y',  raw_wy,  40.0)
+            ang = _adaptive_ema_update(ema_state, 'angle',    raw_ang, 10.0)
+            pln = _adaptive_ema_update(ema_state, 'palm_len', raw_pln, 30.0)
+        else:
+            wx, wy = raw_wx, raw_wy
+            ang, pln = raw_ang, raw_pln
+        scale  = pln * (size_pct / 100.0) / (img_h * 0.17)
+        src_cx = img_w * 0.5
+        src_cy = img_h * 0.9
+        M = cv2.getRotationMatrix2D((src_cx, src_cy), -ang, scale)
+        M[0, 2] += wx - src_cx
+        M[1, 2] += wy - src_cy
+        warped = cv2.warpAffine(weapon_img, M, (w, h),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT,
+                                borderValue=(0, 0, 0, 0))
+        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        overlay[:] = np.clip(
+            warped[:, :, :3].astype(np.float32) * alpha
+            + overlay.astype(np.float32) * (1.0 - alpha),
+            0, 255,
+        ).astype(np.uint8)
+        break
 
 
 def _apply_face_mosaic(frame, face_res, w, h, block=20):
@@ -433,6 +669,21 @@ class CameraPanel:
         self._img_size_var  = tk.IntVar(value=100)  # 크기 배율 (%)
         self._face_pivot     = None                  # (norm_x, norm_y) 피벗, None = 슬라이더 사용
         self._face_rot_var   = tk.IntVar(value=0)    # 추가 회전 오프셋 (°)
+        self._face_img_side     = None               # BGRA (옆모습 이미지)
+        self._face_img_side_pts = None
+        self._face_img_side_anchors = None           # {'eye':…,'nose':…} 옆모습 2-point 앵커
+        self._face_img_side_kps_n = None             # 정규화 kps (옆모습 피벗 피커용)
+        self._side_thr_var      = tk.IntVar(value=45)  # 옆모습 전환 yaw 임계값 (°)
+        self._side_eye_y_var    = tk.IntVar(value=55)  # 옆모습 눈 위치 Y (%)
+        self._side_eye_x_var    = tk.IntVar(value=50)  # 옆모습 눈 위치 X (%)
+        self._side_img_size_var = tk.IntVar(value=100) # 옆모습 크기 배율 (%)
+        self._side_ema_smooth_var = tk.IntVar(value=85)# 옆모습 떨림 보정 강도
+        self._face_img_side_ema: dict = {
+            'face_h': None, 'eye_cx': None, 'eye_cy': None, 'angle': None,
+            's_eye_x': None, 's_eye_y': None, 's_nose_x': None, 's_nose_y': None,
+            'alpha': 0.15,
+        }
+        self._face_img_kps_n    = None               # 정규화 5-kps (피벗 피커 전용)
 
         # ── 오른팔 이미지 오버레이 상태
         self._arm_img        = None   # BGRA numpy array
@@ -470,9 +721,65 @@ class CameraPanel:
         self._arm_pin_btn_l   = None   # 피벗 설정 버튼 참조
         self._arm_pin_lbl_l   = None   # 피벗 상태 레이블 참조
 
+        # ── 신발 이미지 오버레이 상태
+        self._shoe_img_r      = None
+        self._shoe_img_l      = None
+        self._shoe_size_var   = tk.IntVar(value=100)
+        self._shoe_smooth_var = tk.IntVar(value=85)
+        self._shoe_img_ema_r  = {
+            'ankle_x': None, 'ankle_y': None,
+            'angle': None, 'shin_len': None, 'alpha': 0.15,
+        }
+        self._shoe_img_ema_l  = {
+            'ankle_x': None, 'ankle_y': None,
+            'angle': None, 'shin_len': None, 'alpha': 0.15,
+        }
+        self._shoe_img_btn_r  = None
+        self._shoe_img_lbl_r  = None
+        self._shoe_img_btn_l  = None
+        self._shoe_img_lbl_l  = None
+
+        # ── 장갑 이미지 오버레이 상태
+        self._glove_img_r      = None
+        self._glove_img_l      = None
+        self._glove_size_var   = tk.IntVar(value=100)
+        self._glove_smooth_var = tk.IntVar(value=85)
+        self._glove_img_ema_r  = {
+            'wrist_x': None, 'wrist_y': None,
+            'angle': None, 'palm_len': None, 'alpha': 0.15,
+        }
+        self._glove_img_ema_l  = {
+            'wrist_x': None, 'wrist_y': None,
+            'angle': None, 'palm_len': None, 'alpha': 0.15,
+        }
+        self._glove_img_btn_r  = None
+        self._glove_img_lbl_r  = None
+        self._glove_img_btn_l  = None
+        self._glove_img_lbl_l  = None
+
+        # ── 무기 이미지 오버레이 상태
+        self._weapon_img       = None
+        self._weapon_hand_var  = tk.StringVar(value='right')
+        self._weapon_size_var  = tk.IntVar(value=100)
+        self._weapon_smooth_var = tk.IntVar(value=85)
+        self._weapon_img_ema_r = {
+            'wrist_x': None, 'wrist_y': None,
+            'angle': None, 'palm_len': None, 'alpha': 0.15,
+        }
+        self._weapon_img_ema_l = {
+            'wrist_x': None, 'wrist_y': None,
+            'angle': None, 'palm_len': None, 'alpha': 0.15,
+        }
+        self._weapon_img_btn   = None
+        self._weapon_img_lbl   = None
+
         self._build_ui()
-        self._on_ema_smooth_change()   # 슬라이더 초기값 → EMA alpha 동기화
-        self._on_arm_smooth_change()   # arm EMA alpha 동기화
+        self._on_ema_smooth_change()        # 슬라이더 초기값 → EMA alpha 동기화
+        self._on_side_ema_smooth_change()   # 옆모습 EMA alpha 동기화
+        self._on_arm_smooth_change()        # arm EMA alpha 동기화
+        self._on_shoe_smooth_change()       # shoe EMA alpha 동기화
+        self._on_glove_smooth_change()      # glove EMA alpha 동기화
+        self._on_weapon_smooth_change()     # weapon EMA alpha 동기화
         # 패널 열리면 자동으로 카메라 시작
         self.win.after(200, self._start_camera)
 
@@ -733,6 +1040,84 @@ class CameraPanel:
         )
         self._mouth_thr_scale.pack(pady=(0, 4))
 
+        tk.Frame(_fi_body, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(2, 6))
+
+        self._face_img_side_btn = self._make_btn(
+            _fi_body, "🖼  옆모습 이미지 로드", BG_CTRL,
+            command=self._toggle_face_img_side,
+        )
+        self._face_img_side_lbl = tk.Label(
+            _fi_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL,
+            wraplength=CTRL_W - 20,
+        )
+        self._face_img_side_lbl.pack(pady=(0, 2))
+        self._face_side_pivot_btn = self._make_btn(
+            _fi_body, "⊕ 앵커 설정 (옆)", "#2a2a4a",
+            command=self._open_face_side_pivot_picker,
+        )
+        self._face_side_pivot_btn.config(state=tk.DISABLED, fg="#ffaa55",
+                                          activeforeground="#ffaa55")
+        tk.Label(_fi_body, text="전환 각도 (yaw°)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        self._side_thr_scale = tk.Scale(
+            _fi_body, from_=10, to=80, orient=tk.HORIZONTAL,
+            variable=self._side_thr_var, length=170,
+            bg=BG_PANEL, fg="#ffaa55", troughcolor=BG_CTRL,
+            highlightthickness=0, showvalue=True,
+            state=tk.DISABLED,
+        )
+        self._side_thr_scale.pack(pady=(0, 4))
+
+        # 옆모습 위치 Y
+        tk.Label(_fi_body, text="위치 Y (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        self._side_eye_y_scale = tk.Scale(
+            _fi_body, from_=0, to=100, orient=tk.HORIZONTAL,
+            variable=self._side_eye_y_var, length=170,
+            bg=BG_PANEL, fg="#ffaa55", troughcolor=BG_CTRL,
+            highlightthickness=0, showvalue=True,
+            state=tk.DISABLED,
+        )
+        self._side_eye_y_scale.pack(pady=(0, 2))
+
+        # 옆모습 위치 X
+        tk.Label(_fi_body, text="위치 X (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        self._side_eye_x_scale = tk.Scale(
+            _fi_body, from_=0, to=100, orient=tk.HORIZONTAL,
+            variable=self._side_eye_x_var, length=170,
+            bg=BG_PANEL, fg="#ffaa55", troughcolor=BG_CTRL,
+            highlightthickness=0, showvalue=True,
+            state=tk.DISABLED,
+        )
+        self._side_eye_x_scale.pack(pady=(0, 2))
+
+        # 옆모습 크기
+        tk.Label(_fi_body, text="크기 (%)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        self._side_img_size_scale = tk.Scale(
+            _fi_body, from_=10, to=300, orient=tk.HORIZONTAL,
+            variable=self._side_img_size_var, length=170,
+            bg=BG_PANEL, fg="#ffaa55", troughcolor=BG_CTRL,
+            highlightthickness=0, showvalue=True,
+            state=tk.DISABLED,
+        )
+        self._side_img_size_scale.pack(pady=(0, 2))
+
+        # 옆모습 떨림 보정
+        tk.Label(_fi_body, text="떨림 보정 (옆)",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        self._side_ema_smooth_scale = tk.Scale(
+            _fi_body, from_=0, to=95, orient=tk.HORIZONTAL,
+            variable=self._side_ema_smooth_var, length=170,
+            command=self._on_side_ema_smooth_change,
+            bg=BG_PANEL, fg="#ffaa55", troughcolor=BG_CTRL,
+            highlightthickness=0, showvalue=True,
+            state=tk.DISABLED,
+        )
+        self._side_ema_smooth_scale.pack(pady=(0, 4))
+
         self._separator(right)
 
         # ── 오른팔 이미지 (접기/펴기) ──
@@ -877,6 +1262,255 @@ class CameraPanel:
             command=lambda: self._open_pin_picker(side='left'), state=tk.DISABLED,
         )
         self._arm_pin_btn_l.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        self._separator(right)
+
+        # ── 오른발 신발 이미지 (접기/펴기) ──
+        _shoer_open = tk.BooleanVar(value=True)
+        _shoer_hdr = tk.Frame(right, bg=BG_PANEL, cursor="hand2")
+        _shoer_hdr.pack(fill=tk.X)
+        _shoer_lbl = tk.Label(
+            _shoer_hdr, text="▼  오른발 신발",
+            font=("Segoe UI", 10, "bold"), fg=TEXT_G, bg=BG_PANEL,
+        )
+        _shoer_lbl.pack(pady=(14, 4))
+        _shoer_sep = ttk.Separator(right, orient="horizontal")
+        _shoer_sep.pack(fill=tk.X, pady=(0, 4), padx=12)
+        _shoer_body = tk.Frame(right, bg=BG_PANEL)
+        _shoer_body.pack(fill=tk.X)
+
+        def _toggle_shoer_img(_e=None):
+            if _shoer_open.get():
+                _shoer_body.pack_forget()
+                _shoer_lbl.config(text="▶  오른발 신발")
+                _shoer_open.set(False)
+            else:
+                _shoer_body.pack(fill=tk.X, after=_shoer_sep)
+                _shoer_lbl.config(text="▼  오른발 신발")
+                _shoer_open.set(True)
+
+        _shoer_hdr.bind("<Button-1>", _toggle_shoer_img)
+        _shoer_lbl.bind("<Button-1>", _toggle_shoer_img)
+        self._panel_sections.append((_shoer_open, _toggle_shoer_img))
+
+        self._shoe_img_btn_r = self._make_btn(
+            _shoer_body, "👟  이미지 로드", BG_CTRL,
+            command=lambda: self._toggle_shoe_image(side='right'),
+        )
+        self._shoe_img_lbl_r = tk.Label(
+            _shoer_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, wraplength=CTRL_W - 20,
+        )
+        self._shoe_img_lbl_r.pack(pady=(0, 2))
+        tk.Label(_shoer_body, text="크기 (%)", font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(_shoer_body, from_=30, to=300, orient=tk.HORIZONTAL,
+                 variable=self._shoe_size_var, length=170,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 2))
+        tk.Label(_shoer_body, text="떨림 보정", font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(_shoer_body, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._shoe_smooth_var, length=170,
+                 bg=BG_PANEL, fg="#88ddff", troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_shoe_smooth_change,
+                 ).pack(pady=(0, 4))
+
+        self._separator(right)
+
+        # ── 왼발 신발 이미지 (접기/펴기) ──
+        _shoel_open = tk.BooleanVar(value=True)
+        _shoel_hdr = tk.Frame(right, bg=BG_PANEL, cursor="hand2")
+        _shoel_hdr.pack(fill=tk.X)
+        _shoel_lbl = tk.Label(
+            _shoel_hdr, text="▼  왼발 신발",
+            font=("Segoe UI", 10, "bold"), fg=TEXT_G, bg=BG_PANEL,
+        )
+        _shoel_lbl.pack(pady=(14, 4))
+        _shoel_sep = ttk.Separator(right, orient="horizontal")
+        _shoel_sep.pack(fill=tk.X, pady=(0, 4), padx=12)
+        _shoel_body = tk.Frame(right, bg=BG_PANEL)
+        _shoel_body.pack(fill=tk.X)
+
+        def _toggle_shoel_img(_e=None):
+            if _shoel_open.get():
+                _shoel_body.pack_forget()
+                _shoel_lbl.config(text="▶  왼발 신발")
+                _shoel_open.set(False)
+            else:
+                _shoel_body.pack(fill=tk.X, after=_shoel_sep)
+                _shoel_lbl.config(text="▼  왼발 신발")
+                _shoel_open.set(True)
+
+        _shoel_hdr.bind("<Button-1>", _toggle_shoel_img)
+        _shoel_lbl.bind("<Button-1>", _toggle_shoel_img)
+        self._panel_sections.append((_shoel_open, _toggle_shoel_img))
+
+        self._shoe_img_btn_l = self._make_btn(
+            _shoel_body, "👟  이미지 로드", BG_CTRL,
+            command=lambda: self._toggle_shoe_image(side='left'),
+        )
+        self._shoe_img_lbl_l = tk.Label(
+            _shoel_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, wraplength=CTRL_W - 20,
+        )
+        self._shoe_img_lbl_l.pack(pady=(0, 2))
+
+        self._separator(right)
+
+        # ── 오른손 장갑 이미지 (접기/펴기) ──
+        _glover_open = tk.BooleanVar(value=True)
+        _glover_hdr = tk.Frame(right, bg=BG_PANEL, cursor="hand2")
+        _glover_hdr.pack(fill=tk.X)
+        _glover_lbl = tk.Label(
+            _glover_hdr, text="▼  오른손 장갑",
+            font=("Segoe UI", 10, "bold"), fg=TEXT_G, bg=BG_PANEL,
+        )
+        _glover_lbl.pack(pady=(14, 4))
+        _glover_sep = ttk.Separator(right, orient="horizontal")
+        _glover_sep.pack(fill=tk.X, pady=(0, 4), padx=12)
+        _glover_body = tk.Frame(right, bg=BG_PANEL)
+        _glover_body.pack(fill=tk.X)
+
+        def _toggle_glover_img(_e=None):
+            if _glover_open.get():
+                _glover_body.pack_forget()
+                _glover_lbl.config(text="▶  오른손 장갑")
+                _glover_open.set(False)
+            else:
+                _glover_body.pack(fill=tk.X, after=_glover_sep)
+                _glover_lbl.config(text="▼  오른손 장갑")
+                _glover_open.set(True)
+
+        _glover_hdr.bind("<Button-1>", _toggle_glover_img)
+        _glover_lbl.bind("<Button-1>", _toggle_glover_img)
+        self._panel_sections.append((_glover_open, _toggle_glover_img))
+
+        self._glove_img_btn_r = self._make_btn(
+            _glover_body, "🧤  이미지 로드", BG_CTRL,
+            command=lambda: self._toggle_glove_image(side='right'),
+        )
+        self._glove_img_lbl_r = tk.Label(
+            _glover_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, wraplength=CTRL_W - 20,
+        )
+        self._glove_img_lbl_r.pack(pady=(0, 2))
+        tk.Label(_glover_body, text="크기 (%)", font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(_glover_body, from_=30, to=300, orient=tk.HORIZONTAL,
+                 variable=self._glove_size_var, length=170,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 2))
+        tk.Label(_glover_body, text="떨림 보정", font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(_glover_body, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._glove_smooth_var, length=170,
+                 bg=BG_PANEL, fg="#88ddff", troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_glove_smooth_change,
+                 ).pack(pady=(0, 4))
+
+        self._separator(right)
+
+        # ── 왼손 장갑 이미지 (접기/펴기) ──
+        _glovel_open = tk.BooleanVar(value=True)
+        _glovel_hdr = tk.Frame(right, bg=BG_PANEL, cursor="hand2")
+        _glovel_hdr.pack(fill=tk.X)
+        _glovel_lbl = tk.Label(
+            _glovel_hdr, text="▼  왼손 장갑",
+            font=("Segoe UI", 10, "bold"), fg=TEXT_G, bg=BG_PANEL,
+        )
+        _glovel_lbl.pack(pady=(14, 4))
+        _glovel_sep = ttk.Separator(right, orient="horizontal")
+        _glovel_sep.pack(fill=tk.X, pady=(0, 4), padx=12)
+        _glovel_body = tk.Frame(right, bg=BG_PANEL)
+        _glovel_body.pack(fill=tk.X)
+
+        def _toggle_glovel_img(_e=None):
+            if _glovel_open.get():
+                _glovel_body.pack_forget()
+                _glovel_lbl.config(text="▶  왼손 장갑")
+                _glovel_open.set(False)
+            else:
+                _glovel_body.pack(fill=tk.X, after=_glovel_sep)
+                _glovel_lbl.config(text="▼  왼손 장갑")
+                _glovel_open.set(True)
+
+        _glovel_hdr.bind("<Button-1>", _toggle_glovel_img)
+        _glovel_lbl.bind("<Button-1>", _toggle_glovel_img)
+        self._panel_sections.append((_glovel_open, _toggle_glovel_img))
+
+        self._glove_img_btn_l = self._make_btn(
+            _glovel_body, "🧤  이미지 로드", BG_CTRL,
+            command=lambda: self._toggle_glove_image(side='left'),
+        )
+        self._glove_img_lbl_l = tk.Label(
+            _glovel_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, wraplength=CTRL_W - 20,
+        )
+        self._glove_img_lbl_l.pack(pady=(0, 2))
+
+        self._separator(right)
+
+        # ── 무기 이미지 (접기/펴기) ──
+        _weapon_open = tk.BooleanVar(value=True)
+        _weapon_hdr = tk.Frame(right, bg=BG_PANEL, cursor="hand2")
+        _weapon_hdr.pack(fill=tk.X)
+        _weapon_lbl = tk.Label(
+            _weapon_hdr, text="▼  무기 이미지",
+            font=("Segoe UI", 10, "bold"), fg=TEXT_G, bg=BG_PANEL,
+        )
+        _weapon_lbl.pack(pady=(14, 4))
+        _weapon_sep = ttk.Separator(right, orient="horizontal")
+        _weapon_sep.pack(fill=tk.X, pady=(0, 4), padx=12)
+        _weapon_body = tk.Frame(right, bg=BG_PANEL)
+        _weapon_body.pack(fill=tk.X)
+
+        def _toggle_weapon_img(_e=None):
+            if _weapon_open.get():
+                _weapon_body.pack_forget()
+                _weapon_lbl.config(text="▶  무기 이미지")
+                _weapon_open.set(False)
+            else:
+                _weapon_body.pack(fill=tk.X, after=_weapon_sep)
+                _weapon_lbl.config(text="▼  무기 이미지")
+                _weapon_open.set(True)
+
+        _weapon_hdr.bind("<Button-1>", _toggle_weapon_img)
+        _weapon_lbl.bind("<Button-1>", _toggle_weapon_img)
+        self._panel_sections.append((_weapon_open, _toggle_weapon_img))
+
+        self._weapon_img_btn = self._make_btn(
+            _weapon_body, "⚔  이미지 로드", BG_CTRL,
+            command=self._toggle_weapon_image,
+        )
+        self._weapon_img_lbl = tk.Label(
+            _weapon_body, text="미선택",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, wraplength=CTRL_W - 20,
+        )
+        self._weapon_img_lbl.pack(pady=(0, 2))
+        tk.Label(_weapon_body, text="손", font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        _hand_row = tk.Frame(_weapon_body, bg=BG_PANEL)
+        _hand_row.pack(pady=(0, 4))
+        for _lt, _lv in [("오른손", "right"), ("왼손", "left"), ("양손", "both")]:
+            tk.Radiobutton(
+                _hand_row, text=_lt, variable=self._weapon_hand_var, value=_lv,
+                bg=BG_PANEL, fg=TEXT_W, selectcolor=BG_CTRL,
+                activebackground=BG_PANEL, activeforeground=TEXT_W,
+                font=("Segoe UI", 8),
+            ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Label(_weapon_body, text="크기 (%)", font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(_weapon_body, from_=30, to=300, orient=tk.HORIZONTAL,
+                 variable=self._weapon_size_var, length=170,
+                 bg=BG_PANEL, fg=TEXT_W, troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 ).pack(pady=(0, 2))
+        tk.Label(_weapon_body, text="떨림 보정", font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL).pack()
+        tk.Scale(_weapon_body, from_=0, to=95, orient=tk.HORIZONTAL,
+                 variable=self._weapon_smooth_var, length=170,
+                 bg=BG_PANEL, fg="#88ddff", troughcolor=BG_CTRL,
+                 highlightthickness=0, showvalue=True,
+                 command=self._on_weapon_smooth_change,
+                 ).pack(pady=(0, 4))
 
         self._separator(right)
 
@@ -1191,6 +1825,141 @@ class CameraPanel:
         alpha = 1.0 - (v / 100.0)              # 0→1.00, 95→0.05
         self._face_img_ema['alpha'] = alpha
 
+    def _on_side_ema_smooth_change(self, _=None):
+        self._face_img_side_ema['alpha'] = 1.0 - (self._side_ema_smooth_var.get() / 100.0)
+
+    def _on_shoe_smooth_change(self, _=None):
+        alpha = 1.0 - (self._shoe_smooth_var.get() / 100.0)
+        self._shoe_img_ema_r['alpha'] = alpha
+        self._shoe_img_ema_l['alpha'] = alpha
+
+    def _on_glove_smooth_change(self, _=None):
+        alpha = 1.0 - (self._glove_smooth_var.get() / 100.0)
+        self._glove_img_ema_r['alpha'] = alpha
+        self._glove_img_ema_l['alpha'] = alpha
+
+    def _on_weapon_smooth_change(self, _=None):
+        alpha = 1.0 - (self._weapon_smooth_var.get() / 100.0)
+        self._weapon_img_ema_r['alpha'] = alpha
+        self._weapon_img_ema_l['alpha'] = alpha
+
+    def _toggle_shoe_image(self, side='right'):
+        attr = '_shoe_img_r' if side == 'right' else '_shoe_img_l'
+        lbl  = self._shoe_img_lbl_r if side == 'right' else self._shoe_img_lbl_l
+        btn  = self._shoe_img_btn_r if side == 'right' else self._shoe_img_btn_l
+        ema  = '_shoe_img_ema_r' if side == 'right' else '_shoe_img_ema_l'
+        if getattr(self, attr) is not None:
+            setattr(self, attr, None)
+            for _k in ('ankle_x', 'ankle_y', 'angle', 'shin_len'):
+                getattr(self, ema)[_k] = None
+            lbl.config(text="미선택")
+            btn.config(text="👟  이미지 로드")
+        else:
+            self._load_shoe_image(side=side)
+
+    def _load_shoe_image(self, side='right'):
+        title = "오른발 신발 이미지 선택" if side == 'right' else "왼발 신발 이미지 선택"
+        path = filedialog.askopenfilename(
+            parent=self.win, title=title,
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{path}", parent=self.win)
+            return
+        h_i, w_i = img.shape[:2]
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 3:
+            tmp = np.zeros((h_i, w_i, 4), dtype=np.uint8)
+            tmp[:, :, :3] = img; tmp[:, :, 3] = 255
+            img = tmp
+        lbl = self._shoe_img_lbl_r if side == 'right' else self._shoe_img_lbl_l
+        btn = self._shoe_img_btn_r if side == 'right' else self._shoe_img_btn_l
+        if side == 'right':
+            self._shoe_img_r = img.copy()
+        else:
+            self._shoe_img_l = img.copy()
+        lbl.config(text=os.path.basename(path))
+        btn.config(text="× 이미지 제거")
+
+    def _toggle_glove_image(self, side='right'):
+        attr = '_glove_img_r' if side == 'right' else '_glove_img_l'
+        lbl  = self._glove_img_lbl_r if side == 'right' else self._glove_img_lbl_l
+        btn  = self._glove_img_btn_r if side == 'right' else self._glove_img_btn_l
+        ema  = '_glove_img_ema_r' if side == 'right' else '_glove_img_ema_l'
+        if getattr(self, attr) is not None:
+            setattr(self, attr, None)
+            for _k in ('wrist_x', 'wrist_y', 'angle', 'palm_len'):
+                getattr(self, ema)[_k] = None
+            lbl.config(text="미선택")
+            btn.config(text="🧤  이미지 로드")
+        else:
+            self._load_glove_image(side=side)
+
+    def _load_glove_image(self, side='right'):
+        title = "오른손 장갑 이미지 선택" if side == 'right' else "왼손 장갑 이미지 선택"
+        path = filedialog.askopenfilename(
+            parent=self.win, title=title,
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{path}", parent=self.win)
+            return
+        h_i, w_i = img.shape[:2]
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 3:
+            tmp = np.zeros((h_i, w_i, 4), dtype=np.uint8)
+            tmp[:, :, :3] = img; tmp[:, :, 3] = 255
+            img = tmp
+        lbl = self._glove_img_lbl_r if side == 'right' else self._glove_img_lbl_l
+        btn = self._glove_img_btn_r if side == 'right' else self._glove_img_btn_l
+        if side == 'right':
+            self._glove_img_r = img.copy()
+        else:
+            self._glove_img_l = img.copy()
+        lbl.config(text=os.path.basename(path))
+        btn.config(text="× 이미지 제거")
+
+    def _toggle_weapon_image(self):
+        if self._weapon_img is not None:
+            self._weapon_img = None
+            for _k in ('wrist_x', 'wrist_y', 'angle', 'palm_len'):
+                self._weapon_img_ema_r[_k] = None
+                self._weapon_img_ema_l[_k] = None
+            self._weapon_img_lbl.config(text="미선택")
+            self._weapon_img_btn.config(text="⚔  이미지 로드")
+        else:
+            self._load_weapon_image()
+
+    def _load_weapon_image(self):
+        path = filedialog.askopenfilename(
+            parent=self.win, title="무기 이미지 선택",
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{path}", parent=self.win)
+            return
+        h_i, w_i = img.shape[:2]
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 3:
+            tmp = np.zeros((h_i, w_i, 4), dtype=np.uint8)
+            tmp[:, :, :3] = img; tmp[:, :, 3] = 255
+            img = tmp
+        self._weapon_img = img.copy()
+        self._weapon_img_lbl.config(text=os.path.basename(path))
+        self._weapon_img_btn.config(text="× 이미지 제거")
+
     # ── 오른팔 이미지 EMA 콜백 / 로드/제거 ───────────────────────────────
     def _on_arm_smooth_change(self, _=None):
         v = self._arm_smooth_var.get()
@@ -1417,11 +2186,22 @@ class CameraPanel:
             self._face_img_pts = None
             self._face_pivot = None
             self._face_rot_var.set(0)
+            self._face_img_side = None
+            self._face_img_side_pts = None
+            self._face_img_side_anchors = None
+            self._face_img_side_kps_n = None
+            self._face_img_kps_n = None
             for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
                 self._face_img_ema[_k] = None
+            for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle',
+                       's_eye_x', 's_eye_y', 's_nose_x', 's_nose_y'):
+                self._face_img_side_ema[_k] = None
             self._face_img_lbl.config(text="미선택")
             self._face_img_btn.config(text="이미지 로드")
             self._face_pivot_btn.config(text="⊕ 피벗 설정", state=tk.DISABLED)
+            self._face_img_side_btn.config(text="🖼  옆모습 이미지 로드")
+            self._face_img_side_lbl.config(text="미선택")
+            self._face_side_pivot_btn.config(text="⊕ 앵커 설정 (옆)", state=tk.DISABLED)
         else:
             self._load_face_image()
 
@@ -1469,18 +2249,26 @@ class CameraPanel:
         self._face_img = img.copy()
         self._face_img_pts = src_pts
         self._face_pivot = None  # 새 이미지 로드 시 피벗 초기화
+        # 피벗 피커용 kps_n 저장 (오른눈, 왼눈, 코)
+        if face_res.face_landmarks:
+            lf = face_res.face_landmarks[0]
+            self._face_img_kps_n = [(lf[33].x, lf[33].y),
+                                    (lf[263].x, lf[263].y),
+                                    (lf[4].x, lf[4].y)]
+        else:
+            self._face_img_kps_n = None
         self._face_img_lbl.config(text=os.path.basename(path) + mode_text)
         self._face_img_btn.config(text="× 이미지 제거")
         self._face_pivot_btn.config(state=tk.NORMAL, text="⊕ 피벗 설정")
+        self._side_thr_scale.config(state=tk.NORMAL)
 
     def _open_face_pivot_picker(self):
-        """얼굴 이미지 위에서 클릭하여 피벗 포인트를 설정하는 팝업."""
+        """얼굴 이미지 위에서 눈/코 포인트 또는 자유 클릭으로 피벗 설정."""
         if self._face_img is None:
             return
         img_bgra = self._face_img
         img_h, img_w = img_bgra.shape[:2]
 
-        # 팝업 내 표시 크기 (최대 420px)
         max_side = 420
         scale = min(max_side / img_w, max_side / img_h, 1.0)
         dw, dh = max(1, int(img_w * scale)), max(1, int(img_h * scale))
@@ -1490,8 +2278,9 @@ class CameraPanel:
         top.resizable(False, False)
         top.grab_set()
 
-        tk.Label(top, text="피벗으로 사용할 포인트를 클릭하세요.",
-                 font=("Segoe UI", 9)).pack(padx=10, pady=(8, 4))
+        kps = self._face_img_kps_n  # [(nx,ny)×3] 또는 None
+        hint = "눈/코 포인트를 클릭하거나 자유롭게 클릭하세요." if kps else "피벗 포인트를 클릭하세요."
+        tk.Label(top, text=hint, font=("Segoe UI", 9)).pack(padx=10, pady=(8, 4))
 
         canvas = tk.Canvas(top, width=dw, height=dh, cursor="crosshair",
                             highlightthickness=1, highlightbackground="#555")
@@ -1500,9 +2289,26 @@ class CameraPanel:
         rgb = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2RGB)
         photo = ImageTk.PhotoImage(Image.fromarray(rgb).resize((dw, dh), Image.LANCZOS))
         canvas.create_image(0, 0, anchor="nw", image=photo)
-        canvas._photo = photo  # 참조 유지
+        canvas._photo = photo
 
         pivot_ref = [self._face_pivot]
+
+        # 눈/코 랜드마크 포인트 표시
+        _KP_LABELS = [("오른눈", "#55aaff"), ("왼눈", "#55aaff"), ("코", "#55ff88")]
+        if kps:
+            for i, ((nx, ny), (label, color)) in enumerate(zip(kps, _KP_LABELS)):
+                x, y = int(nx * dw), int(ny * dh)
+                r = 13
+                ov = canvas.create_oval(x-r, y-r, x+r, y+r,
+                                        outline=color, fill="#0a0a2a", width=2,
+                                        tags=f"kp{i}")
+                tx = canvas.create_text(x, y-r-9, text=label, fill=color,
+                                        font=("Segoe UI", 8, "bold"), tags=f"kp{i}")
+                def _kp_click(event, _nx=nx, _ny=ny):
+                    pivot_ref[0] = (_nx, _ny)
+                    _draw_marker(_nx, _ny)
+                canvas.tag_bind(ov, "<Button-1>", _kp_click)
+                canvas.tag_bind(tx, "<Button-1>", _kp_click)
 
         def _draw_marker(nx, ny):
             canvas.delete("pivot_marker")
@@ -1528,14 +2334,12 @@ class CameraPanel:
 
         def _ok():
             self._face_pivot = pivot_ref[0]
-            pct_text = ""
             if self._face_pivot is not None:
                 px = int(self._face_pivot[0] * 100)
                 py = int(self._face_pivot[1] * 100)
-                pct_text = f" ({px}%, {py}%)"
-            self._face_pivot_btn.config(
-                text=f"⊕ 피벗 설정{pct_text}" if self._face_pivot else "⊕ 피벗 설정"
-            )
+                self._face_pivot_btn.config(text=f"⊕ 피벗 ({px}%, {py}%)")
+            else:
+                self._face_pivot_btn.config(text="⊕ 피벗 설정")
             top.destroy()
 
         def _reset():
@@ -1613,6 +2417,210 @@ class CameraPanel:
         self._face_img_open_btn.config(text="× 입 벌림 제거")
         self._mouth_thr_scale.config(state=tk.NORMAL)
 
+    def _open_face_side_pivot_picker(self):
+        """옆모습 이미지에서 눈(Iris)과 코 앵커 포인트를 2개 설정."""
+        if self._face_img_side is None:
+            return
+        img_bgra = self._face_img_side
+        img_h, img_w = img_bgra.shape[:2]
+
+        max_side = 440
+        scale = min(max_side / img_w, max_side / img_h, 1.0)
+        dw, dh = max(1, int(img_w * scale)), max(1, int(img_h * scale))
+
+        top = tk.Toplevel(self.win)
+        top.title("앵커 포인트 설정 (옆모습)")
+        top.resizable(False, False)
+        top.grab_set()
+
+        mode_var = tk.StringVar(value="eye")
+        mode_row = tk.Frame(top, bg="#1a1a2e")
+        mode_row.pack(fill=tk.X, padx=10, pady=(8, 2))
+        tk.Label(mode_row, text="설정할 포인트:", font=("Segoe UI", 9),
+                 bg="#1a1a2e", fg="#cccccc").pack(side=tk.LEFT, padx=(4, 8))
+        tk.Radiobutton(mode_row, text="눈 (Iris)", variable=mode_var, value="eye",
+                       font=("Segoe UI", 9, "bold"), fg="#55aaff",
+                       bg="#1a1a2e", selectcolor="#0a0a2a",
+                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=6)
+        tk.Radiobutton(mode_row, text="코 (Nose)", variable=mode_var, value="nose",
+                       font=("Segoe UI", 9, "bold"), fg="#55ff88",
+                       bg="#1a1a2e", selectcolor="#0a0a2a",
+                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=6)
+
+        canvas = tk.Canvas(top, width=dw, height=dh, cursor="crosshair",
+                            highlightthickness=1, highlightbackground="#555")
+        canvas.pack(padx=10, pady=(4, 4))
+
+        from PIL import Image as _PI, ImageTk as _PIT
+        rgb = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2RGB)
+        photo = _PIT.PhotoImage(_PI.fromarray(rgb).resize((dw, dh), _PI.LANCZOS))
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas._photo = photo
+
+        existing = self._face_img_side_anchors or {}
+        anchors_ref = {'eye': existing.get('eye'), 'nose': existing.get('nose')}
+
+        kps = self._face_img_side_kps_n
+        if kps:
+            _KP_DATA = [
+                (kps[0], "오른눈", "#55aaff", "eye"),
+                (kps[1], "왼눈",   "#55aaff", "eye"),
+                (kps[2], "코",     "#55ff88", "nose"),
+            ]
+            for (nx, ny), label, color, atype in _KP_DATA:
+                x, y = int(nx * dw), int(ny * dh)
+                r = 13
+                ov = canvas.create_oval(x-r, y-r, x+r, y+r,
+                                        outline=color, fill="#0a0a2a", width=2)
+                tx = canvas.create_text(x, y-r-9, text=label, fill=color,
+                                        font=("Segoe UI", 8, "bold"))
+                def _kp_click(event, _nx=nx, _ny=ny, _t=atype):
+                    anchors_ref[_t] = (_nx, _ny)
+                    _draw_markers()
+                    _update_status()
+                canvas.tag_bind(ov, "<Button-1>", _kp_click)
+                canvas.tag_bind(tx, "<Button-1>", _kp_click)
+
+        status_lbl = tk.Label(top, font=("Segoe UI", 8), fg="#aaaacc", bg="#1a1a2e")
+        status_lbl.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        def _fmt(pt):
+            return f"({int(pt[0]*100)}%, {int(pt[1]*100)}%)" if pt else "미설정"
+
+        def _update_status():
+            status_lbl.config(
+                text=f"눈: {_fmt(anchors_ref['eye'])}    코: {_fmt(anchors_ref['nose'])}"
+            )
+
+        def _draw_one(nx, ny, color):
+            x, y = int(nx * dw), int(ny * dh)
+            r = 9
+            canvas.create_oval(x-r, y-r, x+r, y+r,
+                                outline=color, width=2, tags="anchor_marker")
+            canvas.create_line(x-r-4, y, x+r+4, y,
+                                fill=color, width=2, tags="anchor_marker")
+            canvas.create_line(x, y-r-4, x, y+r+4,
+                                fill=color, width=2, tags="anchor_marker")
+
+        def _draw_markers():
+            canvas.delete("anchor_marker")
+            if anchors_ref['eye']:
+                _draw_one(*anchors_ref['eye'], "#55aaff")
+            if anchors_ref['nose']:
+                _draw_one(*anchors_ref['nose'], "#55ff88")
+
+        _draw_markers()
+        _update_status()
+
+        def _on_click(event):
+            nx = max(0.0, min(1.0, event.x / dw))
+            ny = max(0.0, min(1.0, event.y / dh))
+            anchors_ref[mode_var.get()] = (nx, ny)
+            _draw_markers()
+            _update_status()
+
+        canvas.bind("<Button-1>", _on_click)
+
+        def _ok():
+            self._face_img_side_anchors = dict(anchors_ref) if any(anchors_ref.values()) else None
+            _a = self._face_img_side_anchors
+            if _a:
+                parts = []
+                if _a.get('eye'):  parts.append(f"눈{_fmt(_a['eye'])}")
+                if _a.get('nose'): parts.append(f"코{_fmt(_a['nose'])}")
+                self._face_side_pivot_btn.config(text="⊕ " + "  ".join(parts))
+            else:
+                self._face_side_pivot_btn.config(text="⊕ 앵커 설정 (옆)")
+            top.destroy()
+
+        def _reset():
+            anchors_ref['eye'] = None
+            anchors_ref['nose'] = None
+            canvas.delete("anchor_marker")
+            _update_status()
+
+        btn_row = tk.Frame(top)
+        btn_row.pack(pady=(4, 8))
+        tk.Button(btn_row, text="리셋", width=7, command=_reset).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="취소", width=7, command=top.destroy).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="확인", width=7, command=_ok).pack(side=tk.LEFT, padx=4)
+
+    def _toggle_face_img_side(self):
+        if self._face_img_side is not None:
+            self._face_img_side = None
+            self._face_img_side_pts = None
+            self._face_img_side_anchors = None
+            self._face_img_side_kps_n = None
+            self._face_img_side_lbl.config(text="미선택")
+            self._face_img_side_btn.config(text="🖼  옆모습 이미지 로드")
+            self._face_side_pivot_btn.config(state=tk.DISABLED, text="⊕ 앵커 설정 (옆)")
+            for _s in (self._side_eye_y_scale, self._side_eye_x_scale,
+                       self._side_img_size_scale, self._side_ema_smooth_scale):
+                _s.config(state=tk.DISABLED)
+        else:
+            self._load_face_img_side()
+
+    def _load_face_img_side(self):
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="옆모습 이미지 선택",
+            filetypes=[("이미지", "*.png *.jpg *.jpeg *.webp *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            pil_img = Image.open(path).convert("RGBA")
+            img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGBA2BGRA)
+        except Exception as e:
+            messagebox.showerror("오류", f"이미지 로드 실패:\n{e}", parent=self.win)
+            return
+
+        h, w = img.shape[:2]
+        if w > 1024:
+            scale = 1024 / w
+            img = cv2.resize(img, (1024, int(h * scale)), interpolation=cv2.INTER_AREA)
+            h, w = img.shape[:2]
+
+        mask = img[:, :, 3]
+        if mask.min() == 255:
+            tmp = img.copy()
+            white = (tmp[:, :, 0] > 240) & (tmp[:, :, 1] > 240) & (tmp[:, :, 2] > 240)
+            tmp[white, 3] = 0
+            img = tmp
+
+        bgr_src = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        try:
+            face_res = _if_det_mod.detect(bgr_src, w=w, h=h)
+        except Exception as e:
+            messagebox.showerror("오류", f"얼굴 감지 실패:\n{e}", parent=self.win)
+            return
+
+        if face_res.face_landmarks and len(face_res.face_landmarks[0]) > max(_FACE_IMG_KPT):
+            lf = face_res.face_landmarks[0]
+            src_pts = np.float32([[lf[i].x * w, lf[i].y * h] for i in _FACE_IMG_KPT])
+            mode_text = " [정밀]"
+        else:
+            src_pts = None
+            mode_text = " [자동]"
+
+        self._face_img_side = img.copy()
+        self._face_img_side_pts = src_pts
+        self._face_img_side_anchors = None  # 새 이미지 로드 시 앵커 초기화
+        # 앵커 피커용 kps_n 저장 (오른눈, 왼눈, 코)
+        if face_res.face_landmarks:
+            lf = face_res.face_landmarks[0]
+            self._face_img_side_kps_n = [(lf[33].x, lf[33].y),
+                                         (lf[263].x, lf[263].y),
+                                         (lf[4].x, lf[4].y)]
+        else:
+            self._face_img_side_kps_n = None
+        self._face_img_side_lbl.config(text=os.path.basename(path) + mode_text)
+        self._face_img_side_btn.config(text="× 옆모습 제거")
+        self._face_side_pivot_btn.config(state=tk.NORMAL, text="⊕ 앵커 설정 (옆)")
+        for _s in (self._side_thr_scale, self._side_eye_y_scale, self._side_eye_x_scale,
+                   self._side_img_size_scale, self._side_ema_smooth_scale):
+            _s.config(state=tk.NORMAL)
+
     # ── 캡처 루프 (백그라운드 스레드) ────────────────────────────────────
     def _capture_loop(self):
         # 얼굴 감지: InsightFace 싱글턴 (별도 초기화 불필요)
@@ -1665,9 +2673,13 @@ class CameraPanel:
                 _fi_on     = self._face_img is not None
                 _arm_on    = self._arm_img is not None
                 _mosaic_on = self._show_mosaic.get()
+                _shoe_on   = self._shoe_img_r is not None or self._shoe_img_l is not None
+                _glove_on  = self._glove_img_r is not None or self._glove_img_l is not None
+                _weapon_on = self._weapon_img is not None
                 _need_det = (_det_tick % 2 == 1) or self._recording
 
-                if _need_det and (_overlay_on or self._recording or _fi_on or _arm_on or _mosaic_on):
+                if _need_det and (_overlay_on or self._recording or _fi_on or _arm_on
+                                  or _mosaic_on or _shoe_on or _glove_on or _weapon_on):
                     # 추론 해상도 축소 (최대 640px 너비, 손/포즈용 mp.Image)
                     _sc = min(1.0, 640 / max(w_px, 1))
                     if _sc < 0.99:
@@ -1680,9 +2692,9 @@ class CameraPanel:
                         if self._show_face.get() or self._recording or _fi_on or _mosaic_on:
                             # InsightFace: BGR 원본 프레임 직접 사용
                             _last_f = _if_det_mod.detect(frame, min_conf=self._face_conf_var.get())
-                        if self._show_hands.get() or self._recording:
+                        if self._show_hands.get() or self._recording or _glove_on or _weapon_on:
                             _last_h = hand_det.detect(_inf)
-                        if self._show_body.get() or self._recording or _arm_on:
+                        if self._show_body.get() or self._recording or _arm_on or _shoe_on:
                             _last_p = pose_det.detect(_inf)
                     except Exception as e:
                         print(f"[detect error] {e}")
@@ -1734,6 +2746,11 @@ class CameraPanel:
                                           (_lf.bbox[0], _lf.bbox[1]),
                                           (_lf.bbox[2], _lf.bbox[3]),
                                           _nc, 1)
+                            if abs(getattr(_lf, 'yaw', 0.0)) > self._side_thr_var.get():
+                                _cx = (_lf.bbox[0] + _lf.bbox[2]) // 2
+                                _cy = (_lf.bbox[1] + _lf.bbox[3]) // 2
+                                cv2.putText(overlay, "side view", (_cx - 40, _cy),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 200, 255), 1, cv2.LINE_AA)
                         else:
                             mp_draw.draw_landmarks(
                                 overlay, _lf,
@@ -1773,19 +2790,27 @@ class CameraPanel:
                 # ── 얼굴 이미지 오버레이
                 _fi = self._face_img
                 _fp = self._face_img_pts
-                if _fi is not None:
-                    if self._face_img_open is not None:
-                        _mar = _compute_mar(face_res, w_px, h_px)
-                        if _mar >= self._mouth_thr_var.get():
-                            _fi = self._face_img_open
-                            _fp = self._face_img_open_pts
+                if _fi is not None and self._face_img_open is not None:
+                    _mar = _compute_mar(face_res, w_px, h_px)
+                    if _mar >= self._mouth_thr_var.get():
+                        _fi = self._face_img_open
+                        _fp = self._face_img_open_pts
+                if _fi is not None or self._face_img_side is not None:
                     _apply_face_img_overlay(overlay, face_res, w_px, h_px, _fi, _fp,
                                             eye_y_pct=self._eye_y_var.get(),
                                             eye_x_pct=self._eye_x_var.get(),
                                             size_pct=self._img_size_var.get(),
                                             ema_state=self._face_img_ema,
                                             pivot=self._face_pivot,
-                                            rotation_offset=self._face_rot_var.get())
+                                            rotation_offset=self._face_rot_var.get(),
+                                            side_img=self._face_img_side,
+                                            side_pts=self._face_img_side_pts,
+                                            side_threshold=float(self._side_thr_var.get()),
+                                            side_anchors=self._face_img_side_anchors,
+                                            side_eye_y_pct=self._side_eye_y_var.get(),
+                                            side_eye_x_pct=self._side_eye_x_var.get(),
+                                            side_size_pct=self._side_img_size_var.get(),
+                                            side_ema_state=self._face_img_side_ema)
 
                 # ── 오른팔 이미지 오버레이
                 if self._arm_img is not None:
@@ -1808,6 +2833,44 @@ class CameraPanel:
                                            arm_pins=self._arm_pins_l,
                                            arm_seg_cache=self._arm_seg_cache_l,
                                            side='left')
+
+                # ── 신발 이미지 오버레이
+                if self._shoe_img_r is not None:
+                    _apply_shoe_img_overlay(overlay, pose_res, w_px, h_px, self._shoe_img_r,
+                                            size_pct=self._shoe_size_var.get(),
+                                            ema_state=self._shoe_img_ema_r,
+                                            side='right')
+                if self._shoe_img_l is not None:
+                    _apply_shoe_img_overlay(overlay, pose_res, w_px, h_px, self._shoe_img_l,
+                                            size_pct=self._shoe_size_var.get(),
+                                            ema_state=self._shoe_img_ema_l,
+                                            side='left')
+
+                # ── 장갑 이미지 오버레이
+                if self._glove_img_r is not None and hand_res.hand_landmarks:
+                    _apply_glove_img_overlay(overlay, hand_res, w_px, h_px, self._glove_img_r,
+                                             size_pct=self._glove_size_var.get(),
+                                             ema_state=self._glove_img_ema_r,
+                                             side='right')
+                if self._glove_img_l is not None and hand_res.hand_landmarks:
+                    _apply_glove_img_overlay(overlay, hand_res, w_px, h_px, self._glove_img_l,
+                                             size_pct=self._glove_size_var.get(),
+                                             ema_state=self._glove_img_ema_l,
+                                             side='left')
+
+                # ── 무기 이미지 오버레이
+                if self._weapon_img is not None and hand_res.hand_landmarks:
+                    _hw = self._weapon_hand_var.get()
+                    if _hw in ('right', 'both'):
+                        _apply_weapon_img_overlay(overlay, hand_res, w_px, h_px, self._weapon_img,
+                                                   size_pct=self._weapon_size_var.get(),
+                                                   ema_state=self._weapon_img_ema_r,
+                                                   hand_side='right')
+                    if _hw in ('left', 'both'):
+                        _apply_weapon_img_overlay(overlay, hand_res, w_px, h_px, self._weapon_img,
+                                                   size_pct=self._weapon_size_var.get(),
+                                                   ema_state=self._weapon_img_ema_l,
+                                                   hand_side='left')
 
                 # 녹화 처리
                 if self._recording:
