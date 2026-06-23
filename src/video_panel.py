@@ -85,6 +85,59 @@ TL_H     = 30
 # 얼굴 이미지 워핑에 사용할 랜드마크 인덱스 (6점)
 _FACE_IMG_KPT = [33, 263, 4, 168, 61, 291]  # R.Eye.O, L.Eye.O, Nose.T, Nose.B, Mouth.R, Mouth.L
 
+EYE_FRAC = 0.40  # 감지 실패 이미지: 콘텐츠 상단 → 눈 라인 비율
+
+
+def _alpha_content_bbox(bgra, thr=16):
+    """알파>thr인 불투명 콘텐츠 박스 (x0,y0,x1,y1). 전부 투명/빈 경우 전체 반환."""
+    a = bgra[:, :, 3]
+    ys, xs = np.where(a > thr)
+    if xs.size == 0:
+        h, w = bgra.shape[:2]
+        return 0, 0, w, h
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def _detect_eye_pivot(bgra, bbox, score_min=0.45):
+    """콘텐츠 박스 안 어두운 대칭 블롭 쌍(만화 눈) → (pivot_norm, score). 미달 시 None."""
+    h, w = bgra.shape[:2]
+    x0, y0, x1, y1 = bbox
+    fw, fh = x1 - x0, y1 - y0
+    if fw < 8 or fh < 8:
+        return None
+    ry0, ry1 = int(y0 + fh * 0.20), int(y0 + fh * 0.65)   # 눈 예상 세로 구간
+    gray = cv2.cvtColor(cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR), cv2.COLOR_BGR2GRAY)
+    amask = bgra[ry0:ry1, x0:x1, 3] > 16
+    if amask.sum() < 10:
+        return None
+    inv = 255.0 - gray[ry0:ry1, x0:x1].astype(np.float32)
+    inv[~amask] = 0
+    thr = np.percentile(inv[amask], 88)
+    bw = ((inv >= thr) & amask).astype(np.uint8)
+    n, _, stats, cent = cv2.connectedComponentsWithStats(bw, 8)
+    min_area = fw * fh * 0.0008
+    blobs = [(stats[i, cv2.CC_STAT_AREA], cent[i][0] + x0, cent[i][1] + ry0)
+             for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    blobs.sort(reverse=True)
+    best = None
+    for i in range(len(blobs)):
+        for j in range(i + 1, len(blobs)):
+            a_i, x_i, y_i = blobs[i]
+            a_j, x_j, y_j = blobs[j]
+            dx, dy = abs(x_i - x_j), abs(y_i - y_j)
+            if not (fw * 0.12 < dx < fw * 0.75 and dy < fh * 0.12):
+                continue
+            mid_x = (x_i + x_j) / 2.0
+            s_sym  = 1.0 - min(abs(mid_x - (x0 + fw / 2.0)) / (fw * 0.25), 1.0)
+            s_vert = 1.0 - min(dy / (fh * 0.12), 1.0)
+            s_area = min(a_i, a_j) / max(a_i, a_j)
+            score = (s_sym + s_vert + s_area) / 3.0
+            if best is None or score > best[0]:
+                best = (score, mid_x, (y_i + y_j) / 2.0)
+    if best is None or best[0] < score_min:
+        return None
+    return (best[1] / w, best[2] / h), best[0]
+
 
 @dataclass
 class BodyPins:
@@ -175,7 +228,9 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                              side_img=None, side_pts=None, side_threshold=45.0,
                              side_anchors=None,
                              side_eye_y_pct=55, side_eye_x_pct=50, side_size_pct=100,
-                             side_ema_state: dict | None = None):
+                             side_ema_state: dict | None = None,
+                             ref_h=None, side_ref_h=None,
+                             feather_px=0, interp=cv2.INTER_LINEAR):
     """로드된 얼굴 이미지(BGRA)를 감지된 얼굴 위에 합성한다.
     side_anchors: {'eye':(nx,ny), 'nose':(nx,ny)} — 옆모습 2-point 유사변환
     """
@@ -185,7 +240,8 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                 ema_state[_k] = None
         if side_ema_state is not None:
             for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle',
-                       's_eye_x', 's_eye_y', 's_nose_x', 's_nose_y'):
+                       's_eye_x', 's_eye_y', 's_nose_x', 's_nose_y',
+                       's_ear_dist', 's_angle'):
                 side_ema_state[_k] = None
         return
     for _lf in face_res.face_landmarks:
@@ -214,24 +270,41 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             src_eye_px  = np.array([img_w * _ae[0], img_h * _ae[1]], dtype=np.float64)
             src_nose_px = np.array([img_w * _an[0], img_h * _an[1]], dtype=np.float64)
             # yaw>0: 코가 눈 오른쪽 → 얼굴이 오른쪽 → 왼눈(lm[263])이 카메라 쪽
-            raw_dst_eye  = (l_eye if yaw >= 0 else r_eye)
+            _ear_idx     = 454 if yaw >= 0 else 234
+            ear_px       = np.array([_lf[_ear_idx].x * w, _lf[_ear_idx].y * h], dtype=np.float64)
             raw_dst_nose = np.array([_lf[4].x * w, _lf[4].y * h], dtype=np.float64)
+            raw_dst_eye  = (l_eye if yaw >= 0 else r_eye)
+            # 귀-코 거리 (안정적 스케일 기준)
+            raw_ear_dist = float(np.linalg.norm(ear_px - raw_dst_nose))
+            # 눈→코 방향각 (회전 기준, 크기 미사용)
+            _dx = float(raw_dst_eye[0]) - float(raw_dst_nose[0])
+            _dy = float(raw_dst_eye[1]) - float(raw_dst_nose[1])
+            raw_angle_en = float(np.degrees(np.arctan2(_dy, _dx)))
             # EMA 평활화 (옆모습 떨림 보정 슬라이더 적용)
             _se = side_ema_state if side_ema_state is not None else ema_state
             if _se is not None:
-                _ex = _adaptive_ema_update(_se, 's_eye_x',  float(raw_dst_eye[0]),  catch_scale=40.0)
-                _ey = _adaptive_ema_update(_se, 's_eye_y',  float(raw_dst_eye[1]),  catch_scale=40.0)
-                _nx = _adaptive_ema_update(_se, 's_nose_x', float(raw_dst_nose[0]), catch_scale=40.0)
-                _ny = _adaptive_ema_update(_se, 's_nose_y', float(raw_dst_nose[1]), catch_scale=40.0)
-                dst_eye  = np.array([_ex, _ey], dtype=np.float64)
+                # 1. 위치: 코 EMA
+                _nx = _adaptive_ema_update(_se, 's_nose_x', float(raw_dst_nose[0]), catch_scale=25.0)
+                _ny = _adaptive_ema_update(_se, 's_nose_y', float(raw_dst_nose[1]), catch_scale=25.0)
+                # 2. 스케일: 귀-코 거리 EMA (핵심 안정화)
+                s_ear_dist = _adaptive_ema_update(_se, 's_ear_dist', raw_ear_dist, catch_scale=15.0)
+                # 3. 회전: 눈→코 각도 EMA
+                s_angle_en = _adaptive_ema_update(_se, 's_angle', raw_angle_en, catch_scale=8.0)
+                # 4. 역산: stable_scale → stable dst_eye
+                img_en_dist  = float(np.linalg.norm(src_eye_px - src_nose_px))
+                img_ear_dist = img_en_dist * 1.6  # 귀-코 ≈ 눈-코 × 1.6 (옆모습 해부학)
+                stable_scale = s_ear_dist / max(img_ear_dist, 1.0)
+                stable_dist  = stable_scale * img_en_dist
+                _rad = np.radians(s_angle_en)
                 dst_nose = np.array([_nx, _ny], dtype=np.float64)
+                dst_eye  = dst_nose + stable_dist * np.array([np.cos(_rad), np.sin(_rad)])
             else:
                 dst_eye, dst_nose = raw_dst_eye, raw_dst_nose
             M2 = _similarity_2pt(src_eye_px, src_nose_px, dst_eye, dst_nose)
             if M2 is None:
                 continue
             warped = cv2.warpAffine(_fi, M2, (w, h),
-                                    flags=cv2.INTER_LINEAR,
+                                    flags=interp,
                                     borderMode=cv2.BORDER_CONSTANT,
                                     borderValue=(0, 0, 0, 0))
 
@@ -255,7 +328,7 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             if M is None:
                 continue
             warped = cv2.warpPerspective(_fi, M, (w, h),
-                                         flags=cv2.INTER_LINEAR,
+                                         flags=interp,
                                          borderMode=cv2.BORDER_CONSTANT,
                                          borderValue=(0, 0, 0, 0))
             # Homography 모드: rotation_offset을 눈 중심 기준으로 추가 적용
@@ -264,7 +337,7 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
                 rot_cy = float(eye_center[1])
                 R = cv2.getRotationMatrix2D((rot_cx, rot_cy), -rotation_offset, 1.0)
                 warped = cv2.warpAffine(warped, R, (w, h),
-                                        flags=cv2.INTER_LINEAR,
+                                        flags=interp,
                                         borderMode=cv2.BORDER_CONSTANT,
                                         borderValue=(0, 0, 0, 0))
         else:
@@ -295,7 +368,9 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
 
             if face_h_px <= 0:
                 continue
-            scale = face_h_px * (_sz_pct / 100.0) / (img_h * 0.8)
+            _rh = side_ref_h if is_side else ref_h
+            _denom = _rh if _rh else img_h * 0.8  # 미지정 시 기존 동작 유지(하위호환)
+            scale = face_h_px * (_sz_pct / 100.0) / max(_denom, 1.0)
             if _piv is not None:
                 src_cx = img_w * _piv[0]
                 src_cy = img_h * _piv[1]
@@ -306,11 +381,15 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
             M[0, 2] += eye_center[0] - src_cx
             M[1, 2] += eye_center[1] - src_cy
             warped = cv2.warpAffine(_fi, M, (w, h),
-                                    flags=cv2.INTER_LINEAR,
+                                    flags=interp,
                                     borderMode=cv2.BORDER_CONSTANT,
                                     borderValue=(0, 0, 0, 0))
 
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -321,7 +400,8 @@ def _apply_face_img_overlay(overlay, face_res, w, h, face_img, face_img_pts,
 def _apply_arm_img_overlay(overlay, pose_res, w, h, arm_img,
                             anchor_y_pct=50, anchor_x_pct=50, size_pct=100,
                             ema_state: dict | None = None,
-                            arm_pins=None, arm_seg_cache=None, side='right'):
+                            arm_pins=None, arm_seg_cache=None, side='right',
+                            feather_px=0, interp=cv2.INTER_LINEAR):
     """로드된 팔 이미지(BGRA)를 팔꿈치 위에 Affine 합성.
     arm_pins/arm_seg_cache가 있으면 Puppet Pin 모드 (2 or 3-세그먼트),
     없으면 기존 Legacy(단일 Affine) 모드.
@@ -397,11 +477,15 @@ def _apply_arm_img_overlay(overlay, pose_res, w, h, arm_img,
             M[0, 2] += ex - src_cx
             M[1, 2] += ey - src_cy
             warped = cv2.warpAffine(arm_img, M, (w, h),
-                                    flags=cv2.INTER_LINEAR,
+                                    flags=interp,
                                     borderMode=cv2.BORDER_CONSTANT,
                                     borderValue=(0, 0, 0, 0))
 
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -412,7 +496,8 @@ def _apply_arm_img_overlay(overlay, pose_res, w, h, arm_img,
 def _apply_leg_img_overlay(overlay, pose_res, w, h, leg_img,
                             size_pct=100,
                             ema_state: dict | None = None,
-                            leg_pins=None, leg_seg_cache=None, side='right'):
+                            leg_pins=None, leg_seg_cache=None, side='right',
+                            feather_px=0, interp=cv2.INTER_LINEAR):
     """로드된 다리 이미지(BGRA)를 무릎 위에 Puppet Pin 합성.
     side='right': 랜드마크 24/26/28/32, 'left': 23/25/27/31
     PuppetPins 재사용: img_shldr=엉덩이, img_elbow=무릎, img_wrist=발목, img_hand=발끝"""
@@ -487,11 +572,15 @@ def _apply_leg_img_overlay(overlay, pose_res, w, h, leg_img,
             M[0, 2] += kx - src_cx
             M[1, 2] += ky - src_cy
             warped = cv2.warpAffine(leg_img, M, (w, h),
-                                    flags=cv2.INTER_LINEAR,
+                                    flags=interp,
                                     borderMode=cv2.BORDER_CONSTANT,
                                     borderValue=(0, 0, 0, 0))
 
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -500,7 +589,8 @@ def _apply_leg_img_overlay(overlay, pose_res, w, h, leg_img,
 
 
 def _apply_shoe_img_overlay(overlay, pose_res, w, h, shoe_img,
-                             size_pct=100, ema_state=None, side='right'):
+                             size_pct=100, ema_state=None, side='right',
+                             feather_px=0, interp=cv2.INTER_LINEAR):
     """발목(ankle) 위치에 신발 이미지 합성.
     side='right': 26(knee)/28(ankle)/32(foot), 'left': 25/27/31"""
     if not pose_res.pose_landmarks:
@@ -548,10 +638,14 @@ def _apply_shoe_img_overlay(overlay, pose_res, w, h, shoe_img,
         M[0, 2] += ax - src_cx
         M[1, 2] += ay - src_cy
         warped = cv2.warpAffine(shoe_img, M, (w, h),
-                                flags=cv2.INTER_LINEAR,
+                                flags=interp,
                                 borderMode=cv2.BORDER_CONSTANT,
                                 borderValue=(0, 0, 0, 0))
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -561,7 +655,8 @@ def _apply_shoe_img_overlay(overlay, pose_res, w, h, shoe_img,
 
 
 def _apply_glove_img_overlay(overlay, hand_res, w, h, glove_img,
-                              size_pct=100, ema_state=None, side='right'):
+                              size_pct=100, ema_state=None, side='right',
+                              feather_px=0, interp=cv2.INTER_LINEAR):
     """손목(lm[0]) + 중지MCP(lm[9]) 방향으로 장갑 이미지 합성.
     src_cy=80% → 손목 위치 기준."""
     if not hand_res.hand_landmarks:
@@ -605,10 +700,14 @@ def _apply_glove_img_overlay(overlay, hand_res, w, h, glove_img,
         M[0, 2] += wx - src_cx
         M[1, 2] += wy - src_cy
         warped = cv2.warpAffine(glove_img, M, (w, h),
-                                flags=cv2.INTER_LINEAR,
+                                flags=interp,
                                 borderMode=cv2.BORDER_CONSTANT,
                                 borderValue=(0, 0, 0, 0))
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -617,7 +716,8 @@ def _apply_glove_img_overlay(overlay, hand_res, w, h, glove_img,
 
 
 def _apply_weapon_img_overlay(overlay, hand_res, w, h, weapon_img,
-                               size_pct=100, ema_state=None, hand_side='right'):
+                               size_pct=100, ema_state=None, hand_side='right',
+                               feather_px=0, interp=cv2.INTER_LINEAR):
     """손목(lm[0]) + 중지MCP(lm[9]) 방향으로 무기 이미지 합성.
     src_cy=90% → 손잡이(그립) 위치 기준."""
     if not hand_res.hand_landmarks:
@@ -661,10 +761,14 @@ def _apply_weapon_img_overlay(overlay, hand_res, w, h, weapon_img,
         M[0, 2] += wx - src_cx
         M[1, 2] += wy - src_cy
         warped = cv2.warpAffine(weapon_img, M, (w, h),
-                                flags=cv2.INTER_LINEAR,
+                                flags=interp,
                                 borderMode=cv2.BORDER_CONSTANT,
                                 borderValue=(0, 0, 0, 0))
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -674,7 +778,8 @@ def _apply_weapon_img_overlay(overlay, hand_res, w, h, weapon_img,
 
 
 def _apply_body_front_overlay(overlay, pose_res, w, h, body_img,
-                               size_pct=100, ema_state=None, body_pins=None):
+                               size_pct=100, ema_state=None, body_pins=None,
+                               feather_px=0, interp=cv2.INTER_LINEAR):
     """앞모습 몸통 이미지(BGRA)를 L.Shldr/R.Shldr/R.Hip/L.Hip 4점으로 Perspective 합성.
     body_pins 미설정 시 이미지 4코너를 랜드마크에 맞춤."""
     if not pose_res.pose_landmarks:
@@ -709,10 +814,14 @@ def _apply_body_front_overlay(overlay, pose_res, w, h, body_img,
         if M is None:
             continue
         warped = cv2.warpPerspective(body_img, M, (w, h),
-                                     flags=cv2.INTER_LINEAR,
+                                     flags=interp,
                                      borderMode=cv2.BORDER_CONSTANT,
                                      borderValue=(0, 0, 0, 0))
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -723,7 +832,8 @@ def _apply_body_front_overlay(overlay, pose_res, w, h, body_img,
 def _apply_body_side_overlay(overlay, pose_res, w, h, body_img,
                               size_pct=100, depth_pct=40,
                               offset_x=0, offset_y=0,
-                              ema_state=None, body_pins=None):
+                              ema_state=None, body_pins=None,
+                              feather_px=0, interp=cv2.INTER_LINEAR):
     """옆모습 몸통 이미지(BGRA)를 척추+수직방향 자동계산 4점으로 Perspective 합성.
     body_pins (BodySidePins): 어깨/앞가슴/앞엉덩이/뒤허리 이미지 핀.
     depth_pct: 몸 두께를 어깨너비 대비 % (기본 40).
@@ -783,10 +893,14 @@ def _apply_body_side_overlay(overlay, pose_res, w, h, body_img,
         if M is None:
             continue
         warped = cv2.warpPerspective(body_img, M, (w, h),
-                                     flags=cv2.INTER_LINEAR,
+                                     flags=interp,
                                      borderMode=cv2.BORDER_CONSTANT,
                                      borderValue=(0, 0, 0, 0))
-        alpha = warped[:, :, 3:4].astype(np.float32) / 255.0
+        _alpha_ch = warped[:, :, 3]
+        if feather_px > 0:
+            _ksize = int(feather_px) | 1
+            _alpha_ch = cv2.GaussianBlur(_alpha_ch, (_ksize, _ksize), 0)
+        alpha = _alpha_ch[:, :, np.newaxis].astype(np.float32) / 255.0
         overlay[:] = np.clip(
             warped[:, :, :3].astype(np.float32) * alpha
             + overlay.astype(np.float32) * (1.0 - alpha),
@@ -915,9 +1029,13 @@ class VideoPanel:
         self._show_mosaic         = tk.BooleanVar(value=False)
         self._img_only_var        = tk.BooleanVar(value=False)
         self._show_anime_var   = tk.BooleanVar(value=False)
-        self._anime_style_var  = tk.StringVar(value="animegan")
+        self._anime_style_var  = tk.StringVar(value="whitebox")
         self._anime_bg_var     = tk.StringVar(value="original")
-        self._anime_model_path = ""
+        self._anime_range_var  = tk.StringVar(value="person")
+        self._anime_model_path = self._find_default_anime_model()
+        self._anime_converter  = None   # AnimeGANConverter 캐시 (지연 로드)
+        self._anime_cache      = None   # 재생 중 변환 프레임 캐시
+        self._anime_skip       = 0
         self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._zoom               = 1.0               # 줌 배율 (1.0 = 100%)
@@ -935,8 +1053,10 @@ class VideoPanel:
         self._det_cache     = None  # 재생 중 감지 결과 캐시
         self._face_img      = None  # BGRA numpy array (얼굴 이미지)
         self._face_img_pts  = None  # 소스 키포인트 (None = Affine 자동 모드)
+        self._face_img_ref_h    = None   # Affine 스케일 기준 높이(px), None=img_h*0.8
         self._face_img_open     = None   # BGRA (입 벌림 이미지)
         self._face_img_open_pts = None
+        self._face_img_open_ref_h = None
         self._mouth_thr_var     = tk.DoubleVar(value=0.12)
         self._eye_y_var     = tk.IntVar(value=55)   # 눈 위치 Y (%)
         self._eye_x_var     = tk.IntVar(value=50)   # 눈 위치 X (%)
@@ -951,6 +1071,7 @@ class VideoPanel:
         self._face_rot_var   = tk.IntVar(value=0)    # 추가 회전 오프셋 (°)
         self._face_img_side     = None               # BGRA (옆모습 이미지)
         self._face_img_side_pts = None
+        self._face_img_side_ref_h = None
         self._face_img_side_anchors = None           # {'eye':…,'nose':…} 옆모습 2-point 앵커
         self._face_img_side_kps_n = None             # 정규화 kps (옆모습 피벗 피커용)
         self._side_thr_var      = tk.IntVar(value=45)  # 옆모습 전환 yaw 임계값 (°)
@@ -961,6 +1082,7 @@ class VideoPanel:
         self._face_img_side_ema: dict = {
             'face_h': None, 'eye_cx': None, 'eye_cy': None, 'angle': None,
             's_eye_x': None, 's_eye_y': None, 's_nose_x': None, 's_nose_y': None,
+            's_ear_dist': None, 's_angle': None,
             'alpha': 0.15,
         }
         self._face_img_kps_n    = None               # 정규화 5-kps (피벗 피커 전용)
@@ -1038,6 +1160,10 @@ class VideoPanel:
         self._leg_pin_btn_l   = None
         self._leg_pin_lbl_l   = None
         self._leg_l_z_var     = tk.IntVar(value=2)  # Z 순서
+
+        # ── 알파 엣지 페더링 + 고화질 보간 (전역)
+        self._feather_var     = tk.IntVar(value=0)
+        self._hq_var          = tk.BooleanVar(value=False)
 
         # ── 신발 이미지 오버레이 상태
         self._shoe_img_r      = None   # BGRA numpy array
@@ -1141,7 +1267,7 @@ class VideoPanel:
         self._on_weapon_smooth_change()     # weapon EMA alpha 동기화
         self._init_mediapipe()
         for _v in (self._show_face, self._show_body, self._show_hands, self._show_names,
-                   self._show_mosaic, self._img_only_var):
+                   self._show_mosaic, self._img_only_var, self._hq_var):
             _v.trace_add("write", lambda *_: self._refresh_frame())
         # 슬라이더 변수 → 값 변경 시 즉시 프레임 갱신
         _slider_vars = (
@@ -1162,6 +1288,8 @@ class VideoPanel:
             self._body_side_size_var, self._body_side_depth_var,
             self._body_side_x_var, self._body_side_y_var,
             self._body_side_smooth_var, self._body_side_z_var,
+            # 페더링 (전역)
+            self._feather_var,
             # 신발/장갑/무기
             self._shoe_size_var, self._shoe_smooth_var,
             self._shoe_r_z_var, self._shoe_l_z_var,
@@ -1471,8 +1599,9 @@ class VideoPanel:
         self._panel_sections.append((_an_open, _toggle_anime))
 
         tk.Checkbutton(
-            _an_body, text="🎨 내보내기 전용",
+            _an_body, text="🎨 애니화 (미리보기+내보내기)",
             variable=self._show_anime_var,
+            command=self._on_anime_toggle,
             font=("Segoe UI", 10, "bold"),
             fg="#88ddff", bg=BG_PANEL,
             selectcolor="#0f3460",
@@ -1486,7 +1615,7 @@ class VideoPanel:
                  ).pack(fill=tk.X, padx=14)
         _sf = tk.Frame(_an_body, bg=BG_PANEL)
         _sf.pack(fill=tk.X, padx=20, pady=(0, 4))
-        for _sv, _sl in [("animegan", "AnimeGAN"), ("opencv", "OpenCV")]:
+        for _sv, _sl in [("whitebox", "카툰(깨끗)"), ("animegan", "AnimeGAN"), ("opencv", "OpenCV")]:
             tk.Radiobutton(
                 _sf, text=_sl, variable=self._anime_style_var, value=_sv,
                 font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL,
@@ -1507,7 +1636,23 @@ class VideoPanel:
                 font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL,
                 selectcolor="#0f3460",
                 activeforeground=TEXT_W, activebackground=BG_PANEL,
+                command=self._on_anime_opt_change,
             ).pack(side=tk.LEFT, padx=(0, 4))
+
+        # 범위
+        tk.Label(_an_body, text="  범위",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        _rf = tk.Frame(_an_body, bg=BG_PANEL)
+        _rf.pack(fill=tk.X, padx=20, pady=(0, 4))
+        for _rv, _rl in [("person", "사람만"), ("full", "전체화면")]:
+            tk.Radiobutton(
+                _rf, text=_rl, variable=self._anime_range_var, value=_rv,
+                font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL,
+                selectcolor="#0f3460",
+                activeforeground=TEXT_W, activebackground=BG_PANEL,
+                command=self._on_anime_opt_change,
+            ).pack(side=tk.LEFT, padx=(0, 8))
 
         # ONNX 모델 선택 (AnimeGAN용)
         self._anime_model_btn = tk.Button(
@@ -1520,8 +1665,15 @@ class VideoPanel:
             command=self._select_anime_model,
         )
         self._anime_model_btn.pack(fill=tk.X, padx=20, pady=(0, 2))
+        if self._anime_style_var.get() == "whitebox":
+            self._anime_model_btn.config(state=tk.DISABLED)
+            _model_lbl_text = "화이트박스 카툰 (내장 모델)"
+        elif self._anime_model_path:
+            _model_lbl_text = os.path.basename(self._anime_model_path)
+        else:
+            _model_lbl_text = "미선택 (OpenCV로 대체)"
         self._anime_model_lbl = tk.Label(
-            _an_body, text="미선택 (OpenCV로 대체)",
+            _an_body, text=_model_lbl_text,
             font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
             wraplength=160,
         )
@@ -1560,7 +1712,27 @@ class VideoPanel:
             activeforeground="#ffcc44", activebackground=BG_PANEL,
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(4, 2))
-        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(2, 6))
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(2, 4))
+
+        # ── 알파 엣지 페더링 슬라이더 (전역) ──
+        tk.Label(parent, text="경계 부드럽기 (px)",
+                 font=("Segoe UI", 8), fg="#aaddff", bg=BG_PANEL, anchor="w",
+                 ).pack(fill=tk.X, padx=14)
+        tk.Scale(parent, from_=0, to=20, orient=tk.HORIZONTAL,
+                 variable=self._feather_var, length=160,
+                 bg=BG_PANEL, fg="#aaddff", troughcolor="#0f3460",
+                 highlightthickness=0, showvalue=True,
+                 ).pack(padx=10, pady=(0, 4))
+        tk.Checkbutton(
+            parent, text="고화질 모드 (LANCZOS4)",
+            variable=self._hq_var,
+            font=("Segoe UI", 9, "bold"),
+            fg="#ffdd88", bg=BG_PANEL,
+            selectcolor="#0f3460",
+            activeforeground="#ffdd88", activebackground=BG_PANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(0, 4))
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(0, 6))
 
         # ── 얼굴 이미지 (접기/펴기) ──
         _fi_open = tk.BooleanVar(value=True)
@@ -2809,8 +2981,64 @@ class VideoPanel:
         if ret:
             self._display_frame(frame)
 
+    def _detect_landmarks(self, bgr):
+        """애니화 사람 마스크용 얼굴/손/포즈 감지 (640px 축소 추론)."""
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h_px, w_px = bgr.shape[:2]
+        _sc = min(1.0, 640 / max(w_px, h_px, 1))
+        rgb_s = (cv2.resize(rgb, (int(w_px * _sc), int(h_px * _sc)))
+                 if _sc < 0.99 else rgb)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_s)
+        try:
+            face_res = _if_det_mod.detect(bgr, min_conf=self._face_conf_var.get())
+            hand_res = self._hand_det.detect(mp_img) if self._hand_det else None
+            pose_res = self._pose_det.detect(mp_img) if self._pose_det else None
+        except Exception as e:
+            print(f"[detect error] {e}")
+            return None, None, None
+        return face_res, hand_res, pose_res
+
+    def _apply_anime(self, bgr, playback=False):
+        """애니화 적용 (미리보기/내보내기 공용). 재생 중에는 N프레임마다 변환."""
+        style      = self._anime_style_var.get()
+        bg_mode    = self._anime_bg_var.get()
+        range_mode = self._anime_range_var.get()
+        if style == "whitebox":
+            converter = self._get_anime_converter(self._find_whitebox_model())
+        elif style == "animegan":
+            converter = self._get_anime_converter(self._anime_model_path)
+        else:
+            converter = None
+
+        # 재생 중 스로틀: 3프레임마다 1회만 변환 (나머지는 직전 결과 재사용)
+        if playback:
+            self._anime_skip += 1
+            if self._anime_cache is not None and (self._anime_skip % 3 != 0):
+                return self._anime_cache.copy()
+
+        # 사람 마스크가 필요할 때만 감지 (전체화면이면 생략)
+        fr = hr = pr = None
+        if range_mode == "person":
+            if playback and self._det_cache is not None:
+                fr, hr, pr = self._det_cache
+            else:
+                fr, hr, pr = self._detect_landmarks(bgr)
+                if playback:
+                    self._det_cache = (fr, hr, pr)
+
+        out = apply_anime_to_person(
+            bgr, pr, fr, hr,
+            style=style, bg_mode=bg_mode,
+            converter=converter, range_mode=range_mode,
+        )
+        if playback:
+            self._anime_cache = out.copy()
+        return out
+
     # ── 프레임 표시 ────────────────────────────────────────────────────────
     def _display_frame(self, bgr, playback=False):
+        if _ANIME_AVAILABLE and self._show_anime_var.get():
+            bgr = self._apply_anime(bgr, playback=playback)
         if (self._show_face.get() or self._show_body.get() or self._show_hands.get()
                 or self._face_img is not None or self._show_mosaic.get()
                 or self._arm_img is not None or self._img_only_var.get()
@@ -3047,11 +3275,13 @@ class VideoPanel:
         # ── 이미지 오버레이 — Z 순서 정렬 후 렌더링 ───────────────────────
         _fi = self._face_img
         _fp = self._face_img_pts
+        _rh = self._face_img_ref_h
         if _fi is not None and self._face_img_open is not None:
             _mar = _compute_mar(face_res, _ow, _oh)
             if _mar >= self._mouth_thr_var.get():
                 _fi = self._face_img_open
                 _fp = self._face_img_open_pts
+                _rh = self._face_img_open_ref_h
 
         _img_jobs = []  # (z, callable)
 
@@ -3077,7 +3307,11 @@ class VideoPanel:
                 side_eye_y_pct=self._side_eye_y_var.get(),
                 side_eye_x_pct=self._side_eye_x_var.get(),
                 side_size_pct=self._side_img_size_var.get(),
-                side_ema_state=self._face_img_side_ema)))
+                side_ema_state=self._face_img_side_ema,
+                ref_h=_rh,
+                side_ref_h=self._face_img_side_ref_h,
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._arm_img is not None and pose_res:
             _img_jobs.append((self._arm_z_var.get(), lambda: _apply_arm_img_overlay(
@@ -3088,7 +3322,9 @@ class VideoPanel:
                 ema_state=self._arm_img_ema,
                 arm_pins=self._arm_pins,
                 arm_seg_cache=self._arm_seg_cache,
-                side='right')))
+                side='right',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._arm_img_l is not None and pose_res:
             _img_jobs.append((self._arm_l_z_var.get(), lambda: _apply_arm_img_overlay(
@@ -3099,7 +3335,9 @@ class VideoPanel:
                 ema_state=self._arm_img_ema_l,
                 arm_pins=self._arm_pins_l,
                 arm_seg_cache=self._arm_seg_cache_l,
-                side='left')))
+                side='left',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._leg_img_r is not None and pose_res:
             _img_jobs.append((self._leg_r_z_var.get(), lambda: _apply_leg_img_overlay(
@@ -3108,7 +3346,9 @@ class VideoPanel:
                 ema_state=self._leg_img_ema_r,
                 leg_pins=self._leg_pins_r,
                 leg_seg_cache=self._leg_seg_cache_r,
-                side='right')))
+                side='right',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._leg_img_l is not None and pose_res:
             _img_jobs.append((self._leg_l_z_var.get(), lambda: _apply_leg_img_overlay(
@@ -3117,35 +3357,45 @@ class VideoPanel:
                 ema_state=self._leg_img_ema_l,
                 leg_pins=self._leg_pins_l,
                 leg_seg_cache=self._leg_seg_cache_l,
-                side='left')))
+                side='left',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._shoe_img_r is not None and pose_res:
             _img_jobs.append((self._shoe_r_z_var.get(), lambda: _apply_shoe_img_overlay(
                 overlay, pose_res, _ow, _oh, self._shoe_img_r,
                 size_pct=self._shoe_size_var.get(),
                 ema_state=self._shoe_img_ema_r,
-                side='right')))
+                side='right',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._shoe_img_l is not None and pose_res:
             _img_jobs.append((self._shoe_l_z_var.get(), lambda: _apply_shoe_img_overlay(
                 overlay, pose_res, _ow, _oh, self._shoe_img_l,
                 size_pct=self._shoe_size_var.get(),
                 ema_state=self._shoe_img_ema_l,
-                side='left')))
+                side='left',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._glove_img_r is not None and hand_res.hand_landmarks:
             _img_jobs.append((self._glove_r_z_var.get(), lambda: _apply_glove_img_overlay(
                 overlay, hand_res, _ow, _oh, self._glove_img_r,
                 size_pct=self._glove_size_var.get(),
                 ema_state=self._glove_img_ema_r,
-                side='right')))
+                side='right',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._glove_img_l is not None and hand_res.hand_landmarks:
             _img_jobs.append((self._glove_l_z_var.get(), lambda: _apply_glove_img_overlay(
                 overlay, hand_res, _ow, _oh, self._glove_img_l,
                 size_pct=self._glove_size_var.get(),
                 ema_state=self._glove_img_ema_l,
-                side='left')))
+                side='left',
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._weapon_img is not None and hand_res.hand_landmarks:
             _hw = self._weapon_hand_var.get()
@@ -3154,20 +3404,26 @@ class VideoPanel:
                     overlay, hand_res, _ow, _oh, self._weapon_img,
                     size_pct=self._weapon_size_var.get(),
                     ema_state=self._weapon_img_ema_r,
-                    hand_side='right')))
+                    hand_side='right',
+                    feather_px=self._feather_var.get(),
+                    interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
             if _hw in ('left', 'both'):
                 _img_jobs.append((self._weapon_z_var.get(), lambda: _apply_weapon_img_overlay(
                     overlay, hand_res, _ow, _oh, self._weapon_img,
                     size_pct=self._weapon_size_var.get(),
                     ema_state=self._weapon_img_ema_l,
-                    hand_side='left')))
+                    hand_side='left',
+                    feather_px=self._feather_var.get(),
+                    interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._body_front_img is not None and pose_res:
             _img_jobs.append((self._body_front_z_var.get(), lambda: _apply_body_front_overlay(
                 overlay, pose_res, _ow, _oh, self._body_front_img,
                 size_pct=self._body_front_size_var.get(),
                 ema_state=self._body_front_ema,
-                body_pins=self._body_front_pins)))
+                body_pins=self._body_front_pins,
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         if self._body_side_img is not None and pose_res:
             _img_jobs.append((self._body_side_z_var.get(), lambda: _apply_body_side_overlay(
@@ -3177,7 +3433,9 @@ class VideoPanel:
                 offset_x=self._body_side_x_var.get(),
                 offset_y=self._body_side_y_var.get(),
                 ema_state=self._body_side_ema,
-                body_pins=self._body_side_pins)))
+                body_pins=self._body_side_pins,
+                feather_px=self._feather_var.get(),
+                interp=cv2.INTER_LANCZOS4 if self._hq_var.get() else cv2.INTER_LINEAR)))
 
         for _, _fn in sorted(_img_jobs, key=lambda x: x[0]):
             _fn()
@@ -3284,6 +3542,44 @@ class VideoPanel:
         self._ae_btn.config(state=state)
         self._video_btn.config(state=state)
 
+    @staticmethod
+    def _find_default_anime_model():
+        """models/ 폴더에서 White-box를 제외한 첫 AnimeGAN *.onnx 모델 자동 탐지."""
+        import glob
+        found = sorted(glob.glob(os.path.join(_BASE, "models", "*.onnx")))
+        found = [f for f in found if "whitebox" not in os.path.basename(f).lower()]
+        return found[0] if found else ""
+
+    @staticmethod
+    def _find_whitebox_model():
+        """White-box 카툰 내장 ONNX 경로 반환 (없으면 빈 문자열)."""
+        import glob
+        p = os.path.join(_BASE, "models", "whitebox_cartoon_720.onnx")
+        if os.path.exists(p):
+            return p
+        found = sorted(glob.glob(os.path.join(_BASE, "models", "*whitebox*.onnx")))
+        return found[0] if found else ""
+
+    def _get_anime_converter(self, model_path=None):
+        """주어진 ONNX 모델로 AnimeGANConverter를 1회 로드 후 재사용."""
+        if model_path is None:
+            model_path = self._anime_model_path
+        if AnimeGANConverter is None or not model_path:
+            return None
+        if (self._anime_converter is not None
+                and getattr(self._anime_converter, "_model_path", None)
+                == model_path):
+            return self._anime_converter
+        try:
+            conv = AnimeGANConverter()
+            conv.load(model_path)
+            conv._model_path = model_path
+            self._anime_converter = conv
+        except Exception as e:
+            print(f"[AnimeGAN load error] {e} — OpenCV로 대체합니다.")
+            self._anime_converter = None
+        return self._anime_converter
+
     def _select_anime_model(self):
         """AnimeGAN ONNX 모델 파일 선택."""
         path = filedialog.askopenfilename(
@@ -3294,6 +3590,8 @@ class VideoPanel:
         if path:
             self._anime_model_path = path
             self._anime_model_lbl.config(text=os.path.basename(path))
+            self._anime_converter = None   # 모델 변경 → 캐시 무효화
+            self._anime_cache = None
 
     def _toggle_all_sections(self, _e=None):
         """- 키: 하나라도 열려 있으면 전체 접기, 모두 닫혀 있으면 전체 펴기."""
@@ -3308,10 +3606,32 @@ class VideoPanel:
 
     def _on_anime_style_change(self):
         """스타일 라디오 변경 시 모델 버튼 상태 업데이트."""
-        is_gan = self._anime_style_var.get() == "animegan"
+        style  = self._anime_style_var.get()
+        is_gan = style == "animegan"
         self._anime_model_btn.config(state=tk.NORMAL if is_gan else tk.DISABLED)
-        if not is_gan:
+        if style == "whitebox":
+            self._anime_model_lbl.config(text="화이트박스 카툰 (내장 모델)")
+        elif style == "opencv":
             self._anime_model_lbl.config(text="OpenCV 사용 (모델 불필요)")
+        elif self._anime_model_path:
+            self._anime_model_lbl.config(text=os.path.basename(self._anime_model_path))
+        else:
+            self._anime_model_lbl.config(text="미선택 (OpenCV로 대체)")
+        self._anime_cache = None
+        if self._show_anime_var.get() and not self._playing:
+            self._refresh_frame()
+
+    def _on_anime_toggle(self):
+        """애니화 체크박스 토글 → 미리보기 갱신."""
+        self._anime_cache = None
+        if not self._playing:
+            self._refresh_frame()
+
+    def _on_anime_opt_change(self):
+        """배경/범위 옵션 변경 → 미리보기 갱신."""
+        self._anime_cache = None
+        if self._show_anime_var.get() and not self._playing:
+            self._refresh_frame()
 
     def _export_video(self):
         save_path = filedialog.asksaveasfilename(
@@ -3414,13 +3734,20 @@ class VideoPanel:
         _anime_converter = None
         _anime_bg_mode   = "original"
         _anime_style     = "opencv"
+        _anime_range     = "person"
         if with_anime:
             _anime_style   = self._anime_style_var.get()
             _anime_bg_mode = self._anime_bg_var.get()
-            if _anime_style == "animegan" and self._anime_model_path:
+            _anime_range   = self._anime_range_var.get()
+            _model_path = ""
+            if _anime_style == "whitebox":
+                _model_path = self._find_whitebox_model()
+            elif _anime_style == "animegan":
+                _model_path = self._anime_model_path
+            if _model_path:
                 try:
                     _anime_converter = AnimeGANConverter()
-                    _anime_converter.load(self._anime_model_path)
+                    _anime_converter.load(_model_path)
                 except Exception as _e:
                     print(f"[AnimeGAN load error] {_e} — OpenCV로 대체합니다.")
                     _anime_style = "opencv"
@@ -3435,28 +3762,30 @@ class VideoPanel:
                 # ── 애니화 (사람 마스크 + 스타일 변환) ─────────────────────
                 if with_anime:
                     _fr = _hr = _pr = None
-                    try:
-                        _fh, _fw = frame.shape[:2]
-                        _asc = min(1.0, 640 / max(_fw, _fh, 1))
-                        _rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        if _asc < 0.99:
-                            _rgb = cv2.resize(_rgb,
-                                              (int(_fw*_asc), int(_fh*_asc)))
-                        _mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
-                                           data=_rgb)
-                        if self._face_det:
-                            _fr = self._face_det.detect(_mp_img)
-                        if self._hand_det:
-                            _hr = self._hand_det.detect(_mp_img)
-                        if self._pose_det:
-                            _pr = self._pose_det.detect(_mp_img)
-                    except Exception:
-                        pass
+                    if _anime_range == "person":
+                        try:
+                            _fh, _fw = frame.shape[:2]
+                            _asc = min(1.0, 640 / max(_fw, _fh, 1))
+                            _rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            if _asc < 0.99:
+                                _rgb = cv2.resize(_rgb,
+                                                  (int(_fw*_asc), int(_fh*_asc)))
+                            _mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
+                                               data=_rgb)
+                            if self._face_det:
+                                _fr = self._face_det.detect(_mp_img)
+                            if self._hand_det:
+                                _hr = self._hand_det.detect(_mp_img)
+                            if self._pose_det:
+                                _pr = self._pose_det.detect(_mp_img)
+                        except Exception:
+                            pass
                     frame = apply_anime_to_person(
                         frame, _pr, _fr, _hr,
                         style=_anime_style,
                         bg_mode=_anime_bg_mode,
                         converter=_anime_converter,
+                        range_mode=_anime_range,
                     )
 
                 # ── 오버레이 (랜드마크/모자이크 등) ─────────────────────────
@@ -4416,17 +4745,20 @@ class VideoPanel:
         if self._face_img is not None:
             self._face_img = None
             self._face_img_pts = None
+            self._face_img_ref_h = None
             self._face_pivot = None
             self._face_rot_var.set(0)
             self._face_img_side = None
             self._face_img_side_pts = None
+            self._face_img_side_ref_h = None
             self._face_img_side_anchors = None
             self._face_img_side_kps_n = None
             self._face_img_kps_n = None
             for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle'):
                 self._face_img_ema[_k] = None
             for _k in ('face_h', 'eye_cx', 'eye_cy', 'angle',
-                       's_eye_x', 's_eye_y', 's_nose_x', 's_nose_y'):
+                       's_eye_x', 's_eye_y', 's_nose_x', 's_nose_y',
+                       's_ear_dist', 's_angle'):
                 self._face_img_side_ema[_k] = None
             self._face_img_lbl.config(text="미선택")
             self._face_img_btn.config(text="🖼  이미지 로드")
@@ -4462,6 +4794,11 @@ class VideoPanel:
             tmp[:, :, 3] = 255
             img = tmp
 
+        # 불투명 이미지(JPG 등)는 흰 배경을 투명 처리 → 콘텐츠 박스 자동 추정 가능
+        if img[:, :, 3].min() == 255:
+            white = (img[:, :, 0] > 240) & (img[:, :, 1] > 240) & (img[:, :, 2] > 240)
+            img[white, 3] = 0
+
         # InsightFace로 얼굴 감지 (BGR 직접 사용)
         bgr_src = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
         try:
@@ -4482,7 +4819,10 @@ class VideoPanel:
 
         self._face_img = img.copy()
         self._face_img_pts = src_pts
-        self._face_pivot = None  # 새 이미지 로드 시 피벗 초기화
+        # 자동 피벗/위치/크기: 감지=눈 중심+bbox, 실패=콘텐츠 중앙X·40%Y+콘텐츠높이
+        piv, ref_h = self._auto_face_pivot(img, face_res)
+        self._face_pivot = piv
+        self._face_img_ref_h = ref_h
         # 피벗 피커용 kps_n 저장 (오른눈, 왼눈, 코)
         if face_res.face_landmarks:
             lf = face_res.face_landmarks[0]
@@ -4494,9 +4834,32 @@ class VideoPanel:
         self._det_cache = None
         self._face_img_lbl.config(text=os.path.basename(path) + mode_text)
         self._face_img_btn.config(text="× 이미지 제거")
-        self._face_pivot_btn.config(state=tk.NORMAL, text="⊕ 피벗 설정")
+        _px, _py = int(piv[0] * 100), int(piv[1] * 100)
+        self._face_pivot_btn.config(state=tk.NORMAL, text=f"⊕ 피벗 ({_px}%,{_py}%) 자동")
         self._side_thr_scale.config(state=tk.NORMAL)
         self._refresh_frame()
+
+    def _auto_face_pivot(self, img, face_res):
+        """(pivot_norm, ref_h_px) 반환. 감지 성공=눈 중심+bbox 높이,
+        실패=다크블롭 눈 탐지(신뢰 시) 또는 콘텐츠 상단40% 폴백. 크기는 콘텐츠 높이."""
+        h, w = img.shape[:2]
+        if face_res.face_landmarks and len(face_res.face_landmarks[0]) > 263:
+            lf = face_res.face_landmarks[0]
+            ex = (lf[33].x + lf[263].x) / 2.0
+            ey = (lf[33].y + lf[263].y) / 2.0
+            if hasattr(lf, 'bbox'):
+                ref_h = float(lf.bbox[3] - lf.bbox[1])
+            else:
+                ys = [p.y * h for p in lf]
+                ref_h = max(ys) - min(ys)
+            return (ex, ey), ref_h
+        bbox = _alpha_content_bbox(img)
+        x0, y0, x1, y1 = bbox
+        ref_h = float(y1 - y0)                       # 크기 기준: 콘텐츠 높이 유지
+        eye = _detect_eye_pivot(img, bbox)           # 다크블롭 눈 탐지
+        if eye is not None:
+            return eye[0], ref_h                     # 신뢰도 충분 → 눈 중점 피벗
+        return ((x0 + x1) / 2.0 / w, (y0 + (y1 - y0) * EYE_FRAC) / h), ref_h  # 폴백
 
     def _open_face_pivot_picker(self):
         """얼굴 이미지 위에서 눈/코 포인트 또는 자유 클릭으로 피벗 설정."""
@@ -4596,6 +4959,7 @@ class VideoPanel:
         if self._face_img_open is not None:
             self._face_img_open = None
             self._face_img_open_pts = None
+            self._face_img_open_ref_h = None
             self._face_img_open_lbl.config(text="미선택")
             self._face_img_open_btn.config(text="🖼  입 벌림 이미지 로드")
             self._mouth_thr_scale.config(state=tk.DISABLED)
@@ -4651,6 +5015,7 @@ class VideoPanel:
 
         self._face_img_open = img.copy()
         self._face_img_open_pts = src_pts
+        self._face_img_open_ref_h = self._auto_face_pivot(img, face_res)[1]
         self._det_cache = None
         self._face_img_open_lbl.config(text=os.path.basename(path) + mode_text)
         self._face_img_open_btn.config(text="× 입 벌림 제거")
@@ -4658,7 +5023,7 @@ class VideoPanel:
         self._refresh_frame()
 
     def _open_face_side_pivot_picker(self):
-        """옆모습 이미지에서 눈(Iris)과 코 앵커 포인트를 2개 설정."""
+        """옆모습 이미지에서 눈/코/입/목 앵커 포인트를 설정."""
         if self._face_img_side is None:
             return
         img_bgra = self._face_img_side
@@ -4673,7 +5038,6 @@ class VideoPanel:
         top.resizable(False, False)
         top.grab_set()
 
-        # 모드 선택 (눈 / 코)
         mode_var = tk.StringVar(value="eye")
         mode_row = tk.Frame(top, bg="#1a1a2e")
         mode_row.pack(fill=tk.X, padx=10, pady=(8, 2))
@@ -4682,11 +5046,19 @@ class VideoPanel:
         tk.Radiobutton(mode_row, text="눈 (Iris)", variable=mode_var, value="eye",
                        font=("Segoe UI", 9, "bold"), fg="#55aaff",
                        bg="#1a1a2e", selectcolor="#0a0a2a",
-                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=6)
+                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=5)
         tk.Radiobutton(mode_row, text="코 (Nose)", variable=mode_var, value="nose",
                        font=("Segoe UI", 9, "bold"), fg="#55ff88",
                        bg="#1a1a2e", selectcolor="#0a0a2a",
-                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=6)
+                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(mode_row, text="입 (Mouth)", variable=mode_var, value="mouth",
+                       font=("Segoe UI", 9, "bold"), fg="#ffaa33",
+                       bg="#1a1a2e", selectcolor="#0a0a2a",
+                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(mode_row, text="목 (Neck)", variable=mode_var, value="neck",
+                       font=("Segoe UI", 9, "bold"), fg="#ff55cc",
+                       bg="#1a1a2e", selectcolor="#0a0a2a",
+                       activebackground="#1a1a2e").pack(side=tk.LEFT, padx=5)
 
         canvas = tk.Canvas(top, width=dw, height=dh, cursor="crosshair",
                             highlightthickness=1, highlightbackground="#555")
@@ -4699,14 +5071,21 @@ class VideoPanel:
         canvas._photo = photo
 
         existing = self._face_img_side_anchors or {}
-        anchors_ref = {'eye': existing.get('eye'), 'nose': existing.get('nose')}
+        anchors_ref = {
+            'eye':   existing.get('eye'),
+            'nose':  existing.get('nose'),
+            'mouth': existing.get('mouth'),
+            'neck':  existing.get('neck'),
+        }
 
-        kps = self._face_img_side_kps_n  # [(r_eye_nx,ny), (l_eye_nx,ny), (nose_nx,ny)]
-        if kps:
+        kps = self._face_img_side_kps_n
+        if kps and len(kps) >= 5:
             _KP_DATA = [
                 (kps[0], "오른눈", "#55aaff", "eye"),
                 (kps[1], "왼눈",   "#55aaff", "eye"),
                 (kps[2], "코",     "#55ff88", "nose"),
+                (kps[3], "입",     "#ffaa33", "mouth"),
+                (kps[4], "목시작", "#ff55cc", "neck"),
             ]
             for (nx, ny), label, color, atype in _KP_DATA:
                 x, y = int(nx * dw), int(ny * dh)
@@ -4726,12 +5105,17 @@ class VideoPanel:
         status_lbl.pack(fill=tk.X, padx=10, pady=(0, 2))
 
         def _fmt(pt):
-            return f"({int(pt[0]*100)}%, {int(pt[1]*100)}%)" if pt else "미설정"
+            return f"({int(pt[0]*100)}%,{int(pt[1]*100)}%)" if pt else "-"
 
         def _update_status():
-            status_lbl.config(
-                text=f"눈: {_fmt(anchors_ref['eye'])}    코: {_fmt(anchors_ref['nose'])}"
-            )
+            status_lbl.config(text=(
+                f"눈:{_fmt(anchors_ref['eye'])}  "
+                f"코:{_fmt(anchors_ref['nose'])}  "
+                f"입:{_fmt(anchors_ref['mouth'])}  "
+                f"목:{_fmt(anchors_ref['neck'])}"
+            ))
+
+        _MARKER_COLORS = {'eye': "#55aaff", 'nose': "#55ff88", 'mouth': "#ffaa33", 'neck': "#ff55cc"}
 
         def _draw_one(nx, ny, color):
             x, y = int(nx * dw), int(ny * dh)
@@ -4745,10 +5129,9 @@ class VideoPanel:
 
         def _draw_markers():
             canvas.delete("anchor_marker")
-            if anchors_ref['eye']:
-                _draw_one(*anchors_ref['eye'], "#55aaff")
-            if anchors_ref['nose']:
-                _draw_one(*anchors_ref['nose'], "#55ff88")
+            for k, c in _MARKER_COLORS.items():
+                if anchors_ref.get(k):
+                    _draw_one(*anchors_ref[k], c)
 
         _draw_markers()
         _update_status()
@@ -4766,10 +5149,10 @@ class VideoPanel:
             self._face_img_side_anchors = dict(anchors_ref) if any(anchors_ref.values()) else None
             _a = self._face_img_side_anchors
             if _a:
-                parts = []
-                if _a.get('eye'):  parts.append(f"눈{_fmt(_a['eye'])}")
-                if _a.get('nose'): parts.append(f"코{_fmt(_a['nose'])}")
-                self._face_side_pivot_btn.config(text="⊕ " + "  ".join(parts))
+                set_pts = [k for k in ('eye', 'nose', 'mouth', 'neck') if _a.get(k)]
+                _labels = {'eye': '눈', 'nose': '코', 'mouth': '입', 'neck': '목'}
+                self._face_side_pivot_btn.config(
+                    text="⊕ 앵커 [" + "/".join(_labels[k] for k in set_pts) + "]")
             else:
                 self._face_side_pivot_btn.config(text="⊕ 앵커 설정 (옆)")
             self._det_cache = None
@@ -4777,8 +5160,8 @@ class VideoPanel:
             top.destroy()
 
         def _reset():
-            anchors_ref['eye'] = None
-            anchors_ref['nose'] = None
+            for k in anchors_ref:
+                anchors_ref[k] = None
             canvas.delete("anchor_marker")
             _update_status()
 
@@ -4792,6 +5175,7 @@ class VideoPanel:
         if self._face_img_side is not None:
             self._face_img_side = None
             self._face_img_side_pts = None
+            self._face_img_side_ref_h = None
             self._face_img_side_anchors = None
             self._face_img_side_kps_n = None
             self._face_img_side_lbl.config(text="미선택")
@@ -4848,13 +5232,24 @@ class VideoPanel:
 
         self._face_img_side = img.copy()
         self._face_img_side_pts = src_pts
+        self._face_img_side_ref_h = self._auto_face_pivot(img, face_res)[1]
         self._face_img_side_anchors = None  # 새 이미지 로드 시 앵커 초기화
-        # 앵커 피커용 kps_n 저장 (오른눈, 왼눈, 코)
+        # 앵커 피커용 kps_n 저장 (오른눈, 왼눈, 코, 입중심, 목시작)
         if face_res.face_landmarks:
             lf = face_res.face_landmarks[0]
+            _mouth_x = (lf[61].x + lf[291].x) / 2
+            _mouth_y = (lf[61].y + lf[291].y) / 2
+            if hasattr(lf, 'bbox'):
+                _neck_x = (lf.bbox[0] + lf.bbox[2]) / 2 / w
+                _neck_y = min(1.0, lf.bbox[3] / h + 0.07)
+            else:
+                _neck_x = lf[152].x
+                _neck_y = min(1.0, lf[152].y + 0.07)
             self._face_img_side_kps_n = [(lf[33].x, lf[33].y),
                                          (lf[263].x, lf[263].y),
-                                         (lf[4].x, lf[4].y)]
+                                         (lf[4].x, lf[4].y),
+                                         (_mouth_x, _mouth_y),
+                                         (_neck_x, _neck_y)]
         else:
             self._face_img_side_kps_n = None
         self._det_cache = None
