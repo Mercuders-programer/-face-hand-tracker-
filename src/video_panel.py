@@ -60,6 +60,14 @@ except Exception:
 
 try:
     try:
+        from .sd_cartoon import SDCartoon
+    except ImportError:
+        from sd_cartoon import SDCartoon
+except Exception:
+    SDCartoon = None
+
+try:
+    try:
         from .puppet_pin import (PuppetPins, SegmentCache,
                                   build_segment_cache, apply_puppet_warp,
                                   pins_degenerate)
@@ -1036,6 +1044,8 @@ class VideoPanel:
         self._anime_converter  = None   # AnimeGANConverter 캐시 (지연 로드)
         self._anime_cache      = None   # 재생 중 변환 프레임 캐시
         self._anime_skip       = 0
+        self._anime_strength_var = tk.IntVar(value=3)  # bold/sd 강도 1~5
+        self._sd_pipe          = None   # SDCartoon 캐시 (지연 로드)
         self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
         self._zoom               = 1.0               # 줌 배율 (1.0 = 100%)
@@ -1615,14 +1625,33 @@ class VideoPanel:
                  ).pack(fill=tk.X, padx=14)
         _sf = tk.Frame(_an_body, bg=BG_PANEL)
         _sf.pack(fill=tk.X, padx=20, pady=(0, 4))
-        for _sv, _sl in [("whitebox", "카툰(깨끗)"), ("animegan", "AnimeGAN"), ("opencv", "OpenCV")]:
+        self._anime_strength_anchor = _sf
+        for _sv, _sl in [("whitebox", "카툰(깨끗)"), ("bold", "굵은카툰"),
+                         ("sd", "SD(고품질)"), ("animegan", "AnimeGAN"),
+                         ("opencv", "OpenCV")]:
             tk.Radiobutton(
                 _sf, text=_sl, variable=self._anime_style_var, value=_sv,
                 font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL,
                 selectcolor="#0f3460",
                 activeforeground=TEXT_W, activebackground=BG_PANEL,
                 command=self._on_anime_style_change,
-            ).pack(side=tk.LEFT, padx=(0, 8))
+            ).pack(side=tk.LEFT, padx=(0, 6))
+
+        # 강도 (굵은카툰/SD 전용)
+        self._anime_strength_row = tk.Frame(_an_body, bg=BG_PANEL)
+        self._anime_strength_row.pack(fill=tk.X, padx=14, pady=(0, 2))
+        tk.Label(self._anime_strength_row, text="강도",
+                 font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL,
+                 ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Scale(
+            self._anime_strength_row, from_=1, to=5, orient=tk.HORIZONTAL,
+            variable=self._anime_strength_var, length=120,
+            bg=BG_PANEL, fg=TEXT_W, troughcolor="#0f3460",
+            highlightthickness=0, showvalue=True,
+            command=lambda _v: self._on_anime_opt_change(),
+        ).pack(side=tk.LEFT)
+        if self._anime_style_var.get() not in ("bold", "sd"):
+            self._anime_strength_row.pack_forget()
 
         # 배경
         tk.Label(_an_body, text="  배경",
@@ -2998,17 +3027,37 @@ class VideoPanel:
             return None, None, None
         return face_res, hand_res, pose_res
 
+    def _get_sd_pipe(self):
+        """SDCartoon 파이프라인을 1회 로드 후 재사용 (지연 로드)."""
+        if SDCartoon is None:
+            return None
+        if self._sd_pipe is None:
+            try:
+                self._sd_pipe = SDCartoon().load()
+            except Exception as e:
+                print(f"[SD load error] {e} — OpenCV로 대체합니다.")
+                self._sd_pipe = None
+        return self._sd_pipe
+
     def _apply_anime(self, bgr, playback=False):
         """애니화 적용 (미리보기/내보내기 공용). 재생 중에는 N프레임마다 변환."""
         style      = self._anime_style_var.get()
         bg_mode    = self._anime_bg_var.get()
         range_mode = self._anime_range_var.get()
-        if style == "whitebox":
+        strength   = self._anime_strength_var.get()
+
+        # SD는 프레임당 수 초 → 재생 중에는 적용하지 않음(직전 결과/원본 표시)
+        if style == "sd" and playback:
+            return self._anime_cache.copy() if self._anime_cache is not None else bgr
+
+        # base 변환기 선택 (whitebox/bold=White-box ONNX, animegan=선택 모델)
+        if style in ("whitebox", "bold"):
             converter = self._get_anime_converter(self._find_whitebox_model())
         elif style == "animegan":
             converter = self._get_anime_converter(self._anime_model_path)
         else:
             converter = None
+        sd_pipe = self._get_sd_pipe() if style == "sd" else None
 
         # 재생 중 스로틀: 3프레임마다 1회만 변환 (나머지는 직전 결과 재사용)
         if playback:
@@ -3030,6 +3079,7 @@ class VideoPanel:
             bgr, pr, fr, hr,
             style=style, bg_mode=bg_mode,
             converter=converter, range_mode=range_mode,
+            strength=strength, sd_pipe=sd_pipe,
         )
         if playback:
             self._anime_cache = out.copy()
@@ -3611,12 +3661,24 @@ class VideoPanel:
         self._anime_model_btn.config(state=tk.NORMAL if is_gan else tk.DISABLED)
         if style == "whitebox":
             self._anime_model_lbl.config(text="화이트박스 카툰 (내장 모델)")
+        elif style == "bold":
+            self._anime_model_lbl.config(text="굵은 카툰 (White-box + 양자화/외곽선)")
+        elif style == "sd":
+            self._anime_model_lbl.config(
+                text="SD 고품질 — 느림·정지컷 권장 (영상은 떨림)")
         elif style == "opencv":
             self._anime_model_lbl.config(text="OpenCV 사용 (모델 불필요)")
         elif self._anime_model_path:
             self._anime_model_lbl.config(text=os.path.basename(self._anime_model_path))
         else:
             self._anime_model_lbl.config(text="미선택 (OpenCV로 대체)")
+
+        # 강도 슬라이더는 bold/sd 에서만 노출
+        if style in ("bold", "sd"):
+            self._anime_strength_row.pack(fill=tk.X, padx=14, pady=(0, 2),
+                                          after=self._anime_strength_anchor)
+        else:
+            self._anime_strength_row.pack_forget()
         self._anime_cache = None
         if self._show_anime_var.get() and not self._playing:
             self._refresh_frame()
@@ -3666,6 +3728,17 @@ class VideoPanel:
                 "모델 미선택",
                 "AnimeGAN ONNX 모델이 선택되지 않았습니다.\n"
                 "OpenCV 방식으로 대체하여 저장하시겠습니까?",
+                parent=self.win,
+            ):
+                return
+
+        # SD 스타일은 프레임당 수 초 + 영상 떨림 → 사전 경고
+        if with_anime and self._anime_style_var.get() == "sd":
+            if not messagebox.askyesno(
+                "SD 고품질 — 느림 주의",
+                "SD 스타일은 프레임당 수 초가 걸려 영상 전체 변환이 매우 오래 걸립니다.\n"
+                "또한 프레임마다 그림이 달라져 영상에서 떨림(flicker)이 생깁니다.\n"
+                "(짧은 클립/정지컷 권장) 계속하시겠습니까?",
                 parent=self.win,
             ):
                 return
@@ -3735,12 +3808,15 @@ class VideoPanel:
         _anime_bg_mode   = "original"
         _anime_style     = "opencv"
         _anime_range     = "person"
+        _anime_strength  = 3
+        _sd_pipe         = None
         if with_anime:
-            _anime_style   = self._anime_style_var.get()
-            _anime_bg_mode = self._anime_bg_var.get()
-            _anime_range   = self._anime_range_var.get()
+            _anime_style    = self._anime_style_var.get()
+            _anime_bg_mode  = self._anime_bg_var.get()
+            _anime_range    = self._anime_range_var.get()
+            _anime_strength = self._anime_strength_var.get()
             _model_path = ""
-            if _anime_style == "whitebox":
+            if _anime_style in ("whitebox", "bold"):
                 _model_path = self._find_whitebox_model()
             elif _anime_style == "animegan":
                 _model_path = self._anime_model_path
@@ -3750,6 +3826,11 @@ class VideoPanel:
                     _anime_converter.load(_model_path)
                 except Exception as _e:
                     print(f"[AnimeGAN load error] {_e} — OpenCV로 대체합니다.")
+                    if _anime_style != "bold":
+                        _anime_style = "opencv"
+            if _anime_style == "sd":
+                _sd_pipe = self._get_sd_pipe()
+                if _sd_pipe is None:
                     _anime_style = "opencv"
 
         try:
@@ -3786,6 +3867,8 @@ class VideoPanel:
                         bg_mode=_anime_bg_mode,
                         converter=_anime_converter,
                         range_mode=_anime_range,
+                        strength=_anime_strength,
+                        sd_pipe=_sd_pipe,
                     )
 
                 # ── 오버레이 (랜드마크/모자이크 등) ─────────────────────────

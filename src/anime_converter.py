@@ -135,6 +135,38 @@ def apply_opencv_anime(frame, scale=512, k_colors=8):
     return anime_small
 
 
+def apply_bold_cartoon(frame, base, strength=3):
+    """
+    base(예: White-box 결과) 위에 색 양자화 + 굵은 검정 외곽선을 얹어
+    "확실한 만화" 룩으로 강화. strength 1~5 (클수록 색 적고 선 굵음).
+    엣지는 구조가 또렷한 원본(frame)에서 추출.
+    """
+    strength = int(max(1, min(5, strength)))
+    # 강도별 프리셋: (양자화 색 수, adaptiveThreshold C, 선 두께 erode 반경)
+    k_map      = {1: 16, 2: 12, 3: 10, 4: 8, 5: 6}
+    c_map      = {1: 9,  2: 7,  3: 6,  4: 5, 5: 4}
+    dil_map    = {1: 0,  2: 0,  3: 1,  4: 1, 5: 2}
+    k          = k_map[strength]
+    edge_c     = c_map[strength]
+    edge_dil   = dil_map[strength]
+
+    quant = _quantize_colors(base, k=k)
+
+    gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray  = cv2.medianBlur(gray, 5)
+    edges = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY, blockSize=9, C=edge_c,
+    )
+    if edge_dil > 0:
+        ksz = edge_dil * 2 + 1
+        edges = cv2.erode(edges, np.ones((ksz, ksz), np.uint8))
+
+    out = quant.copy()
+    out[edges == 0] = (0, 0, 0)
+    return out
+
+
 # ── AnimeGAN ONNX 추론기 ───────────────────────────────────────────────────
 
 class AnimeGANConverter:
@@ -252,7 +284,7 @@ class AnimeGANConverter:
 def apply_anime_to_person(frame, pose_res, face_res, hand_res,
                            style="animegan", bg_mode="original",
                            converter=None, dilate_px=50, blur_k=31,
-                           range_mode="person"):
+                           range_mode="person", strength=3, sd_pipe=None):
     """
     사람 마스크 생성 → 애니 필터 → 배경 합성.
 
@@ -262,21 +294,32 @@ def apply_anime_to_person(frame, pose_res, face_res, hand_res,
     pose_res   : PoseLandmarker 결과 (None 가능)
     face_res   : FaceLandmarker 결과 (None 가능)
     hand_res   : HandLandmarker 결과 (None 가능)
-    style      : "whitebox" | "animegan" | "opencv" (converter 유무로 실제 경로 결정)
+    style      : "whitebox" | "bold" | "sd" | "animegan" | "opencv"
     bg_mode    : "original" | "blur" | "solid"
     converter  : AnimeGANConverter 인스턴스 (ONNX 스타일 시 필요, 없으면 OpenCV 폴백)
     range_mode : "person" (사람 마스크) | "full" (전체 화면 변환)
+    strength   : 1~5 — "bold" 강도, "sd" denoise 강도(내부에서 0~1로 매핑)
+    sd_pipe    : SDCartoon 인스턴스 (style="sd" 시 필요)
     """
     h, w = frame.shape[:2]
 
-    # 1. 애니 스타일 변환 — converter가 로드돼 있으면 ONNX, 아니면 OpenCV 폴백
-    if converter is not None and converter.loaded:
+    # 1. 애니 스타일 변환
+    if style == "sd" and sd_pipe is not None:
+        try:
+            styled = sd_pipe.stylize(frame, strength=strength)
+        except Exception:
+            styled = apply_opencv_anime(frame)
+    elif converter is not None and converter.loaded:
         try:
             styled = converter.convert(frame)
         except Exception:
             styled = apply_opencv_anime(frame)
     else:
         styled = apply_opencv_anime(frame)
+
+    # 1b. "bold" 스타일이면 base 위에 양자화 + 굵은 외곽선 강화
+    if style == "bold":
+        styled = apply_bold_cartoon(frame, styled, strength=strength)
 
     # 2. 전체 화면 변환이면 마스크/합성 생략
     if range_mode == "full":
