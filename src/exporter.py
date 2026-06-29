@@ -202,6 +202,43 @@ def _write_ae_file(path: str,
     return True
 
 
+def export_tracks_ae(out_dir: str, info: VideoInfo, tracks: list) -> list:
+    """포인트 트래킹 점들을 AE 키프레임(.txt)으로 내보낸다.
+
+    tracks: [{"id", "color", "origin_frame", "pos": {frame_idx: (x, y)}}]
+    각 점을 track_<id>.txt 로 저장하며, AE Position 속성에 붙여넣어 쓴다.
+    반환: 작성된 파일 경로 리스트.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for entry in tracks:
+        tid = entry.get("id", 0)
+        pos = entry.get("pos", {})
+        path = os.path.join(out_dir, f"track_{tid}.txt")
+
+        lines = []
+        lines.append("Adobe After Effects 8.0 Keyframe Data\n")
+        lines.append(f"\tUnits Per Second\t{info.fps}\n")
+        lines.append(f"\tSource Width\t{info.width}\n")
+        lines.append(f"\tSource Height\t{info.height}\n")
+        lines.append("\tSource Pixel Aspect Ratio\t1\n")
+        lines.append("\tComp Pixel Aspect Ratio\t1\n")
+        lines.append("\n")
+        lines.append("Transform\tPosition\n")
+        lines.append("\tFrame\tX pixels\tY pixels\tZ pixels\t\n")
+        for frame_idx in sorted(pos.keys()):
+            x, y = pos[frame_idx]
+            lines.append(f"\t{frame_idx}\t{x:.4f}\t{y:.4f}\t0.0000\t\n")
+        lines.append("\nEnd of Keyframe Data\n")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        written.append(path)
+
+    print(f"[Exporter] 트랙 {len(written)}개 내보냄 → {out_dir}")
+    return written
+
+
 def export_ae_keyframes(frames: List[FrameData], info: VideoInfo, out_dir: str,
                         include_face: bool = True, include_body: bool = True,
                         include_hands: bool = True,

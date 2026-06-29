@@ -33,13 +33,13 @@ try:
     from .tracker import (FrameData, VideoInfo, PersonData,
                           _extract_face, _extract_hand, _extract_pose,
                           _build_persons, MAX_PERSONS, PERSON_COLORS)
-    from .exporter import export_json, export_ae_keyframes
+    from .exporter import export_json, export_ae_keyframes, export_tracks_ae
     from . import insightface_detector as _if_det_mod
 except ImportError:
     from tracker import (FrameData, VideoInfo, PersonData,
                          _extract_face, _extract_hand, _extract_pose,
                          _build_persons, MAX_PERSONS, PERSON_COLORS)
-    from exporter import export_json, export_ae_keyframes
+    from exporter import export_json, export_ae_keyframes, export_tracks_ae
     import insightface_detector as _if_det_mod
 
 try:
@@ -1266,6 +1266,17 @@ class VideoPanel:
         self._body_side_pin_lbl   = None
         self._body_side_z_var     = tk.IntVar(value=0)  # Z 순서
 
+        # ── 포인트 트래킹 상태 (LK 광학 흐름) ─────────────────────────────
+        self._track_points     = []     # [{"id","color","origin_frame","pos":{idx:(x,y)}}]
+        self._track_pick_mode  = False  # '점 추가' 후 캔버스 클릭 대기 상태
+        self._track_gray_cache = None   # 지연 생성 grayscale 프레임 리스트 (전 점 공유)
+        self._track_next_id    = 1
+        self._track_busy       = False  # 추적 워커 진행 중
+        self._show_track_var   = tk.BooleanVar(value=True)
+        self._track_status_var = tk.StringVar(value="")
+        self._track_list_frame = None
+        self._track_pick_btn   = None
+
         self._build_ui()
         self._on_ema_smooth_change()        # 슬라이더 초기값 → EMA alpha 동기화
         self._on_side_ema_smooth_change()   # 옆모습 EMA alpha 동기화
@@ -1277,7 +1288,8 @@ class VideoPanel:
         self._on_weapon_smooth_change()     # weapon EMA alpha 동기화
         self._init_mediapipe()
         for _v in (self._show_face, self._show_body, self._show_hands, self._show_names,
-                   self._show_mosaic, self._img_only_var, self._hq_var):
+                   self._show_mosaic, self._img_only_var, self._hq_var,
+                   self._show_track_var):
             _v.trace_add("write", lambda *_: self._refresh_frame())
         # 슬라이더 변수 → 값 변경 시 즉시 프레임 갱신
         _slider_vars = (
@@ -1364,6 +1376,7 @@ class VideoPanel:
         self._canvas.bind("<ButtonPress-2>",    self._pan_start_cb)
         self._canvas.bind("<B2-Motion>",        self._pan_drag_cb)
         self._canvas.bind("<ButtonRelease-2>",  self._pan_end_cb)
+        self._canvas.bind("<Button-1>",         self._on_track_click)
 
         # 타임라인 캔버스
         self._tl = tk.Canvas(
@@ -1576,6 +1589,84 @@ class VideoPanel:
             activeforeground="#ff8888", activebackground=BG_PANEL,
             anchor="w",
         ).pack(fill=tk.X, padx=10, pady=(2, 2))
+
+        # ── 트래킹 (접기/펴기) ───────────────────────────────────────────────
+        tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        _tk_open = tk.BooleanVar(value=True)
+        _tk_hdr = tk.Frame(parent, bg=BG_PANEL, cursor="hand2")
+        _tk_hdr.pack(fill=tk.X)
+        _tk_lbl = tk.Label(
+            _tk_hdr, text="▼  트래킹",
+            font=("Segoe UI", 10, "bold"),
+            fg="#ffcc66", bg=BG_PANEL, anchor="w",
+        )
+        _tk_lbl.pack(fill=tk.X, padx=14, pady=(0, 4))
+        _tk_sep = tk.Frame(parent, bg="#1e1e3a", height=1)
+        _tk_sep.pack(fill=tk.X, padx=10, pady=(0, 4))
+        _tk_body = tk.Frame(parent, bg=BG_PANEL)
+        _tk_body.pack(fill=tk.X)
+
+        def _toggle_track(_e=None):
+            if _tk_open.get():
+                _tk_body.pack_forget()
+                _tk_lbl.config(text="▶  트래킹")
+                _tk_open.set(False)
+            else:
+                _tk_body.pack(fill=tk.X, after=_tk_sep)
+                _tk_lbl.config(text="▼  트래킹")
+                _tk_open.set(True)
+
+        _tk_hdr.bind("<Button-1>", _toggle_track)
+        _tk_lbl.bind("<Button-1>", _toggle_track)
+        self._panel_sections.append((_tk_open, _toggle_track))
+
+        self._track_pick_btn = tk.Button(
+            _tk_body, text="🎯 점 추가",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=6, anchor="w", padx=12,
+            command=self._toggle_track_pick,
+        )
+        self._track_pick_btn.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Checkbutton(
+            _tk_body, text="트래킹 표시", variable=self._show_track_var,
+            font=("Segoe UI", 10),
+            fg=TEXT_W, bg=BG_PANEL,
+            selectcolor="#0f3460",
+            activeforeground=TEXT_W, activebackground=BG_PANEL,
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        tk.Label(
+            _tk_body, textvariable=self._track_status_var,
+            font=("Segoe UI", 8), fg="#ffcc66", bg=BG_PANEL, anchor="w",
+        ).pack(fill=tk.X, padx=14, pady=(0, 2))
+
+        self._track_list_frame = tk.Frame(_tk_body, bg=BG_PANEL)
+        self._track_list_frame.pack(fill=tk.X, padx=10, pady=(0, 2))
+
+        _tk_btns = tk.Frame(_tk_body, bg=BG_PANEL)
+        _tk_btns.pack(fill=tk.X, padx=10, pady=(2, 4))
+        tk.Button(
+            _tk_btns, text="🗑 전체 삭제",
+            font=("Segoe UI", 9), bg="#3a1e1e", fg=TEXT_W,
+            activebackground="#5a2a2a", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=4,
+            command=self._clear_tracks,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+        tk.Button(
+            _tk_btns, text="💾 트랙 내보내기",
+            font=("Segoe UI", 9, "bold"), bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2", pady=4,
+            command=self._export_tracks,
+        ).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+
+        self._rebuild_track_list()
 
         # ── 애니화 (접기/펴기) ───────────────────────────────────────────────
         tk.Frame(parent, bg="#2a2a4a", height=1).pack(fill=tk.X, padx=10, pady=(8, 4))
@@ -3098,6 +3189,8 @@ class VideoPanel:
                 or self._glove_img_r is not None or self._glove_img_l is not None
                 or self._weapon_img is not None):
             bgr = self._apply_overlay(bgr, playback=playback, img_only=self._img_only_var.get())
+        if self._show_track_var.get() and self._track_points:
+            bgr = self._draw_track_markers(bgr)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
         self._canvas.update_idletasks()
@@ -3194,6 +3287,268 @@ class VideoPanel:
     def _pan_end_cb(self, _event):
         self._pan_start = None
         self._canvas.config(cursor="")
+
+    # ── 포인트 트래킹 ────────────────────────────────────────────────────────
+    def _canvas_to_frame(self, cx_click, cy_click):
+        """캔버스 클릭 좌표 → 원본 프레임 픽셀 좌표. 영상 밖이면 None.
+        _display_frame 의 줌/팬 정변환을 역산한다."""
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw <= 1:
+            cw = 840
+        if ch <= 1:
+            ch = 480
+        vw, vh = self._vid_w, self._vid_h
+        if vw <= 0 or vh <= 0:
+            return None
+        base_scale = min(cw / vw, ch / vh)
+        scale = base_scale * self._zoom
+        if scale <= 0:
+            return None
+        nw, nh = int(vw * scale), int(vh * scale)
+        if self._zoom <= 1.0:
+            ox = (cw - nw) // 2
+            oy = (ch - nh) // 2
+            fx = (cx_click - ox) / scale
+            fy = (cy_click - oy) / scale
+        else:
+            crop_x = (nw - cw) // 2 - self._pan_x
+            crop_y = (nh - ch) // 2 - self._pan_y
+            crop_x = max(0, min(max(0, nw - cw), crop_x))
+            crop_y = max(0, min(max(0, nh - ch), crop_y))
+            x2 = min(nw, crop_x + cw)
+            y2 = min(nh, crop_y + ch)
+            pox = (cw - (x2 - crop_x)) // 2
+            poy = (ch - (y2 - crop_y)) // 2
+            fx = (cx_click - pox + crop_x) / scale
+            fy = (cy_click - poy + crop_y) / scale
+        if fx < 0 or fy < 0 or fx >= vw or fy >= vh:
+            return None
+        return (fx, fy)
+
+    def _toggle_track_pick(self):
+        if self._track_busy:
+            return
+        self._track_pick_mode = not self._track_pick_mode
+        if self._track_pick_mode:
+            self._track_pick_btn.config(text="🎯 클릭하세요…", bg="#2a4f80")
+            self._canvas.config(cursor="tcross")
+            self._track_status_var.set("영상에서 추적할 지점을 클릭하세요")
+        else:
+            self._track_pick_btn.config(text="🎯 점 추가", bg="#1e3a5f")
+            self._canvas.config(cursor="")
+            self._track_status_var.set("")
+
+    def _on_track_click(self, event):
+        if not self._track_pick_mode or self._track_busy:
+            return
+        pt = self._canvas_to_frame(event.x, event.y)
+        if pt is None:
+            self._track_status_var.set("영상 영역 안을 클릭하세요")
+            return
+        fx, fy = pt
+        origin = self._current_frame
+        self._track_pick_mode = False
+        self._canvas.config(cursor="")
+        self._track_busy = True
+        self._track_pick_btn.config(text="🎯 추적 중…", bg="#2a4f80", state=tk.DISABLED)
+        self._track_status_var.set("추적 준비 중…")
+        threading.Thread(
+            target=self._track_worker, args=(fx, fy, origin), daemon=True,
+        ).start()
+
+    def _track_color(self, tid):
+        import colorsys
+        h = ((tid - 1) * 0.61803398875) % 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, 0.85, 1.0)
+        return (int(b * 255), int(g * 255), int(r * 255))   # BGR
+
+    def _set_track_status(self, text):
+        self.win.after(0, lambda: self._track_status_var.set(text))
+
+    def _ensure_gray_cache(self):
+        """전 프레임 grayscale 리스트 (지연 생성, 전 점 공유). 워커 스레드에서 호출."""
+        if self._track_gray_cache is not None:
+            return self._track_gray_cache
+        grays = []
+        cap = cv2.VideoCapture(self._video_path)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            grays.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        cap.release()
+        self._track_gray_cache = grays
+        return grays
+
+    def _track_worker(self, fx, fy, origin):
+        try:
+            self._set_track_status("프레임 분석 중…")
+            grays = self._ensure_gray_cache()
+            n = len(grays) if grays else 0
+            if n == 0:
+                self._set_track_status("프레임을 읽을 수 없습니다")
+                self.win.after(0, self._track_finish_ui)
+                return
+            origin = max(0, min(n - 1, origin))
+
+            # 클릭 지점 주변에서 가장 강한 코너로 스냅 → LK 추적 안정성 향상
+            roi_r = 15
+            gx0 = max(0, int(fx - roi_r))
+            gy0 = max(0, int(fy - roi_r))
+            roi = grays[origin][gy0:gy0 + 2 * roi_r, gx0:gx0 + 2 * roi_r]
+            if roi.size > 0:
+                feats = cv2.goodFeaturesToTrack(
+                    roi, maxCorners=1, qualityLevel=0.01, minDistance=5)
+                if feats is not None:
+                    fx = gx0 + float(feats[0][0][0])
+                    fy = gy0 + float(feats[0][0][1])
+
+            lk = dict(
+                winSize=(21, 21), maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+            )
+            pos = {origin: (float(fx), float(fy))}
+            total = max(1, n - 1)
+            done = 0
+
+            p = np.array([[[fx, fy]]], dtype=np.float32)
+            for i in range(origin, n - 1):
+                nxt, st, _e = cv2.calcOpticalFlowPyrLK(grays[i], grays[i + 1], p, None, **lk)
+                done += 1
+                if st is None or int(st[0][0]) == 0:
+                    break
+                x, y = float(nxt[0][0][0]), float(nxt[0][0][1])
+                if not (0 <= x < self._vid_w and 0 <= y < self._vid_h):
+                    break
+                pos[i + 1] = (x, y)
+                p = nxt
+                if done % 20 == 0:
+                    self._set_track_status(f"추적 중… {int(done * 100 / total)}%")
+
+            p = np.array([[[fx, fy]]], dtype=np.float32)
+            for i in range(origin, 0, -1):
+                nxt, st, _e = cv2.calcOpticalFlowPyrLK(grays[i], grays[i - 1], p, None, **lk)
+                done += 1
+                if st is None or int(st[0][0]) == 0:
+                    break
+                x, y = float(nxt[0][0][0]), float(nxt[0][0][1])
+                if not (0 <= x < self._vid_w and 0 <= y < self._vid_h):
+                    break
+                pos[i - 1] = (x, y)
+                p = nxt
+                if done % 20 == 0:
+                    self._set_track_status(f"추적 중… {int(done * 100 / total)}%")
+
+            entry = {
+                "id": self._track_next_id,
+                "color": self._track_color(self._track_next_id),
+                "origin_frame": origin,
+                "pos": pos,
+            }
+            self._track_next_id += 1
+            self._track_points.append(entry)
+            self.win.after(0, lambda e=entry: self._on_track_done(e))
+        except Exception as exc:                                   # noqa: BLE001
+            msg = str(exc)
+            self._set_track_status(f"추적 오류: {msg}")
+            self.win.after(0, self._track_finish_ui)
+
+    def _on_track_done(self, entry):
+        self._track_status_var.set(f"#{entry['id']} 추적 완료 ({len(entry['pos'])} 프레임)")
+        self._track_finish_ui()
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    def _track_finish_ui(self):
+        self._track_busy = False
+        if self._track_pick_btn is not None:
+            self._track_pick_btn.config(state=tk.NORMAL, text="🎯 점 추가", bg="#1e3a5f")
+        self._canvas.config(cursor="")
+
+    def _draw_track_markers(self, bgr):
+        out = bgr.copy()
+        idx = self._current_frame
+        for entry in self._track_points:
+            pt = entry["pos"].get(idx)
+            if pt is None:
+                continue
+            x, y = int(round(pt[0])), int(round(pt[1]))
+            color = entry["color"]
+            cv2.drawMarker(out, (x, y), color, cv2.MARKER_CROSS, 18, 2)
+            cv2.circle(out, (x, y), 10, color, 2, cv2.LINE_AA)
+            cv2.putText(out, f"#{entry['id']}", (x + 12, y - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        return out
+
+    def _rebuild_track_list(self):
+        frame = self._track_list_frame
+        if frame is None:
+            return
+        for w in frame.winfo_children():
+            w.destroy()
+        if not self._track_points:
+            tk.Label(frame, text="추적 점 없음",
+                     font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+                     ).pack(fill=tk.X, padx=4, pady=2)
+            return
+        for entry in self._track_points:
+            row = tk.Frame(frame, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=1)
+            b, g, r = entry["color"]
+            hexc = f"#{r:02x}{g:02x}{b:02x}"
+            tk.Label(row, text="●", font=("Segoe UI", 11), fg=hexc, bg=BG_PANEL,
+                     ).pack(side=tk.LEFT, padx=(2, 4))
+            tk.Label(row, text=f"#{entry['id']}  ({len(entry['pos'])}f)",
+                     font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL, anchor="w",
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Button(row, text="✕", font=("Segoe UI", 9),
+                      bg=BG_PANEL, fg="#ff8888", relief=tk.FLAT, cursor="hand2",
+                      activebackground="#3a1e1e", activeforeground="white",
+                      command=lambda tid=entry["id"]: self._remove_track(tid),
+                      ).pack(side=tk.RIGHT, padx=2)
+
+    def _remove_track(self, tid):
+        if self._track_busy:
+            return
+        self._track_points = [e for e in self._track_points if e["id"] != tid]
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    def _clear_tracks(self):
+        if self._track_busy:
+            return
+        self._track_points = []
+        self._track_status_var.set("")
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    def _export_tracks(self):
+        if self._track_busy:
+            messagebox.showinfo("트래킹", "추적이 끝난 뒤 내보내세요.", parent=self.win)
+            return
+        if not self._track_points:
+            messagebox.showinfo("트래킹", "내보낼 추적 점이 없습니다.", parent=self.win)
+            return
+        out_dir = filedialog.askdirectory(
+            title="트랙 내보낼 폴더 선택", parent=self.win,
+        )
+        if not out_dir:
+            return
+        info = VideoInfo(
+            width=self._vid_w, height=self._vid_h,
+            fps=self._fps, total_frames=self._total_frames,
+        )
+        try:
+            files = export_tracks_ae(out_dir, info, self._track_points)
+        except Exception as exc:                                   # noqa: BLE001
+            messagebox.showerror("트래킹", f"내보내기 실패:\n{exc}", parent=self.win)
+            return
+        self._track_status_var.set(f"{len(files)}개 트랙 내보냄")
+        messagebox.showinfo(
+            "트래킹", f"{len(files)}개 트랙을 AE 키프레임으로 저장했습니다:\n{out_dir}",
+            parent=self.win,
+        )
 
     def _apply_overlay(self, bgr, playback=False, img_only=False):
         """오버레이 렌더링."""
