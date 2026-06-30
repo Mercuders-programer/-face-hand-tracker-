@@ -10,6 +10,7 @@ video_panel.py — 영상 분석 패널
 import tkinter as tk
 from tkinter import messagebox, filedialog, ttk
 import threading
+import math
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -33,13 +34,15 @@ try:
     from .tracker import (FrameData, VideoInfo, PersonData,
                           _extract_face, _extract_hand, _extract_pose,
                           _build_persons, MAX_PERSONS, PERSON_COLORS)
-    from .exporter import export_json, export_ae_keyframes, export_tracks_ae
+    from .exporter import (export_json, export_ae_keyframes, export_tracks_ae,
+                           export_pairs_ae, export_quads_ae)
     from . import insightface_detector as _if_det_mod
 except ImportError:
     from tracker import (FrameData, VideoInfo, PersonData,
                          _extract_face, _extract_hand, _extract_pose,
                          _build_persons, MAX_PERSONS, PERSON_COLORS)
-    from exporter import export_json, export_ae_keyframes, export_tracks_ae
+    from exporter import (export_json, export_ae_keyframes, export_tracks_ae,
+                          export_pairs_ae, export_quads_ae)
     import insightface_detector as _if_det_mod
 
 try:
@@ -1048,6 +1051,7 @@ class VideoPanel:
         self._sd_pipe          = None   # SDCartoon 캐시 (지연 로드)
         self._smooth_var = tk.IntVar(value=3)
         self._time_var           = tk.StringVar(value="00:00 / 00:00")
+        self._frame_var          = tk.StringVar(value="0 / 0 프레임")
         self._zoom               = 1.0               # 줌 배율 (1.0 = 100%)
         self._zoom_var           = tk.StringVar(value="100%")
         self._pan_x              = 0                 # 패닝 오프셋 (확대 이미지 픽셀 기준)
@@ -1272,10 +1276,25 @@ class VideoPanel:
         self._track_gray_cache = None   # 지연 생성 grayscale 프레임 리스트 (전 점 공유)
         self._track_next_id    = 1
         self._track_busy       = False  # 추적 워커 진행 중
+        self._track_correct_id = None   # 보정 대상 트랙 id (None=비활성, _track_pick_mode와 상호배타)
         self._show_track_var   = tk.BooleanVar(value=True)
         self._track_status_var = tk.StringVar(value="")
         self._track_list_frame = None
         self._track_pick_btn   = None
+
+        # ── 두점(쌍) 트래킹 상태 ─────────────────────────────────────────
+        self._track_pairs        = []    # [{"id","color","origin_frame","members":[{"id","pos"},...]}]
+        self._track_pair_next_id = 1
+        self._track_pair_pick    = 0     # 0=off, 1=첫 클릭 대기, 2=둘째 클릭 대기
+        self._track_pair_first   = None  # (fx,fy) 첫 점 임시 저장
+        self._track_pair_btn     = None
+
+        # ── 네점(코너핀) 트래킹 상태 ──────────────────────────────────────
+        self._track_quads        = []    # [{"id","color","origin_frame","members":[m0..m3]}]
+        self._track_quad_next_id = 1
+        self._track_quad_pick    = 0     # 0=off, 1~4=N번째 클릭 대기
+        self._track_quad_pts     = []    # 누적 클릭 좌표
+        self._track_quad_btn     = None
 
         self._build_ui()
         self._on_ema_smooth_change()        # 슬라이더 초기값 → EMA alpha 동기화
@@ -1409,6 +1428,12 @@ class VideoPanel:
             font=("Segoe UI", 11),
             fg=TEXT_W, bg=BG_DARK,
         ).pack(side=tk.LEFT)
+        tk.Label(ctrl, text="  |", font=("Segoe UI", 11), fg=TEXT_G, bg=BG_DARK).pack(side=tk.LEFT)
+        tk.Label(
+            ctrl, textvariable=self._frame_var,
+            font=("Segoe UI", 11),
+            fg=TEXT_W, bg=BG_DARK,
+        ).pack(side=tk.LEFT, padx=(4, 0))
         tk.Label(ctrl, text="  |", font=("Segoe UI", 11), fg=TEXT_G, bg=BG_DARK).pack(side=tk.LEFT)
         tk.Label(
             ctrl, textvariable=self._zoom_var,
@@ -1631,6 +1656,33 @@ class VideoPanel:
             command=self._toggle_track_pick,
         )
         self._track_pick_btn.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        self._track_pair_btn = tk.Button(
+            _tk_body, text="🔗 두점 추가",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=6, anchor="w", padx=12,
+            command=self._toggle_track_pair_pick,
+        )
+        self._track_pair_btn.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        self._track_quad_btn = tk.Button(
+            _tk_body, text="🔲 네점 추가 (코너핀)",
+            font=("Segoe UI", 10, "bold"),
+            bg="#1e3a5f", fg=TEXT_W,
+            activebackground="#2a4f80", activeforeground="white",
+            relief=tk.FLAT, cursor="hand2",
+            pady=6, anchor="w", padx=12,
+            command=self._toggle_track_quad_pick,
+        )
+        self._track_quad_btn.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        tk.Label(
+            _tk_body, text="↓ 목록의 [그림] 버튼으로 각 추적에 이미지를 넣을 수 있어요",
+            font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
+        ).pack(fill=tk.X, padx=12, pady=(0, 4))
 
         tk.Checkbutton(
             _tk_body, text="트래킹 표시", variable=self._show_track_var,
@@ -3189,7 +3241,10 @@ class VideoPanel:
                 or self._glove_img_r is not None or self._glove_img_l is not None
                 or self._weapon_img is not None):
             bgr = self._apply_overlay(bgr, playback=playback, img_only=self._img_only_var.get())
-        if self._show_track_var.get() and self._track_points:
+        if self._has_track_images():
+            bgr = self._render_track_images(bgr)
+        if self._show_track_var.get() and (self._track_points or self._track_pairs
+                                           or self._track_quads):
             bgr = self._draw_track_markers(bgr)
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
@@ -3329,6 +3384,9 @@ class VideoPanel:
     def _toggle_track_pick(self):
         if self._track_busy:
             return
+        self._track_correct_id = None       # 보정 모드와 상호 배타
+        self._reset_pair_pick()             # 두점 모드와 상호 배타
+        self._reset_quad_pick()             # 네점 모드와 상호 배타
         self._track_pick_mode = not self._track_pick_mode
         if self._track_pick_mode:
             self._track_pick_btn.config(text="🎯 클릭하세요…", bg="#2a4f80")
@@ -3339,8 +3397,137 @@ class VideoPanel:
             self._canvas.config(cursor="")
             self._track_status_var.set("")
 
+    def _reset_pair_pick(self):
+        """두점 픽 모드 해제 + 버튼 라벨 복원."""
+        self._track_pair_pick = 0
+        self._track_pair_first = None
+        if self._track_pair_btn is not None:
+            self._track_pair_btn.config(text="🔗 두점 추가", bg="#1e3a5f")
+
+    def _toggle_track_pair_pick(self):
+        if self._track_busy:
+            return
+        if self._track_pair_pick:                # 이미 켜져 있으면 취소
+            self._reset_pair_pick()
+            self._canvas.config(cursor="")
+            self._track_status_var.set("")
+            return
+        # 다른 모드 해제 후 진입
+        self._track_pick_mode = False
+        if self._track_pick_btn is not None:
+            self._track_pick_btn.config(text="🎯 점 추가", bg="#1e3a5f")
+        self._track_correct_id = None
+        self._reset_quad_pick()
+        self._track_pair_pick = 1
+        self._track_pair_first = None
+        self._track_pair_btn.config(text="🔗 첫 점 클릭…", bg="#2a4f80")
+        self._canvas.config(cursor="tcross")
+        self._track_status_var.set("두점: 첫 번째 점을 클릭하세요")
+
+    def _reset_quad_pick(self):
+        """네점 픽 모드 해제 + 버튼 라벨 복원."""
+        self._track_quad_pick = 0
+        self._track_quad_pts = []
+        if self._track_quad_btn is not None:
+            self._track_quad_btn.config(text="🔲 네점 추가 (코너핀)", bg="#1e3a5f")
+
+    def _toggle_track_quad_pick(self):
+        if self._track_busy:
+            return
+        if self._track_quad_pick:                # 이미 켜져 있으면 취소
+            self._reset_quad_pick()
+            self._canvas.config(cursor="")
+            self._track_status_var.set("")
+            return
+        # 다른 모드 해제 후 진입
+        self._track_pick_mode = False
+        if self._track_pick_btn is not None:
+            self._track_pick_btn.config(text="🎯 점 추가", bg="#1e3a5f")
+        self._track_correct_id = None
+        self._reset_pair_pick()
+        self._track_quad_pick = 1
+        self._track_quad_pts = []
+        self._track_quad_btn.config(text="🔲 1/4 좌상단 클릭…", bg="#2a4f80")
+        self._canvas.config(cursor="tcross")
+        self._track_status_var.set("네점: 좌상단(1/4)을 클릭하세요 — 시계방향 좌상→우상→우하→좌하")
+
     def _on_track_click(self, event):
-        if not self._track_pick_mode or self._track_busy:
+        if self._track_busy:
+            return
+        # ── 보정 모드: 잘못된 프레임에서 올바른 위치 클릭 → 앞쪽 재추적 ──
+        if self._track_correct_id is not None:
+            pt = self._canvas_to_frame(event.x, event.y)
+            if pt is None:
+                self._track_status_var.set("영상 영역 안을 클릭하세요")
+                return
+            tid = self._track_correct_id
+            self._track_correct_id = None
+            corr = self._current_frame
+            self._canvas.config(cursor="")
+            self._track_busy = True
+            if self._track_pick_btn is not None:
+                self._track_pick_btn.config(state=tk.DISABLED)
+            self._track_status_var.set(f"#{tid} 보정 추적 중…")
+            threading.Thread(
+                target=self._correct_worker, args=(tid, pt[0], pt[1], corr),
+                daemon=True,
+            ).start()
+            return
+        # ── 두점(쌍) 추가: 두 번 클릭 ──
+        if self._track_pair_pick:
+            pt = self._canvas_to_frame(event.x, event.y)
+            if pt is None:
+                self._track_status_var.set("영상 영역 안을 클릭하세요")
+                return
+            if self._track_pair_pick == 1:
+                self._track_pair_first = pt
+                self._track_pair_pick = 2
+                self._track_pair_btn.config(text="🔗 둘째 점 클릭…")
+                self._track_status_var.set("두점: 두 번째 점을 클릭하세요")
+                return
+            a = self._track_pair_first
+            b = pt
+            origin = self._current_frame
+            self._reset_pair_pick()
+            self._canvas.config(cursor="")
+            self._track_busy = True
+            if self._track_pick_btn is not None:
+                self._track_pick_btn.config(state=tk.DISABLED)
+            self._track_pair_btn.config(text="🔗 추적 중…", bg="#2a4f80", state=tk.DISABLED)
+            self._track_status_var.set("두점 추적 준비 중…")
+            threading.Thread(
+                target=self._pair_worker, args=(a, b, origin), daemon=True,
+            ).start()
+            return
+        # ── 네점(코너핀) 추가: 네 번 클릭 ──
+        if self._track_quad_pick:
+            pt = self._canvas_to_frame(event.x, event.y)
+            if pt is None:
+                self._track_status_var.set("영상 영역 안을 클릭하세요")
+                return
+            self._track_quad_pts.append(pt)
+            picked = len(self._track_quad_pts)
+            if picked < 4:
+                self._track_quad_pick = picked + 1
+                labels = {2: "우상단", 3: "우하단", 4: "좌하단"}
+                self._track_quad_btn.config(text=f"🔲 {picked + 1}/4 {labels[picked + 1]} 클릭…")
+                self._track_status_var.set(f"네점: {labels[picked + 1]}({picked + 1}/4)을 클릭하세요")
+                return
+            pts = list(self._track_quad_pts)
+            origin = self._current_frame
+            self._reset_quad_pick()
+            self._canvas.config(cursor="")
+            self._track_busy = True
+            if self._track_pick_btn is not None:
+                self._track_pick_btn.config(state=tk.DISABLED)
+            self._track_quad_btn.config(text="🔲 추적 중…", bg="#2a4f80", state=tk.DISABLED)
+            self._track_status_var.set("네점 추적 준비 중…")
+            threading.Thread(
+                target=self._quad_worker, args=(pts, origin), daemon=True,
+            ).start()
+            return
+        # ── 신규 점 추가 ──
+        if not self._track_pick_mode:
             return
         pt = self._canvas_to_frame(event.x, event.y)
         if pt is None:
@@ -3381,6 +3568,93 @@ class VideoPanel:
         self._track_gray_cache = grays
         return grays
 
+    # ── 견고화 헬퍼 (워커 스레드에서만 호출, 순수 계산) ─────────────────────
+    _LK_PARAMS = dict(
+        winSize=(21, 21), maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+
+    def _snap_to_corner(self, gray, fx, fy, roi_r=15):
+        """클릭 지점 주변에서 가장 강한 코너로 스냅 → LK 추적 안정성 향상."""
+        gx0 = max(0, int(fx - roi_r))
+        gy0 = max(0, int(fy - roi_r))
+        roi = gray[gy0:gy0 + 2 * roi_r, gx0:gx0 + 2 * roi_r]
+        if roi.size > 0:
+            feats = cv2.goodFeaturesToTrack(
+                roi, maxCorners=1, qualityLevel=0.01, minDistance=5)
+            if feats is not None:
+                fx = gx0 + float(feats[0][0][0])
+                fy = gy0 + float(feats[0][0][1])
+        return fx, fy
+
+    def _extract_template(self, gray, x, y, r=10):
+        """(x,y) 중심 (2r+1) 정사각 패치. 경계에서 잘림, 너무 작으면 None."""
+        h, w = gray.shape[:2]
+        x0 = max(0, int(round(x)) - r); x1 = min(w, int(round(x)) + r + 1)
+        y0 = max(0, int(round(y)) - r); y1 = min(h, int(round(y)) + r + 1)
+        patch = gray[y0:y1, x0:x1]
+        if patch.shape[0] < 5 or patch.shape[1] < 5:
+            return None
+        return patch
+
+    def _patch_ncc(self, gray, x, y, template, search_r=4):
+        """(x,y) 주변 검색창에서 template 과의 최대 정규화 상관(NCC).
+        패치 추출 불가 시 -1.0 반환."""
+        if template is None:
+            return 1.0
+        th, tw = template.shape[:2]
+        h, w = gray.shape[:2]
+        x0 = max(0, int(round(x)) - tw // 2 - search_r)
+        y0 = max(0, int(round(y)) - th // 2 - search_r)
+        x1 = min(w, int(round(x)) + tw // 2 + search_r + 1)
+        y1 = min(h, int(round(y)) + th // 2 + search_r + 1)
+        region = gray[y0:y1, x0:x1]
+        if region.shape[0] < th or region.shape[1] < tw:
+            return -1.0
+        res = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+        return float(res.max())
+
+    def _lk_track(self, grays, origin, start_pt, template, step,
+                  fb_thresh=1.5, ncc_thresh=0.55, progress=None):
+        """origin 에서 step(+1=앞, -1=뒤) 방향으로 한 프레임씩 LK 추적.
+        FB 오차 + 템플릿 NCC 검증을 통과하는 동안만 위치 누적, 실패 시 중단.
+        반환: {frame_idx: (x, y)} (origin 은 포함하지 않음)."""
+        n = len(grays)
+        pos = {}
+        p = np.array([[list(start_pt)]], dtype=np.float32)
+        i = origin
+        done = 0
+        while True:
+            j = i + step
+            if j < 0 or j >= n:
+                break
+            nxt, st, _e = cv2.calcOpticalFlowPyrLK(grays[i], grays[j], p, None,
+                                                   **self._LK_PARAMS)
+            done += 1
+            if st is None or int(st[0][0]) == 0:
+                break
+            # 전후방 오차(FB error): j→i 역추적이 출발점으로 돌아오는지
+            back, st2, _e2 = cv2.calcOpticalFlowPyrLK(grays[j], grays[i], nxt, None,
+                                                      **self._LK_PARAMS)
+            if st2 is None or int(st2[0][0]) == 0:
+                break
+            fb = math.hypot(float(back[0][0][0]) - float(p[0][0][0]),
+                            float(back[0][0][1]) - float(p[0][0][1]))
+            if fb > fb_thresh:
+                break
+            x, y = float(nxt[0][0][0]), float(nxt[0][0][1])
+            if not (0 <= x < self._vid_w and 0 <= y < self._vid_h):
+                break
+            # 템플릿 NCC: 다른 물체로 점프하면 외형이 달라져 상관이 떨어짐
+            if self._patch_ncc(grays[j], x, y, template) < ncc_thresh:
+                break
+            pos[j] = (x, y)
+            p = nxt
+            i = j
+            if progress is not None and done % 20 == 0:
+                progress(done)
+        return pos
+
     def _track_worker(self, fx, fy, origin):
         try:
             self._set_track_status("프레임 분석 중…")
@@ -3392,53 +3666,17 @@ class VideoPanel:
                 return
             origin = max(0, min(n - 1, origin))
 
-            # 클릭 지점 주변에서 가장 강한 코너로 스냅 → LK 추적 안정성 향상
-            roi_r = 15
-            gx0 = max(0, int(fx - roi_r))
-            gy0 = max(0, int(fy - roi_r))
-            roi = grays[origin][gy0:gy0 + 2 * roi_r, gx0:gx0 + 2 * roi_r]
-            if roi.size > 0:
-                feats = cv2.goodFeaturesToTrack(
-                    roi, maxCorners=1, qualityLevel=0.01, minDistance=5)
-                if feats is not None:
-                    fx = gx0 + float(feats[0][0][0])
-                    fy = gy0 + float(feats[0][0][1])
+            fx, fy = self._snap_to_corner(grays[origin], fx, fy)
+            template = self._extract_template(grays[origin], fx, fy)
 
-            lk = dict(
-                winSize=(21, 21), maxLevel=3,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-            )
-            pos = {origin: (float(fx), float(fy))}
             total = max(1, n - 1)
-            done = 0
+            prog = lambda d: self._set_track_status(f"추적 중… {int(d * 100 / total)}%")
 
-            p = np.array([[[fx, fy]]], dtype=np.float32)
-            for i in range(origin, n - 1):
-                nxt, st, _e = cv2.calcOpticalFlowPyrLK(grays[i], grays[i + 1], p, None, **lk)
-                done += 1
-                if st is None or int(st[0][0]) == 0:
-                    break
-                x, y = float(nxt[0][0][0]), float(nxt[0][0][1])
-                if not (0 <= x < self._vid_w and 0 <= y < self._vid_h):
-                    break
-                pos[i + 1] = (x, y)
-                p = nxt
-                if done % 20 == 0:
-                    self._set_track_status(f"추적 중… {int(done * 100 / total)}%")
-
-            p = np.array([[[fx, fy]]], dtype=np.float32)
-            for i in range(origin, 0, -1):
-                nxt, st, _e = cv2.calcOpticalFlowPyrLK(grays[i], grays[i - 1], p, None, **lk)
-                done += 1
-                if st is None or int(st[0][0]) == 0:
-                    break
-                x, y = float(nxt[0][0][0]), float(nxt[0][0][1])
-                if not (0 <= x < self._vid_w and 0 <= y < self._vid_h):
-                    break
-                pos[i - 1] = (x, y)
-                p = nxt
-                if done % 20 == 0:
-                    self._set_track_status(f"추적 중… {int(done * 100 / total)}%")
+            pos = {origin: (float(fx), float(fy))}
+            pos.update(self._lk_track(grays, origin, (fx, fy), template,
+                                      step=+1, progress=prog))
+            pos.update(self._lk_track(grays, origin, (fx, fy), template,
+                                      step=-1, progress=prog))
 
             entry = {
                 "id": self._track_next_id,
@@ -3454,16 +3692,232 @@ class VideoPanel:
             self._set_track_status(f"추적 오류: {msg}")
             self.win.after(0, self._track_finish_ui)
 
-    def _on_track_done(self, entry):
-        self._track_status_var.set(f"#{entry['id']} 추적 완료 ({len(entry['pos'])} 프레임)")
+    def _find_point_entry(self, pid):
+        """pid 로 추적 점 dict 검색: 단일 점 + 모든 쌍/네점의 멤버 대상.
+        반환: {"id","pos",...} 형태 dict (없으면 None)."""
+        for e in self._track_points:
+            if e["id"] == pid:
+                return e
+        for grp in self._track_pairs + self._track_quads:
+            for m in grp["members"]:
+                if m["id"] == pid:
+                    return m
+        return None
+
+    def _track_group(self, grays, pts, origin, tag):
+        """여러 클릭 지점(pts)을 각각 양방향 추적 → members 리스트 반환.
+        각 멤버는 _track_next_id 에서 유일 id 발급. (워커 스레드에서 호출)"""
+        n = len(grays)
+        total = max(1, n - 1)
+        members = []
+        for k, pt in enumerate(pts):
+            fx, fy = self._snap_to_corner(grays[origin], pt[0], pt[1])
+            template = self._extract_template(grays[origin], fx, fy)
+            prog = lambda d, K=k: self._set_track_status(
+                f"{tag} {K + 1}번 추적 중… {int(d * 100 / total)}%")
+            pos = {origin: (float(fx), float(fy))}
+            pos.update(self._lk_track(grays, origin, (fx, fy), template,
+                                      step=+1, progress=prog))
+            pos.update(self._lk_track(grays, origin, (fx, fy), template,
+                                      step=-1, progress=prog))
+            members.append({"id": self._track_next_id, "pos": pos})
+            self._track_next_id += 1
+        return members
+
+    def _pair_worker(self, a, b, origin):
+        """두 클릭 지점 a,b 를 각각 양방향 추적 → 쌍 엔트리 생성."""
+        try:
+            self._set_track_status("두점 프레임 분석 중…")
+            grays = self._ensure_gray_cache()
+            n = len(grays) if grays else 0
+            if n == 0:
+                self._set_track_status("프레임을 읽을 수 없습니다")
+                self.win.after(0, self._track_finish_ui)
+                return
+            origin = max(0, min(n - 1, origin))
+            members = self._track_group(grays, [a, b], origin, "두점")
+            pair = {
+                "id": self._track_pair_next_id,
+                "color": self._track_color(self._track_pair_next_id + 100),
+                "origin_frame": origin,
+                "members": members,
+            }
+            self._track_pair_next_id += 1
+            self._track_pairs.append(pair)
+            self.win.after(0, lambda p=pair: self._on_pair_done(p))
+        except Exception as exc:                                   # noqa: BLE001
+            msg = str(exc)
+            self._set_track_status(f"두점 추적 오류: {msg}")
+            self.win.after(0, self._track_finish_ui)
+
+    def _on_pair_done(self, pair):
+        ma, mb = pair["members"]
+        common = len(set(ma["pos"]) & set(mb["pos"]))
+        self._track_status_var.set(
+            f"⛓ #{pair['id']} 두점 추적 완료 (공통 {common} 프레임)")
+        self._track_finish_ui()
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    def _track_plane_dir(self, grays, corners0, origin, step, progress=None):
+        """origin 평면(corners0 4점)을 step 방향으로 추적.
+        쿼드 내부의 강한 특징점들을 LK로 추적하고 매 프레임 호모그래피를 추정해
+        4모서리 위치를 산출한다. 모서리 자체에 텍스처가 없어도 평면 내부 텍스처로
+        함께 움직이므로 개별 모서리가 사라지지 않는다.
+        반환 {frame_idx: [(x,y)*4]} (origin 미포함). 내부 특징 부족 시 None."""
+        n = len(grays)
+        g0 = grays[origin]
+        quad = np.array([[int(round(c[0])), int(round(c[1]))] for c in corners0],
+                        dtype=np.int32)
+        mask = np.zeros(g0.shape[:2], np.uint8)
+        cv2.fillPoly(mask, [quad], 255)
+        f0 = cv2.goodFeaturesToTrack(g0, maxCorners=200, qualityLevel=0.01,
+                                     minDistance=8, mask=mask)
+        if f0 is None or len(f0) < 8:
+            return None                      # 평면 내부 특징 부족 → 폴백 신호
+        f0 = f0.reshape(-1, 1, 2).astype(np.float32)
+        corners_arr = np.array(corners0, np.float32).reshape(-1, 1, 2)
+        out = {}
+        cur = f0.copy()
+        alive = np.ones(len(f0), dtype=bool)
+        i = origin
+        done = 0
+        while True:
+            j = i + step
+            if j < 0 or j >= n:
+                break
+            nxt, st, _ = cv2.calcOpticalFlowPyrLK(grays[i], grays[j], cur, None,
+                                                  **self._LK_PARAMS)
+            back, st2, _ = cv2.calcOpticalFlowPyrLK(grays[j], grays[i], nxt, None,
+                                                    **self._LK_PARAMS)
+            done += 1
+            fb = np.linalg.norm((back - cur).reshape(-1, 2), axis=1)
+            good = (st.reshape(-1) == 1) & (st2.reshape(-1) == 1) & (fb < 1.5)
+            alive = alive & good             # 한 번 탈락한 특징은 영구 제외
+            if int(alive.sum()) < 6:
+                break
+            src = f0[alive].reshape(-1, 2)
+            dst = nxt[alive].reshape(-1, 2)
+            H, inl = cv2.findHomography(src, dst, cv2.RANSAC, 3.0)
+            if H is None or inl is None or int(inl.sum()) < 6:
+                break
+            proj = cv2.perspectiveTransform(corners_arr, H).reshape(-1, 2)
+            out[j] = [(float(x), float(y)) for x, y in proj]
+            cur = nxt
+            i = j
+            if progress is not None and done % 20 == 0:
+                progress(done)
+        return out
+
+    def _quad_worker(self, pts, origin):
+        """네 클릭 지점으로 평면(코너핀)을 추적 → 쿼드 엔트리 생성.
+        1차: 쿼드 내부 특징 + 호모그래피(모서리 동반 이동, 사라짐 방지).
+        내부 특징 부족 시 2차: 모서리별 개별 LK 추적(_track_group)으로 폴백."""
+        try:
+            self._set_track_status("네점 평면 분석 중…")
+            grays = self._ensure_gray_cache()
+            n = len(grays) if grays else 0
+            if n == 0:
+                self._set_track_status("프레임을 읽을 수 없습니다")
+                self.win.after(0, self._track_finish_ui)
+                return
+            origin = max(0, min(n - 1, origin))
+            total = max(1, n - 1)
+            prog = lambda d: self._set_track_status(
+                f"네점 평면 추적 중… {int(d * 100 / total)}%")
+
+            fwd = self._track_plane_dir(grays, pts, origin, +1, progress=prog)
+            bwd = self._track_plane_dir(grays, pts, origin, -1, progress=prog)
+
+            if fwd is None or bwd is None:
+                # 평면 텍스처 부족 → 모서리별 개별 추적으로 폴백
+                self._set_track_status("네점: 평면 텍스처 부족 → 모서리별 추적")
+                members = self._track_group(grays, pts, origin, "네점")
+            else:
+                members = [{"id": self._track_next_id + k,
+                            "pos": {origin: (float(pts[k][0]), float(pts[k][1]))}}
+                           for k in range(4)]
+                self._track_next_id += 4
+                for frame_map in (fwd, bwd):
+                    for f, corners in frame_map.items():
+                        for k in range(4):
+                            members[k]["pos"][f] = corners[k]
+
+            quad = {
+                "id": self._track_quad_next_id,
+                "color": self._track_color(self._track_quad_next_id + 200),
+                "origin_frame": origin,
+                "members": members,
+            }
+            self._track_quad_next_id += 1
+            self._track_quads.append(quad)
+            self.win.after(0, lambda q=quad: self._on_quad_done(q))
+        except Exception as exc:                                   # noqa: BLE001
+            msg = str(exc)
+            self._set_track_status(f"네점 추적 오류: {msg}")
+            self.win.after(0, self._track_finish_ui)
+
+    def _on_quad_done(self, quad):
+        common = None
+        for m in quad["members"]:
+            ks = set(m["pos"])
+            common = ks if common is None else (common & ks)
+        self._track_status_var.set(
+            f"▦ #{quad['id']} 네점(코너핀) 추적 완료 (공통 {len(common or [])} 프레임)")
+        self._track_finish_ui()
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    def _correct_worker(self, tid, fx, fy, corr):
+        """보정 지점(corr)에서 올바른 위치를 새 기준으로 앞쪽 끝까지 재추적.
+        corr 이전 프레임은 유지, corr 및 이후는 덮어쓴다."""
+        try:
+            grays = self._ensure_gray_cache()
+            n = len(grays) if grays else 0
+            entry = self._find_point_entry(tid)
+            if n == 0 or entry is None:
+                self.win.after(0, self._track_finish_ui)
+                return
+            corr = max(0, min(n - 1, corr))
+
+            fx, fy = self._snap_to_corner(grays[corr], fx, fy)
+            template = self._extract_template(grays[corr], fx, fy)
+
+            total = max(1, n - corr)
+            prog = lambda d: self._set_track_status(f"#{tid} 보정 추적 중… {int(d * 100 / total)}%")
+            fwd = self._lk_track(grays, corr, (fx, fy), template,
+                                 step=+1, progress=prog)
+
+            new_pos = {k: v for k, v in entry["pos"].items() if k < corr}
+            new_pos[corr] = (float(fx), float(fy))
+            new_pos.update(fwd)
+            entry["pos"] = new_pos
+            self.win.after(0, lambda e=entry: self._on_track_done(e, corrected=True))
+        except Exception as exc:                                   # noqa: BLE001
+            msg = str(exc)
+            self._set_track_status(f"보정 오류: {msg}")
+            self.win.after(0, self._track_finish_ui)
+
+    def _on_track_done(self, entry, corrected=False):
+        verb = "보정 완료" if corrected else "추적 완료"
+        self._track_status_var.set(f"#{entry['id']} {verb} ({len(entry['pos'])} 프레임)")
         self._track_finish_ui()
         self._rebuild_track_list()
         self._refresh_frame()
 
     def _track_finish_ui(self):
         self._track_busy = False
+        self._track_correct_id = None
+        self._track_pair_pick = 0
+        self._track_pair_first = None
+        self._track_quad_pick = 0
+        self._track_quad_pts = []
         if self._track_pick_btn is not None:
             self._track_pick_btn.config(state=tk.NORMAL, text="🎯 점 추가", bg="#1e3a5f")
+        if self._track_pair_btn is not None:
+            self._track_pair_btn.config(state=tk.NORMAL, text="🔗 두점 추가", bg="#1e3a5f")
+        if self._track_quad_btn is not None:
+            self._track_quad_btn.config(state=tk.NORMAL, text="🔲 네점 추가 (코너핀)", bg="#1e3a5f")
         self._canvas.config(cursor="")
 
     def _draw_track_markers(self, bgr):
@@ -3479,6 +3933,46 @@ class VideoPanel:
             cv2.circle(out, (x, y), 10, color, 2, cv2.LINE_AA)
             cv2.putText(out, f"#{entry['id']}", (x + 12, y - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        # ── 쌍(두점): 연결선 + 멤버 마커 ──
+        for pair in self._track_pairs:
+            color = pair["color"]
+            ma, mb = pair["members"]
+            pa = ma["pos"].get(idx)
+            pb = mb["pos"].get(idx)
+            if pa is not None and pb is not None:
+                ax, ay = int(round(pa[0])), int(round(pa[1]))
+                bx, by = int(round(pb[0])), int(round(pb[1]))
+                cv2.line(out, (ax, ay), (bx, by), color, 1, cv2.LINE_AA)
+            for m, p, suffix, filled in (
+                (ma, pa, "a", True), (mb, pb, "b", False)):
+                if p is None:
+                    continue
+                x, y = int(round(p[0])), int(round(p[1]))
+                if filled:
+                    cv2.drawMarker(out, (x, y), color, cv2.MARKER_CROSS, 18, 2)
+                    cv2.circle(out, (x, y), 6, color, -1, cv2.LINE_AA)
+                else:
+                    cv2.circle(out, (x, y), 9, color, 2, cv2.LINE_AA)
+                cv2.putText(out, f"#{pair['id']}{suffix}", (x + 12, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+        # ── 네점(코너핀): 사각 외곽선 + 모서리 마커 ──
+        for quad in self._track_quads:
+            color = quad["color"]
+            corners = [m["pos"].get(idx) for m in quad["members"]]
+            present = [c for c in corners if c is not None]
+            # 시계방향 클릭 순서대로 외곽선 연결 (모두 있을 때만 닫힌 사각형)
+            if len(present) == 4:
+                poly = np.array([[int(round(c[0])), int(round(c[1]))] for c in corners],
+                                dtype=np.int32)
+                cv2.polylines(out, [poly], True, color, 1, cv2.LINE_AA)
+            for ci, c in enumerate(corners):
+                if c is None:
+                    continue
+                x, y = int(round(c[0])), int(round(c[1]))
+                cv2.drawMarker(out, (x, y), color, cv2.MARKER_CROSS, 16, 2)
+                cv2.circle(out, (x, y), 5, color, -1, cv2.LINE_AA)
+                cv2.putText(out, f"#{quad['id']}.{ci + 1}", (x + 10, y - 7),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
         return out
 
     def _rebuild_track_list(self):
@@ -3487,11 +3981,23 @@ class VideoPanel:
             return
         for w in frame.winfo_children():
             w.destroy()
-        if not self._track_points:
+        if not self._track_points and not self._track_pairs and not self._track_quads:
             tk.Label(frame, text="추적 점 없음",
                      font=("Segoe UI", 8), fg=TEXT_G, bg=BG_PANEL, anchor="w",
                      ).pack(fill=tk.X, padx=4, pady=2)
             return
+
+        def _img_btn(parent, kind, oid, has_img):
+            # 좌측에 배치 → 우측 편집 버튼이 많아도 항상 보이도록
+            tk.Button(parent, text=("🖼 그림✓" if has_img else "🖼 그림"),
+                      font=("Segoe UI", 8, "bold"),
+                      bg=("#2a8a4a" if has_img else "#2f5a96"),
+                      fg="white",
+                      relief=tk.FLAT, cursor="hand2", padx=5, pady=1, bd=0,
+                      activebackground="#36a85c", activeforeground="white",
+                      command=lambda k=kind, i=oid: self._load_entity_image(k, i),
+                      ).pack(side=tk.LEFT, padx=(0, 4))
+
         for entry in self._track_points:
             row = tk.Frame(frame, bg=BG_PANEL)
             row.pack(fill=tk.X, pady=1)
@@ -3499,6 +4005,7 @@ class VideoPanel:
             hexc = f"#{r:02x}{g:02x}{b:02x}"
             tk.Label(row, text="●", font=("Segoe UI", 11), fg=hexc, bg=BG_PANEL,
                      ).pack(side=tk.LEFT, padx=(2, 4))
+            _img_btn(row, "point", entry["id"], entry.get("img") is not None)
             tk.Label(row, text=f"#{entry['id']}  ({len(entry['pos'])}f)",
                      font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL, anchor="w",
                      ).pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -3507,6 +4014,76 @@ class VideoPanel:
                       activebackground="#3a1e1e", activeforeground="white",
                       command=lambda tid=entry["id"]: self._remove_track(tid),
                       ).pack(side=tk.RIGHT, padx=2)
+            tk.Button(row, text="✎", font=("Segoe UI", 9),
+                      bg=BG_PANEL, fg="#88c0ff", relief=tk.FLAT, cursor="hand2",
+                      activebackground="#1e2f3a", activeforeground="white",
+                      command=lambda tid=entry["id"]: self._start_correct(tid),
+                      ).pack(side=tk.RIGHT, padx=2)
+        # ── 쌍(두점) 행 ──
+        for pair in self._track_pairs:
+            row = tk.Frame(frame, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=1)
+            b, g, r = pair["color"]
+            hexc = f"#{r:02x}{g:02x}{b:02x}"
+            tk.Label(row, text="⛓", font=("Segoe UI", 10), fg=hexc, bg=BG_PANEL,
+                     ).pack(side=tk.LEFT, padx=(2, 4))
+            ma, mb = pair["members"]
+            _img_btn(row, "pair", pair["id"], pair.get("img") is not None)
+            tk.Label(row, text=f"#{pair['id']} (A:{len(ma['pos'])}/B:{len(mb['pos'])}f)",
+                     font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL, anchor="w",
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Button(row, text="✕", font=("Segoe UI", 9),
+                      bg=BG_PANEL, fg="#ff8888", relief=tk.FLAT, cursor="hand2",
+                      activebackground="#3a1e1e", activeforeground="white",
+                      command=lambda pid=pair["id"]: self._remove_pair(pid),
+                      ).pack(side=tk.RIGHT, padx=2)
+            tk.Button(row, text="✎B", font=("Segoe UI", 8),
+                      bg=BG_PANEL, fg="#88c0ff", relief=tk.FLAT, cursor="hand2",
+                      activebackground="#1e2f3a", activeforeground="white",
+                      command=lambda mid=mb["id"]: self._start_correct(mid),
+                      ).pack(side=tk.RIGHT, padx=2)
+            tk.Button(row, text="✎A", font=("Segoe UI", 8),
+                      bg=BG_PANEL, fg="#88c0ff", relief=tk.FLAT, cursor="hand2",
+                      activebackground="#1e2f3a", activeforeground="white",
+                      command=lambda mid=ma["id"]: self._start_correct(mid),
+                      ).pack(side=tk.RIGHT, padx=2)
+        # ── 네점(코너핀) 행 ──
+        for quad in self._track_quads:
+            row = tk.Frame(frame, bg=BG_PANEL)
+            row.pack(fill=tk.X, pady=1)
+            b, g, r = quad["color"]
+            hexc = f"#{r:02x}{g:02x}{b:02x}"
+            tk.Label(row, text="▦", font=("Segoe UI", 10), fg=hexc, bg=BG_PANEL,
+                     ).pack(side=tk.LEFT, padx=(2, 4))
+            _img_btn(row, "quad", quad["id"], quad.get("img") is not None)
+            mins = min(len(m["pos"]) for m in quad["members"])
+            tk.Label(row, text=f"#{quad['id']} (코너핀 {mins}f)",
+                     font=("Segoe UI", 9), fg=TEXT_W, bg=BG_PANEL, anchor="w",
+                     ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            tk.Button(row, text="✕", font=("Segoe UI", 9),
+                      bg=BG_PANEL, fg="#ff8888", relief=tk.FLAT, cursor="hand2",
+                      activebackground="#3a1e1e", activeforeground="white",
+                      command=lambda pid=quad["id"]: self._remove_quad(pid),
+                      ).pack(side=tk.RIGHT, padx=2)
+            for ci in range(3, -1, -1):   # ✎4 ✎3 ✎2 ✎1 (오른쪽부터)
+                tk.Button(row, text=f"✎{ci + 1}", font=("Segoe UI", 8),
+                          bg=BG_PANEL, fg="#88c0ff", relief=tk.FLAT, cursor="hand2",
+                          activebackground="#1e2f3a", activeforeground="white",
+                          command=lambda mid=quad["members"][ci]["id"]: self._start_correct(mid),
+                          ).pack(side=tk.RIGHT, padx=1)
+
+    def _start_correct(self, tid):
+        """보정 모드 진입: 올바른 프레임으로 이동 후 캔버스 클릭을 대기."""
+        if self._track_busy:
+            return
+        self._track_pick_mode = False
+        if self._track_pick_btn is not None:
+            self._track_pick_btn.config(text="🎯 점 추가", bg="#1e3a5f")
+        self._reset_pair_pick()
+        self._reset_quad_pick()
+        self._track_correct_id = tid
+        self._canvas.config(cursor="tcross")
+        self._track_status_var.set(f"#{tid} 보정: 올바른 프레임으로 이동 후 클릭")
 
     def _remove_track(self, tid):
         if self._track_busy:
@@ -3515,10 +4092,208 @@ class VideoPanel:
         self._rebuild_track_list()
         self._refresh_frame()
 
+    def _remove_pair(self, pid):
+        if self._track_busy:
+            return
+        self._track_pairs = [p for p in self._track_pairs if p["id"] != pid]
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    def _remove_quad(self, pid):
+        if self._track_busy:
+            return
+        self._track_quads = [q for q in self._track_quads if q["id"] != pid]
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    # ── 추적별 이미지: 로드/제거 + 렌더링 ───────────────────────────────────
+    def _find_track_owner(self, kind, oid):
+        """kind('point'/'pair'/'quad')와 id로 최상위 추적 엔트리 반환."""
+        seq = {"point": self._track_points,
+               "pair": self._track_pairs,
+               "quad": self._track_quads}.get(kind, [])
+        for e in seq:
+            if e["id"] == oid:
+                return e
+        return None
+
+    def _load_entity_image(self, kind, oid):
+        """해당 추적에 붙일 이미지를 로드(이미 있으면 제거)."""
+        if self._track_busy:
+            return
+        owner = self._find_track_owner(kind, oid)
+        if owner is None:
+            return
+        if owner.get("img") is not None:           # 토글 제거
+            owner["img"] = None
+            self._track_status_var.set("이미지 제거됨")
+            self._rebuild_track_list()
+            self._refresh_frame()
+            return
+        path = filedialog.askopenfilename(
+            parent=self.win, title="추적에 넣을 이미지 선택",
+            filetypes=[("이미지 파일", "*.png *.jpg *.jpeg *.bmp"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            messagebox.showerror("오류", f"이미지를 열 수 없습니다:\n{path}", parent=self.win)
+            return
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        if img.shape[2] == 3:
+            h_i, w_i = img.shape[:2]
+            tmp = np.zeros((h_i, w_i, 4), dtype=np.uint8)
+            tmp[:, :, :3] = img
+            tmp[:, :, 3] = 255
+            img = tmp
+        owner["img"] = img.copy()
+        owner.pop("_bb_ref_normal", None)   # 현재(origin) 프레임으로 빌보드 기준 재anchor
+        self._track_status_var.set(f"이미지: {os.path.basename(path)}")
+        self._rebuild_track_list()
+        self._refresh_frame()
+
+    def _has_track_images(self):
+        return (any(e.get("img") is not None for e in self._track_points)
+                or any(p.get("img") is not None for p in self._track_pairs)
+                or any(q.get("img") is not None for q in self._track_quads))
+
+    def _alpha_paste(self, out, img, dst):
+        """img(BGRA)를 dst 4점(좌상→우상→우하→좌하)으로 워프해 알파 합성."""
+        h_f, w_f = out.shape[:2]
+        ih, iw = img.shape[:2]
+        src = np.array([[0, 0], [iw, 0], [iw, ih], [0, ih]], np.float32)
+        try:
+            M = cv2.getPerspectiveTransform(src, dst.astype(np.float32))
+        except cv2.error:
+            return out
+        warped = cv2.warpPerspective(
+            img, M, (w_f, h_f), flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+        a = warped[:, :, 3:4].astype(np.float32) / 255.0
+        return (out.astype(np.float32) * (1 - a)
+                + warped[:, :, :3].astype(np.float32) * a).astype(np.uint8)
+
+    def _quad_billboard_dst(self, quad, corners, w_f, h_f, aspect):
+        """네점 평면의 법선 방향으로 세운 빌보드의 화면상 4점 산출(없으면 None).
+
+        평면 포즈(IPPE)는 같은 4점에 맞는 해가 2개(법선이 반대로 기운 해) 존재한다.
+        두 해는 원근 기울기가 반대인 빌보드를 만든다(왼쪽으로 누움 vs 오른쪽). 기울기가
+        변할 때 '가장 위로 선' 해만 고르면 두 해 사이를 갈아타며 이미지가 원근 반전된다.
+        또 직전 프레임과 비교(rolling)하면 거의 평평한 구간에서 노이즈로 브랜치가 표류한다.
+        → 이미지를 처음 올린 프레임의 법선을 '고정 기준(_bb_ref_normal)'으로 anchor 하고,
+          매 프레임 그 기준에 가장 가까운 브랜치를 골라 반전/표류를 모두 차단한다.
+          기립 방향(±법선)은 그 브랜치에서 화면 위로 서는 쪽을 택한다.
+        """
+        f = float(max(w_f, h_f))
+        K = np.array([[f, 0, w_f / 2.0], [0, f, h_f / 2.0], [0, 0, 1.0]], np.float64)
+        dist = np.zeros((4, 1), np.float64)
+        obj = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]],
+                       np.float64).reshape(-1, 1, 3)
+        imgpts = np.array(corners, np.float64).reshape(-1, 1, 2)
+        try:
+            retval, rvecs, tvecs, _errs = cv2.solvePnPGeneric(
+                obj, imgpts, K, dist, flags=cv2.SOLVEPNP_IPPE)
+        except cv2.error:
+            return None
+        if retval < 1:
+            return None
+        normals = [cv2.Rodrigues(rvecs[i])[0][:, 2].astype(np.float64)
+                   for i in range(retval)]
+        ref = quad.get("_bb_ref_normal")
+        if ref is None:
+            best_i = 0                       # 최초: 재투영오차 최소 브랜치
+            quad["_bb_ref_normal"] = normals[0].tolist()
+        else:
+            ref = np.asarray(ref, np.float64).reshape(3)
+            best_i = int(np.argmax([float(np.dot(n, ref)) for n in normals]))
+        rvec, tvec = rvecs[best_i], tvecs[best_i]
+        base_l = np.array([0, 1, 0], np.float64)
+        base_r = np.array([1, 1, 0], np.float64)
+        best = None
+        for sign in (-1.0, 1.0):
+            n = np.array([0, 0, sign * aspect], np.float64)
+            pts3 = np.array([base_l + n, base_r + n, base_r, base_l]).reshape(-1, 1, 3)
+            proj, _ = cv2.projectPoints(pts3, rvec, tvec, K, dist)
+            proj = proj.reshape(-1, 2)
+            if not np.all(np.isfinite(proj)):
+                continue
+            top_y = (proj[0, 1] + proj[1, 1]) * 0.5
+            if best is None or top_y < best[0]:
+                best = (top_y, proj)
+        if best is None:
+            return None
+        return best[1]
+
+    def _render_track_images(self, bgr):
+        """각 추적 엔트리의 이미지를 종류에 맞게 합성.
+        단일점=점 위 정립, 두점=두 점 baseline에 회전/크기, 네점=법선 빌보드."""
+        out = bgr
+        idx = self._current_frame
+        h_f, w_f = out.shape[:2]
+        # 단일 점: 점에 이미지 중심 정렬(정립, 원본 크기)
+        for e in self._track_points:
+            img = e.get("img")
+            p = e["pos"].get(idx)
+            if img is None or p is None:
+                continue
+            ih, iw = img.shape[:2]
+            cx, cy = float(p[0]), float(p[1])
+            hw, hh = iw / 2.0, ih / 2.0
+            dst = np.array([[cx - hw, cy - hh], [cx + hw, cy - hh],
+                            [cx + hw, cy + hh], [cx - hw, cy + hh]])
+            out = self._alpha_paste(out, img, dst)
+        # 두점: 두 점을 잇는 baseline에 맞춰 회전/크기(가로세로비 유지)
+        for pair in self._track_pairs:
+            img = pair.get("img")
+            if img is None:
+                continue
+            ma, mb = pair["members"]
+            pa = ma["pos"].get(idx)
+            pb = mb["pos"].get(idx)
+            if pa is None or pb is None:
+                continue
+            ih, iw = img.shape[:2]
+            ax, ay = float(pa[0]), float(pa[1])
+            bx, by = float(pb[0]), float(pb[1])
+            dx, dy = bx - ax, by - ay
+            L = float(np.hypot(dx, dy))
+            if L < 1.0:
+                continue
+            ux, uy = dx / L, dy / L            # baseline 방향 단위벡터
+            vx, vy = -uy, ux                   # 수직 단위벡터
+            half_w = L / 2.0
+            half_h = (L * ih / iw) / 2.0
+            mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+            dst = np.array([
+                [mx - half_w * ux - half_h * vx, my - half_w * uy - half_h * vy],
+                [mx + half_w * ux - half_h * vx, my + half_w * uy - half_h * vy],
+                [mx + half_w * ux + half_h * vx, my + half_w * uy + half_h * vy],
+                [mx - half_w * ux + half_h * vx, my - half_w * uy + half_h * vy],
+            ])
+            out = self._alpha_paste(out, img, dst)
+        # 네점: 평면 법선 방향으로 기립(빌보드)
+        for quad in self._track_quads:
+            img = quad.get("img")
+            if img is None:
+                continue
+            corners = [m["pos"].get(idx) for m in quad["members"]]
+            if any(c is None for c in corners):
+                continue
+            ih, iw = img.shape[:2]
+            dst = self._quad_billboard_dst(quad, corners, w_f, h_f, float(ih) / float(iw))
+            if dst is None:
+                continue
+            out = self._alpha_paste(out, img, dst)
+        return out
+
     def _clear_tracks(self):
         if self._track_busy:
             return
         self._track_points = []
+        self._track_pairs = []
+        self._track_quads = []
         self._track_status_var.set("")
         self._rebuild_track_list()
         self._refresh_frame()
@@ -3527,7 +4302,7 @@ class VideoPanel:
         if self._track_busy:
             messagebox.showinfo("트래킹", "추적이 끝난 뒤 내보내세요.", parent=self.win)
             return
-        if not self._track_points:
+        if not self._track_points and not self._track_pairs and not self._track_quads:
             messagebox.showinfo("트래킹", "내보낼 추적 점이 없습니다.", parent=self.win)
             return
         out_dir = filedialog.askdirectory(
@@ -3540,13 +4315,19 @@ class VideoPanel:
             fps=self._fps, total_frames=self._total_frames,
         )
         try:
-            files = export_tracks_ae(out_dir, info, self._track_points)
+            files = []
+            if self._track_points:
+                files += export_tracks_ae(out_dir, info, self._track_points)
+            if self._track_pairs:
+                files += export_pairs_ae(out_dir, info, self._track_pairs)
+            if self._track_quads:
+                files += export_quads_ae(out_dir, info, self._track_quads)
         except Exception as exc:                                   # noqa: BLE001
             messagebox.showerror("트래킹", f"내보내기 실패:\n{exc}", parent=self.win)
             return
-        self._track_status_var.set(f"{len(files)}개 트랙 내보냄")
+        self._track_status_var.set(f"{len(files)}개 파일 내보냄")
         messagebox.showinfo(
-            "트래킹", f"{len(files)}개 트랙을 AE 키프레임으로 저장했습니다:\n{out_dir}",
+            "트래킹", f"{len(files)}개 트랙 파일을 AE 키프레임으로 저장했습니다:\n{out_dir}",
             parent=self.win,
         )
 
@@ -3853,6 +4634,7 @@ class VideoPanel:
             secs = int(f / max(self._fps, 1))
             return f"{secs // 60:02d}:{secs % 60:02d}"
         self._time_var.set(f"{fmt(self._current_frame)} / {fmt(self._total_frames - 1)}")
+        self._frame_var.set(f"{self._current_frame:,} / {self._total_frames - 1:,} 프레임")
 
     # ── 내보내기 ───────────────────────────────────────────────────────────
     def _export_json(self):

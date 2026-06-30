@@ -3,6 +3,7 @@ exporter.py — 추적 데이터를 JSON + After Effects Keyframe Data 로 저�
 """
 
 import json
+import math
 import os
 import shutil
 from typing import List, Callable
@@ -236,6 +237,134 @@ def export_tracks_ae(out_dir: str, info: VideoInfo, tracks: list) -> list:
         written.append(path)
 
     print(f"[Exporter] 트랙 {len(written)}개 내보냄 → {out_dir}")
+    return written
+
+
+def export_pairs_ae(out_dir: str, info: VideoInfo, pairs: list) -> list:
+    """두점(쌍) 트래킹을 AE 키프레임(.txt)으로 내보낸다.
+
+    pairs: [{"id","color","origin_frame","members":[{"id","pos"},{"id","pos"}]}]
+    쌍마다 track_pair_<id>.txt 1개에 Position/Scale/Rotation 3블록 작성.
+    - Position = 점 A 위치(회전/크기 피벗)
+    - Scale    = 100 * (현재 길이 / origin 길이) %  (균등)
+    - Rotation = degrees(현재 각도 - origin 각도)   (origin=0°)
+    두 멤버 위치가 모두 있는 프레임만 출력.
+    반환: 작성된 파일 경로 리스트.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for pair in pairs:
+        pid = pair.get("id", 0)
+        members = pair.get("members", [])
+        if len(members) != 2:
+            continue
+        pos_a = members[0].get("pos", {})
+        pos_b = members[1].get("pos", {})
+        origin = pair.get("origin_frame", 0)
+
+        common = sorted(set(pos_a.keys()) & set(pos_b.keys()))
+        if not common:
+            continue
+
+        # 기준 길이/각도 (origin 우선, 없으면 첫 공통 프레임)
+        ref = origin if origin in pos_a and origin in pos_b else common[0]
+        ax0, ay0 = pos_a[ref]; bx0, by0 = pos_b[ref]
+        len0 = math.hypot(bx0 - ax0, by0 - ay0) or 1e-6
+        ang0 = math.atan2(by0 - ay0, bx0 - ax0)
+
+        path = os.path.join(out_dir, f"track_pair_{pid}.txt")
+        lines = []
+        lines.append("Adobe After Effects 8.0 Keyframe Data\n")
+        lines.append(f"\tUnits Per Second\t{info.fps}\n")
+        lines.append(f"\tSource Width\t{info.width}\n")
+        lines.append(f"\tSource Height\t{info.height}\n")
+        lines.append("\tSource Pixel Aspect Ratio\t1\n")
+        lines.append("\tComp Pixel Aspect Ratio\t1\n")
+        lines.append("\n")
+
+        lines.append("Transform\tPosition\n")
+        lines.append("\tFrame\tX pixels\tY pixels\tZ pixels\t\n")
+        for f in common:
+            ax, ay = pos_a[f]
+            lines.append(f"\t{f}\t{ax:.4f}\t{ay:.4f}\t0.0000\t\n")
+        lines.append("\n")
+
+        lines.append("Transform\tScale\n")
+        lines.append("\tFrame\tX percent\tY percent\tZ percent\t\n")
+        for f in common:
+            ax, ay = pos_a[f]; bx, by = pos_b[f]
+            s = 100.0 * math.hypot(bx - ax, by - ay) / len0
+            lines.append(f"\t{f}\t{s:.4f}\t{s:.4f}\t100.0000\t\n")
+        lines.append("\n")
+
+        lines.append("Transform\tRotation\n")
+        lines.append("\tFrame\tDegrees\t\n")
+        for f in common:
+            ax, ay = pos_a[f]; bx, by = pos_b[f]
+            deg = math.degrees(math.atan2(by - ay, bx - ax) - ang0)
+            lines.append(f"\t{f}\t{deg:.4f}\t\n")
+        lines.append("\nEnd of Keyframe Data\n")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        written.append(path)
+
+    print(f"[Exporter] 두점 트랙 {len(written)}개 내보냄 → {out_dir}")
+    return written
+
+
+def export_quads_ae(out_dir: str, info: VideoInfo, quads: list) -> list:
+    """네점(코너핀) 트래킹을 AE Corner Pin 키프레임(.txt)으로 내보낸다.
+
+    quads: [{"id","color","origin_frame","members":[m0,m1,m2,m3]}]
+    클릭 순서(시계방향): m0=좌상, m1=우상, m2=우하, m3=좌하.
+    AE Corner Pin 점 순서는 0001=좌상, 0002=우상, 0003=좌하, 0004=우하 →
+    멤버를 [m0, m1, m3, m2] 순으로 매핑해 작성.
+    네 멤버 위치가 모두 있는 프레임만 출력. 쌍마다 track_quad_<id>.txt 1개.
+    반환: 작성된 파일 경로 리스트.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    # AE Corner Pin 점 인덱스(0001~0004) → 클릭 멤버 인덱스
+    corner_to_member = [0, 1, 3, 2]   # 좌상, 우상, 좌하, 우하
+    for quad in quads:
+        qid = quad.get("id", 0)
+        members = quad.get("members", [])
+        if len(members) != 4:
+            continue
+        poss = [m.get("pos", {}) for m in members]
+        common = None
+        for p in poss:
+            ks = set(p.keys())
+            common = ks if common is None else (common & ks)
+        common = sorted(common or [])
+        if not common:
+            continue
+
+        path = os.path.join(out_dir, f"track_quad_{qid}.txt")
+        lines = []
+        lines.append("Adobe After Effects 8.0 Keyframe Data\n")
+        lines.append(f"\tUnits Per Second\t{info.fps}\n")
+        lines.append(f"\tSource Width\t{info.width}\n")
+        lines.append(f"\tSource Height\t{info.height}\n")
+        lines.append("\tSource Pixel Aspect Ratio\t1\n")
+        lines.append("\tComp Pixel Aspect Ratio\t1\n")
+        lines.append("\n")
+        for ci, mi in enumerate(corner_to_member):
+            pos = poss[mi]
+            lines.append(f"Effects\tCorner Pin #2\tCorner Pin-{ci + 1:04d}\n")
+            lines.append("\tFrame\tX pixels\tY pixels\tZ pixels\t\n")
+            for f in common:
+                x, y = pos[f]
+                lines.append(f"\t{f}\t{x:.4f}\t{y:.4f}\t0.0000\t\n")
+            lines.append("\n")
+        lines.append("End of Keyframe Data\n")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        written.append(path)
+
+    print(f"[Exporter] 네점(코너핀) 트랙 {len(written)}개 내보냄 → {out_dir}")
     return written
 
 
